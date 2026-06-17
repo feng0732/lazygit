@@ -320,11 +320,95 @@ cmdArgs := NewGitCmd("commit").Arg("--fixup=" + hash).ToArgv()
 
 命令：`git commit --fixup=<targetHash>`
 
-### 2.5 CreateFixupCommit 与 CreateAmendCommit（fixup!/amend! 提交 + stacked branch 移动）
+### 2.5 Amend 消息保留机制对比（HEAD vs 非 HEAD）
+
+普通 Amend 操作根据目标提交是否为 HEAD 分为两条路径，都实现了**保留目标提交原消息不变、只合并暂存区内容**的效果，但实现机制完全不同。
+
+#### 2.5.1 HEAD 路径：`--no-edit` 直接保留
+
+[commit.go:235-241](pkg/commands/git_commands/commit.go#L235-L241)
+
+```go
+cmdArgs := NewGitCmd("commit").
+    Arg("--amend", "--no-edit", "--allow-empty", "--allow-empty-message").
+    ToArgv()
+```
+
+执行命令：`git commit --amend --no-edit`
+
+**消息保留原理：**
+
+- `--amend`：用暂存区内容替换 HEAD 提交
+- `--no-edit`：明确告诉 git**不要打开编辑器**，直接复用 HEAD 提交的原消息
+- git 在内部重建 commit 时，直接从原 HEAD 提交读取 message 字段，不作任何修改
+- 结果：commit hash 变了（因为内容变了），但消息文本完全保持不变
+
+**流程特点：**
+- 单步执行，没有中间提交
+- 只修改 HEAD，不影响其他提交
+- 不需要 rebase
+
+#### 2.5.2 非 HEAD 路径：`--fixup` + rebase autosquash
+
+非 HEAD 路径分三步 [rebase.go:298-315](pkg/commands/git_commands/rebase.go#L298-L315)：
+
+1. **创建 fixup! 提交**：`git commit --fixup=<targetHash>`
+2. **获取 fixup commit 的 hash**：`getHashOfLastCommitMade()`
+3. **交互式 rebase autosquash**：`MoveFixupCommitDown(applyAutosquash=true)`
+
+**第一步：`--fixup` 创建中间提交**
+
+[commit.go:290-294](pkg/commands/git_commands/commit.go#L290-L294)
+```go
+cmdArgs := NewGitCmd("commit").Arg("--fixup=" + hash).ToArgv()
+```
+
+执行命令：`git commit --fixup=<targetHash>`
+
+`--fixup` 参数的特殊行为：
+- git 自动生成固定格式的消息：`fixup! <target commit's first line>`
+- 例如目标提交消息是 "Add user login feature"，fixup 提交的消息就是 "fixup! Add user login feature"
+- 这个消息的用途是让后续 autosquash 机制识别它应该被合并到哪个目标提交
+
+注意：此时暂存区内容已经提交到这个 fixup 提交中，目标提交还没有被修改。
+
+**第三步：rebase autosquash 合并**
+
+`NewMoveFixupCommitDownInstruction(commit.Hash(), fixupHash, true)` 第 3 个参数 `applyAutosquash=true` 告诉 rebase daemon：在移动 fixup 到目标提交下方后，立即执行 autosquash。
+
+`PrepareInteractiveRebaseCommand` 会：
+1. 生成 rebase TODO 文件，将 fixup 提交放到目标提交下方
+2. 由于 autosquash 被启用，fixup 提交的动作在 TODO 中被标记为 `fixup` 而非 `pick`
+3. rebase 执行到这一行时，git 自动将 fixup 提交的内容**压缩合并**到目标提交中
+4. autosquash 规则：`fixup` 动作的提交消息会被**丢弃**，目标提交的消息**完全保留**
+
+**消息保留原理：**
+- 目标提交的消息从未被修改过
+- fixup 提交的消息在 autosquash 合并时被 git 自动丢弃（这是 `fixup` 动作的语义，区别于 `squash` 会弹出编辑器让你合并消息）
+- 结果：目标提交的消息文本完全保持不变，只把 fixup 提交的文件变更合并进去
+
+**流程特点：**
+- 多步执行：先创建中间 fixup 提交，再通过 rebase 合并
+- 需要交互式 rebase，会修改目标提交及其之后所有提交的 hash
+- 消息保留依赖 git autosquash 机制对 `fixup` 动作的语义定义
+
+#### 2.5.3 两条路径对比
+
+| 维度 | HEAD 路径（`--amend --no-edit`） | 非 HEAD 路径（`--fixup` + rebase autosquash） |
+|------|---------|---------|
+| 命令 | `git commit --amend --no-edit` | ① `git commit --fixup=<hash>` → ② `git rebase -i --autosquash` |
+| 中间提交 | 无 | 1 个 fixup! 提交（rebase 完成后被消解） |
+| 消息保留方式 | `--no-edit` 参数显式告诉 git 复用原消息 | autosquash 中 `fixup` 动作自动丢弃 fixup 消息、保留目标消息 |
+| 谁的消息被保留 | HEAD 提交的原消息 | 目标提交的原消息 |
+| 修改范围 | 只改 HEAD 提交 | 改目标提交及其之后所有提交（hash 变化） |
+| 是否需要 rebase | 不需要 | 需要交互式 rebase |
+| 代码入口 | `Commit.AmendHeadCmdObj` | `Rebase.AmendTo` → `Commit.CreateFixupCommit` → `Rebase.MoveFixupCommitDown` |
+
+### 2.6 CreateFixupCommit 与 CreateAmendCommit（fixup!/amend! 提交 + stacked branch 移动）
 
 两者均从 `createFixupCommit` 菜单弹出，成功创建提交后都会执行 stacked branch 移动与选择同步。
 
-#### 2.5.1 CreateFixupCommit（Fixup 菜单项）
+#### 2.6.1 CreateFixupCommit（Fixup 菜单项）
 
 [local_commits_controller.go:1004-L1019](pkg/gui/controllers/local_commits_controller.go#L1004-L1019)：
 
@@ -339,7 +423,7 @@ WithEnsureCommittableFiles
     4. Refresh(SYNC)                                 // 同步刷新所有 UI
 ```
 
-#### 2.5.2 CreateAmendCommit（两个 Amend 菜单项）
+#### 2.6.2 CreateAmendCommit（两个 Amend 菜单项）
 
 `createAmendCommit` 函数 [local_commits_controller.go:1090-L1127](pkg/gui/controllers/local_commits_controller.go#L1090-L1127)：
 
@@ -362,7 +446,7 @@ OnConfirm(summary, description):
     4. Refresh(SYNC)
 ```
 
-#### 2.5.3 Commit.CreateAmendCommit 参数组织
+#### 2.6.3 Commit.CreateAmendCommit 参数组织
 
 [commit.go:297-309](pkg/commands/git_commands/commit.go#L297-L309)：
 
@@ -388,7 +472,7 @@ git commit -m "amend! original subject text" -m "new subject\n\nnew description"
 
 `includeFileChanges=false` 时加 `--only --allow-empty` 创建空消息提交，后续通过 autosquash 合并时只替换消息内容。
 
-#### 2.5.4 moveFixupCommitToOwnerStackedBranch 前置条件判断
+#### 2.6.4 moveFixupCommitToOwnerStackedBranch 前置条件判断
 
 [local_commits_controller.go:1046-L1088](pkg/gui/controllers/local_commits_controller.go#L1046-L1088)：
 
@@ -437,7 +521,7 @@ func (self *RebaseCommands) MoveFixupCommitDown(commits []*models.Commit, target
 - AmendTo：移动 + 立即 autosquash 一步到位合并
 - CreateFixupCommit / CreateAmendCommit：只移动位置，保留 fixup!/amend! 标记，等用户后续手动 squash
 
-### 2.6 Amend Commit 属性（作者、Co-author）
+### 2.7 Amend Commit 属性（作者、Co-author）
 
 通过 `GenericAmend` [rebase.go:89-112](pkg/commands/git_commands/rebase.go#L89-L112) 统一处理：
 
@@ -469,7 +553,7 @@ func (self *RebaseCommands) GenericAmend(commits []*models.Commit, start, end in
 - **AddCoAuthor** [commit.go:42-55](pkg/commands/git_commands/commit.go#L42-L55)：
   先获取原消息 → 在末尾追加 `Co-authored-by:` 行 → 执行 `git commit --allow-empty --amend --only -m <newMessage>`
 
-### 2.7 GPG 签名处理封装
+### 2.8 GPG 签名处理封装
 
 `GpgHelper.WithGpgHandling` [gpg_helper.go:26-41](pkg/gui/controllers/helpers/gpg_helper.go#L26-L41) 根据配置决定执行方式：
 
