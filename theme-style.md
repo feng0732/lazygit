@@ -140,18 +140,63 @@ loadUserConfig(configFiles, base=默认值, isGuiInitialized)
   return base
 ```
 
-**YAML 反序列化的覆盖语义对 ThemeConfig 的影响**：
+**YAML 反序列化的覆盖语义——三种字段类型，三种行为**：
 
-`yaml.Unmarshal(content, base)` 的行为是：**对结构体字段做深度合并，对切片字段做整体替换**。具体到 ThemeConfig：
+`yaml.Unmarshal(content, base)` 将新内容反序列化到已有 `base` 上时，对结构体、map、切片三种字段类型的行为完全不同（源码依据：`vendor/gopkg.in/yaml.v3/decode.go`）：
 
-- ThemeConfig 的每个字段都是 `[]string`（切片类型）
-- 如果配置文件 A 声明了 `activeBorderColor: [green, bold]`，配置文件 B 声明了 `activeBorderColor: [red]`
-- 则最终结果为 `[red]`——**后者完全替换前者，而非追加**
+#### 结构体字段：深度合并（只覆盖声明的字段）
 
-这意味着：
+`mappingStruct()`（第 878 行）遍历 YAML 中出现的字段名，对每个字段调用 `d.unmarshal(n.Content[i+1], field)` 递归反序列化。**YAML 中未提及的字段完全不受影响**，保留 `base` 中的原值。
+
+```
+全局配置:  Gui: { Theme: {activeBorderColor: [green, bold], defaultFgColor: [white]} }
+仓库配置:  Gui: { Theme: {activeBorderColor: [red]} }
+结果:      Gui: { Theme: {activeBorderColor: [red],         defaultFgColor: [white]} }
+                                                              ↑ 未提及，保留全局值
+```
+
+这适用于 `UserConfig` → `GuiConfig` → `ThemeConfig` 整条嵌套链：只要某个层级的字段在 YAML 中未被提及，它的子字段全部保留。
+
+#### map 字段：键级合并（只覆盖声明的键）
+
+`mapping()`（第 800 行）只遍历 YAML map 中的键值对，逐一 `out.SetMapIndex(k, e)` 设置。**YAML 中未提及的键保留原值**。`resetMap()` 函数虽然存在但从未被调用。
+
+```
+全局配置:  AuthorColors: {"Alice": "#ff6600", "Bob": "#00cc00"}
+仓库配置:  AuthorColors: {"Alice": "#ff0000", "Carol": "#0000ff"}
+结果:      AuthorColors: {"Alice": "#ff0000", "Bob": "#00cc00", "Carol": "#0000ff"}
+                               ↑ 覆盖           ↑ 保留           ↑ 新增
+```
+
+影响范围：`AuthorColors`、`BranchColorPatterns`、`CommitPrefixes`、`CustomPager` 等 `map[string]string` 类型字段。
+
+#### 切片字段：整体替换
+
+`sequence()`（第 729 行）执行 `out.Set(reflect.MakeSlice(out.Type(), l, l))`，**先创建全新切片再填入值，旧切片完全丢弃**。
+
+```
+全局配置:  ActiveBorderColor: [green, bold]
+仓库配置:  ActiveBorderColor: [red]
+结果:      ActiveBorderColor: [red]
+                            ↑ 不是 [green, bold, red]，旧值整体丢弃
+```
+
+ThemeConfig 的所有字段（`ActiveBorderColor`、`InactiveBorderColor`、`SelectedLineBgColor` 等）都是 `[]string` 切片类型，因此**主题配置的每个颜色字段都是整体替换**。
+
+#### 三种行为总结
+
+| 字段类型 | 合并行为 | 未提及的字段/键 | ThemeConfig 中的影响 |
+|---|---|---|---|
+| 结构体 | 深度合并 | 保留原值 | `Theme` 整体未被提及时保留全部子字段 |
+| `map[string]string` | 键级合并 | 保留原键值 | 不适用于 ThemeConfig 本身，但适用于 `AuthorColors`、`BranchColorPatterns` 等 |
+| `[]string` | 整体替换 | 不适用（整个切片替换） | **ThemeConfig 的每个颜色字段都是整体替换** |
+
+#### 实际效果示例
+
 - 若全局配置设置了 `activeBorderColor: [green, bold]`，仓库配置只需 `activeBorderColor: [red]`，最终生效 `[red]`
-- 若仓库配置只声明了 `selectedLineBgColor: [magenta]`，其他字段保持全局配置的值
+- 若仓库配置只声明了 `selectedLineBgColor: [magenta]`，其他字段保持全局配置的值（结构体深度合并）
 - 若某个配置文件完全省略了 `theme:` 段，则该文件不会修改任何主题字段
+- 若全局配置声明了 `authorColors: {"Alice": "#ff6600"}`，仓库配置声明了 `authorColors: {"Bob": "#00cc00"}`，最终两个作者颜色都生效（map 键级合并）
 
 **唯一的例外是 `CustomCommands`**：代码在反序列化前保存旧的 `base.CustomCommands`，反序列化后执行 `append`，因此自定义命令是追加而非替换。
 
@@ -262,17 +307,19 @@ gui:
   theme:
     activeBorderColor:
       - magenta
+  authorColors:
+    "Bob": "#00cc00"
 ```
 
 **最终生效的 ThemeConfig**：
 
-| 字段 | 值 | 来源 |
+| 字段 | 值 | 来源与合并逻辑 |
 |---|---|---|
-| ActiveBorderColor | `["magenta"]` | 仓库级覆盖全局 |
-| InactiveBorderColor | `["default"]` | 默认值（两层配置均未声明） |
-| SelectedLineBgColor | `["blue"]` | 全局配置 |
+| ActiveBorderColor | `["magenta"]` | 切片整体替换：仓库级 `[magenta]` 替换全局 `[green, bold]` |
+| InactiveBorderColor | `["default"]` | 默认值（两层配置均未声明，结构体深度合并保留默认值） |
+| SelectedLineBgColor | `["blue"]` | 全局配置（仓库配置未声明此字段，结构体深度合并保留） |
 | DefaultFgColor | `["default"]` | 默认值 |
-| AuthorColors | `{"Alice": "#ff6600"}` | 全局配置（map 类型也是整体替换，但仓库配置未声明此字段所以保留全局值） |
+| AuthorColors | `{"Alice": "#ff6600", "Bob": "#00cc00"}` | map 键级合并：Alice 来自全局，Bob 来自仓库级，两键均保留 |
 
 ---
 
@@ -650,9 +697,9 @@ SetCustomBranches(customBranchColors, isRegex)
 │  注: 仓库根目录的 .lazygit.yml 目前为 TODO 状态，未实现              │
 │                                                                      │
 │  合并规则: yaml.Unmarshal 逐文件覆盖 base                            │
-│    - 结构体字段: 深度合并 (子字段级别覆盖)                             │
-│    - 切片字段: 整体替换 (如 []string)                                │
-│    - map字段: 整体替换                                               │
+│    - 结构体字段: 深度合并 (只覆盖YAML中声明的子字段)                   │
+│    - 切片字段: 整体替换 (如 ThemeConfig 的 []string 颜色字段)          │
+│    - map字段:   键级合并 (只覆盖YAML中声明的键，未声明的键保留)         │
 │    - CustomCommands: 特殊追加 (append)                               │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
