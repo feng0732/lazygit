@@ -128,24 +128,59 @@ return self.cmd.New(cmdArgs).Run()  // 返回 error
 | [StashUnstagedChanges(message)](pkg/commands/git_commands/stash.go#L112-L130) | **3 步复合**：临时commit→stash→reset soft | 仅未暂存入栈 |
 | [Store(hash, message)](pkg/commands/git_commands/stash.go#L63-L72) | `git stash store [-m msg] <hash>` | Rename 内部使用 |
 
-#### 复合命令细节：SaveStagedChanges（Git < 2.35 兼容方案）
+#### 复合命令细节与失败边界：SaveStagedChanges（Git < 2.35 兼容方案）
 
-6 个步骤：
+完整代码位于 [stash.go:133-193](pkg/commands/git_commands/stash.go#L133-L193)，分版本两条路径：
 
-1. `git stash --keep-index` — 临时藏起未暂存改动
-2. `git stash push -m <msg>` — 保存暂存改动入栈
-3. `git stash apply refs/stash@{1}` — 恢复步骤 1 临时藏的改动
-4. `git stash show -p | git apply -R` — 反向应用补丁，从工作树移除临时 stash 的内容
-5. `git stash drop refs/stash@{1}` — 删除步骤 1 的临时 stash
-6. 遍历文件列表，清理 `AD` 状态（新增已暂存 + 工作树已删除）的文件
+**Git ≥ 2.35（单命令，原子性好）：**
+```
+git stash push --staged -m <msg>
+```
+Git 原生支持 `--staged` 标志，一条命令完成，中途无副作用。
 
-#### 复合命令细节：StashUnstagedChanges
+**Git < 2.35（6 步复合，非原子）：**
 
-3 个步骤：
+| 步骤 | 命令 | 成功后哪些状态已改变 | 若此步失败并 return，磁盘/仓库状态 |
+|------|------|----------------------|-----------------------------------|
+| ① | `git stash --keep-index` | stash 新增 1 条临时条目（未暂存改动被藏起），工作树只剩暂存内容 | 仓库状态与执行前一致（git stash --keep-index 失败时不创建 stash） |
+| ② | `git stash push -m <msg>` | stash 再新增 1 条（真正要保存的暂存改动），此时 stash 列表多了 2 条 | stash 残留步骤①的临时 stash，工作树只剩暂存内容（①已成功不可逆） |
+| ③ | `git stash apply refs/stash@{1}` | 工作树恢复了步骤①临时藏起的未暂存改动（stash 列表仍 2 条） | stash 有 2 条，工作树仅有暂存内容（未恢复临时 stash） |
+| ④ | `git stash show -p \| git apply -R` | 从工作树移除了临时 stash 对应的改动内容（文件被还原），stash 仍 2 条 | stash 有 2 条，工作树同时包含暂存+未暂存（临时 stash 的改动仍在） |
+| ⑤ | `git stash drop refs/stash@{1}` | stash 列表回到 1 条（删除了步骤①的临时 stash） | stash 残留 2 条（临时 stash 未被删除） |
+| ⑥ | 遍历 `AD` 状态文件，`UnStageFile(paths, false)` 逐一 `git rm --cached` | 暂存区清理了 `AD` 状态（新增已暂存+工作树已删）的文件 | 部分 `AD` 文件可能已被清理，部分未清理，状态不一致 |
 
-1. `git commit --no-verify -m "[lazygit] stashing unstaged changes"` — 先把暂存改动临时提交（跳过 githooks）
-2. `git stash push -m <msg>` — 把真正要保存的未暂存入栈
-3. `git reset --soft HEAD^` — 回滚步骤 1 的临时提交，恢复暂存区
+> **代码已知缺陷说明**（stash.go 第 142-146 行注释）：
+> - 当**只有暂存改动没有未暂存改动**时，步骤① `git stash --keep-index` 无任何东西可藏，但仍会创建空 stash，后续步骤索引错位
+> - 当**同一文件内暂存和未暂存改动距离太近**时，步骤④ `git apply -R` 无法精确反向应用补丁
+> - 官方不打算修复，建议升级 Git
+
+**为什么外层（handleStashSave）失败时不刷新？**
+1. 状态不一致：步骤②-⑤任一步失败，stash 列表残留临时条目、工作树和暂存区处于中间态，**没有任何单一状态能正确描述当前局面**
+2. 用户需要手动排查：刷新 UI 只会展示"部分成功"的误导画面，不如保留操作前的旧 UI，让用户通过错误提示意识到"命令执行到一半出问题了"
+3. 错误提示由 ErrorHandler 展示：Alert 弹窗已告诉用户具体失败的命令，用户可以自行决定是手动 `git stash drop` 清理残留条目，还是退出后重入 lazygit 让完整 `git status` 刷新
+
+---
+
+#### 复合命令细节与失败边界：StashUnstagedChanges
+
+完整代码位于 [stash.go:112-130](pkg/commands/git_commands/stash.go#L112-L130)，共 3 步：
+
+| 步骤 | 命令 | 成功后哪些状态已改变 | 若此步失败并 return，磁盘/仓库状态 |
+|------|------|----------------------|-----------------------------------|
+| ① | `git commit --no-verify -m "[lazygit] stashing unstaged changes"` | 生成 1 条临时 commit，HEAD 前进 1 格，暂存区被清空，工作树保留未暂存改动 | 仓库与执行前一致（commit 失败不移动 HEAD） |
+| ② | `git stash push -m <msg>` | stash 新增 1 条（未暂存改动被藏起），工作树干净 | HEAD 前进了 1 格（①已成功不可逆），暂存区空，工作树仍有未暂存改动（②未 stash） |
+| ③ | `git reset --soft HEAD^` | HEAD 后退 1 格回到原位置，临时 commit 的内容重新回到暂存区 | HEAD 仍指向临时 commit（未回退），暂存区空，工作树干净（②已 stash），用户丢失了暂存内容 |
+
+**各失败场景的用户可见影响：**
+
+- **步骤①失败**：最好情况，仓库完全没动，用户无感知
+- **步骤②失败**：最常见，暂存内容被塞进临时 commit 但没回到暂存区，用户会看到"文件变干净了，但暂存区空了"——实际暂存内容在临时 commit 里，可用 `git reset --soft HEAD^` 手动恢复
+- **步骤③失败**：最危险，暂存内容和未暂存内容都"消失"了——暂存在临时 commit（`HEAD`）里，未暂存在新 stash 里，用户需要分别 `git reset --soft HEAD^` 和 `git stash pop` 手动恢复
+
+**为什么外层（handleStashSave）失败时不刷新？**
+1. 步骤②或③失败后，**暂存区/工作树的真实状态与 UI 展示会出现偏差**：比如步骤②失败时 HEAD 已前移 1 格，但 Files 面板仍显示旧的暂存文件列表
+2. 如果此时强制刷新，Files 面板会显示"没有暂存文件"，但 Commit 面板又显示了那个 `[lazygit]` 临时 commit，UI 反而更混乱
+3. 保留旧 UI + Alert 错误提示，用户能明确意识到"命令中途失败，需要手动介入"，而不是被部分刷新的误导画面搞糊涂
 
 ---
 
