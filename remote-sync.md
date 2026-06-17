@@ -300,7 +300,7 @@ WaitTime   = 50 * time.Millisecond
 - `.git/index.lock` 存在
 - `cannot lock ref`（ref 锁冲突）
 
-### 4.3 Refresh 刷新机制
+### 4.3 Refresh 刷新机制（完整流程）
 
 **代码位置**：[refresh_helper.go:63-237](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237)
 
@@ -319,12 +319,339 @@ COMMITS, BRANCHES, FILES, STASH, REFLOG, TAGS, REMOTES,
 WORKTREES, STATUS, BISECT_INFO, STAGING, PULL_REQUESTS
 ```
 
-#### 并行执行策略：
-- 使用 `sync.WaitGroup` 等待所有 scope 完成
-- `branchesAndRemotesWg` 协调 branches/remotes/pull-requests 依赖关系
-- `fileWg` 协调 files 和 staging 依赖关系
+#### 并行执行策略与依赖关系：
 
-### 4.4 Upstream 提示机制
+```
+Refresh(ASYNC) 入口
+    │
+    ├─ commits and commit files (独立 goroutine)
+    │   └─ refreshCommitsAndCommitFiles()
+    │       ├─ refreshCommitsWithLimit()  →  Model.Commits
+    │       ├─ 计算 CheckedOutBranch
+    │       └─ refreshCommitFilesContext()
+    │
+    ├─ branchesAndRemotesWg (WaitGroup, 2-3 个子任务)
+    │   ├─ branches (+ reflog) 线程
+    │   │   └─ refreshBranches() / refreshReflogAndBranches()
+    │   │       ├─ BranchLoader.Load()  →  Model.Branches
+    │   │       ├─ 异步加载 BehindBaseBranch (onWorker 回调)
+    │   │       ├─ 恢复选中分支索引
+    │   │       └─ refreshStatus()  →  状态栏
+    │   │
+    │   └─ remotes 线程 (可选)
+    │       └─ refreshRemotes()
+    │           ├─ RemoteLoader.GetRemotes()  →  Model.Remotes
+    │           │   ├─ 并行: getRemoteBranchesByRemoteName()
+    │           │   └─ getRemotesFromConfig()
+    │           ├─ rebuildPullRequestsMap()
+    │           └─ 同步 Model.RemoteBranches
+    │
+    ├─ fileWg (WaitGroup, files 线程)
+    │   └─ refreshFilesAndSubmodules()
+    │       ├─ refreshStateSubmoduleConfigs()
+    │       ├─ refreshStateFiles()
+    │       │   ├─ FileLoader.GetStatusFiles()  →  Model.Files
+    │       │   ├─ 自动 stage 已解决的冲突文件
+    │       │   ├─ 检测冲突从有到无 → 弹 ContinueRebase 提示
+    │       │   └─ 文件树过滤自动切换 (冲突过滤)
+    │       └─ FileTreeViewModel.SetTree()
+    │
+    ├─ stash 线程 (独立)
+    ├─ tags 线程 (独立)
+    ├─ worktrees 线程 (独立，可选)
+    ├─ reflog 线程 (独立，可选)
+    ├─ sub_commits 线程 (独立，可选)
+    │
+    ├─ PULL_REQUESTS (依赖 branchesAndRemotesWg)
+    │   └─ refreshGithubPullRequests()
+    │
+    ├─ STAGING (依赖 fileWg)
+    │   └─ StagingHelper.RefreshStagingPanel()
+    │
+    ├─ MERGE_CONFLICTS / FILES (依赖 fileWg)
+    │   └─ mergeConflictsHelper.RefreshMergeState()
+    │
+    └─ refreshStatus()  (主线程，最后同步调用)
+        └─ FormatStatus()  →  设置状态栏 View 内容
+```
+
+#### Scope 间的 WaitGroup 依赖：
+
+```
+commitsAndCommitFiles ─┐
+branchesAndRemotes    ─┤
+files/submodules      ─┼── sync.WaitGroup (wg) 等待
+stash                 ─┤
+tags                  ─┤
+worktrees             ─┘
+                           │
+                           ▼
+                  PULL_REQUESTS 须等待 branchesAndRemotesWg
+                  STAGING 须等待 fileWg
+                  MERGE_CONFLICTS 须等待 fileWg
+```
+
+---
+
+### 4.4 分支计数（Ahead/Behind）加载详解
+
+**代码位置**：[branch_loader.go:66-492](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/commands/git_commands/branch_loader.go#L66-L492)
+
+#### 数据源：`git for-each-ref` 单次命令
+
+Lazygit 通过一次 `git for-each-ref` 调用获取所有分支信息，字段包括：
+
+```go
+var branchFields = []string{
+    "HEAD",              // 是否为当前分支 "*"
+    "refname:short",     // 分支名
+    "upstream:short",    // 上游分支名 (如 origin/main)
+    "upstream:track",    // 上游 track 信息 (ahead N, behind M)
+    "push:track",        // push remote track 信息
+    "subject",           // commit subject
+    "objectname",        // commit hash
+    "committerdate:unix" // commit 时间戳
+}
+```
+
+#### 解析流程 `parseUpstreamInfo()`：[branch_loader.go:466-491](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/commands/git_commands/branch_loader.go#L466-L491)
+
+```
+upstreamName == ""
+   ├─ 是 → 返回 ("?", "?", false)  // 远程分支未在本地缓存
+   └─ 否
+       ├─ track == "[gone]" → 返回 ("?", "?", true)  // 上游已删除
+       └─ 正则解析 track 字符串
+           ├─ `ahead (\d+)`  → AheadForPull
+           └─ `behind (\d+)` → BehindForPull
+```
+
+**注意**：Ahead/Behind 分两组：
+- `AheadForPull` / `BehindForPull`：基于 `upstream:track`（fetch 后的 origin/xxx 比较）
+- `AheadForPush` / `BehindForPush`：基于 `push:track`（push remote 比较）
+
+#### 渲染显示 `BranchStatus()`：[branches.go:215-245](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/presentation/branches.go#L215-L245)
+
+```go
+ItemOperation != None  →  "Pushing ⠋"  或 "Pulling ⠋" (带 spinner)
+UpstreamGone           →  "(gone)" (红色)
+MatchesUpstream()      →  "✓" (绿色)
+RemoteBranchNotStored  →  "?" (品红)
+Ahead + Behind         →  "↓N↑M" (黄色)
+仅 Behind              →  "↓N" (黄色)
+仅 Ahead               →  "↑N" (黄色)
+```
+
+#### 基分支落后计数 `BehindBaseBranch`（异步加载）
+
+push/pull 后 `BranchLoader.Load()` 会通过 `onWorker` 回调异步计算所有分支相对主分支（main/master）的落后数：
+
+- **Git ≥ 2.41**：一次 `for-each-ref --format=%(ahead-behind:<base>)` 批量获取
+- **Git < 2.41**：每个分支单独 `rev-list --left-right --count <branch>...<base>`，errgroup 并发
+
+每计算完一个分支会调用 `renderFunc()` 触发 `OnUIThread` 重绘分支上下文。
+
+---
+
+### 4.5 远程信息（Remotes）刷新详解
+
+**代码位置**：[remote_loader.go:31-164](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/commands/git_commands/remote_loader.go#L31-L164)
+
+#### 并行加载策略 `GetRemotes()`：
+
+```
+GetRemotes()
+    ├─ goroutine A: getRemoteBranchesByRemoteName()
+    │   └─ git for-each-ref --format=%(refname) refs/remotes
+    │       └─ 解析每行 refs/remotes/<name>/<branch>
+    │           └─ 构建 map[string][]*RemoteBranch
+    │
+    └─ 主线程: getRemotesFromConfig()
+        └─ git config --local --get-regexp ^remote\.[^.]+\.(url|pushurl)$
+            └─ 解析 remote name + urls + pushUrls
+                └─ 构建 []*Remote (不含 Branches)
+
+    └─ wg.Wait()  → 合并: remote.Branches = map[name]
+    └─ 排序: origin 优先，其余按字母序
+```
+
+#### 刷新后的联动：`refreshRemotes()` [refresh_helper.go:689-720](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L689-L720)
+
+1. 更新 `Model.Remotes`
+2. `rebuildPullRequestsMap()`：根据远程分支重建 GitHub PR 映射
+3. 保持选中的 remote，同步更新 `Model.RemoteBranches`
+4. 刷新 Remotes 视图 + RemoteBranches 视图
+5. 如果 PR 映射从空变非空，额外刷新 Branches 视图（显示 PR 图标）
+
+---
+
+### 4.6 文件状态刷新与冲突检测联动
+
+**代码位置**：[file_loader.go:41-215](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/commands/git_commands/file_loader.go#L41-L215)
+
+#### 核心命令 `git status --porcelain -z`：
+
+```go
+cmdArgs := NewGitCmd("status").
+    Arg("--untracked-files=all").
+    Arg("--porcelain").
+    Arg("-z").  // NUL 分隔，支持含空格的文件名
+    Arg("--find-renames=50%").
+    ToArgv()
+```
+
+#### 状态字段解析 `SetStatusFields()` / `deriveStatusFields()`：[file.go:132-164](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/commands/models/file.go#L132-L164)
+
+每个文件的 2 字符状态码（XY）被解析为结构化字段：
+
+| 状态码 | 含义 | HasMergeConflicts | HasInlineMergeConflicts |
+|--------|------|-------------------|-------------------------|
+| `UU` | 双方都修改 (unmerged) | ✅ | ✅ |
+| `AA` | 双方都添加 | ✅ | ✅ |
+| `DD` | 双方都删除 | ✅ | ❌ |
+| `AU` | 我们添加，他们修改 | ✅ | ❌ |
+| `UA` | 我们修改，他们添加 | ✅ | ❌ |
+| `UD` | 我们修改，他们删除 | ✅ | ❌ |
+| `DU` | 我们删除，他们修改 | ✅ | ❌ |
+| `??` | 未跟踪 | ❌ | ❌ |
+| `M ` | 已暂存修改 | ❌ | ❌ |
+| ` M` | 未暂存修改 | ❌ | ❌ |
+
+#### 刷新期间的自动处理 `refreshStateFiles()`：[refresh_helper.go:570-639](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L570-L639)
+
+```
+refreshStateFiles()
+    │
+    ├─ 自动 Stage 已解决的内联冲突文件 (AutoStageResolvedConflicts)
+    │   └─ HasInlineMergeConflicts == true 的文件
+    │       └─ 检查实际文件是否还有冲突标记
+    │           └─ 无冲突 → 加入 pathsToStage → git add
+    │
+    ├─ 冲突消失检测 (从有到无)
+    │   └─ WorkingTreeState.Any() && conflictFileCount == 0 && prevConflictFileCount > 0
+    │       └─ OnUIThread → PromptToContinueRebase()
+    │           └─ 弹 "Conflicts resolved, continue?" 确认框
+    │
+    └─ 文件过滤自动切换
+        ├─ 冲突从 0 → N: DisplayAll → DisplayConflicted
+        └─ 冲突从 N → 0: DisplayConflicted → DisplayAll
+```
+
+#### 文件渲染：[files.go:22-348](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/presentation/files.go#L22-L348)
+
+- 绿色字符 = 暂存区状态（X）
+- 红色字符 = 工作区状态（Y）
+- 工作树目录特殊显示（检测到 worktree path 时去尾斜杠）
+- 支持文件树（展开/折叠）和扁平两种展示模式
+
+---
+
+### 4.7 界面渲染顺序详解
+
+从数据模型更新到最终屏幕显示，经过以下调用链：
+
+#### 调用链：`Refresh → refreshView → postRefreshUpdate → HandleRender`
+
+```
+RefreshHelper.Refresh(ASYNC)
+    │
+    ├─ [Worker goroutine] 各 scope 加载数据 → 更新 Model.*
+    │
+    └─ refreshView(context)  [每个 scope 完成后触发]
+        │
+        └─ OnUIThread (切到 UI 线程)
+            │
+            ├─ ReApplyFilter(context)  // 重新应用搜索过滤
+            │
+            ├─ PostRefreshUpdate(context)
+            │   │
+            │   └─ Gui.postRefreshUpdate()  [view_helpers.go:127-163]
+            │       │
+            │       ├─ 1. c.HandleRender()
+            │       │   │
+            │       │   ├─ SimpleContext: 调用 handleRenderFunc()
+            │       │   │
+            │       │   └─ ListContextTrait.HandleRender()
+            │       │       ├─ ClampSelection()  // 限制选中范围
+            │       │       ├─ renderLines()     // 调用 presentation.* 生成字符串
+            │       │       │   └─ getDisplayStrings()
+            │       │       │       └─ e.g. GetBranchListDisplayStrings()
+            │       │       │           ├─ 读 Model.Branches
+            │       │       │           ├─ 读 State.itemOperations (for spinner)
+            │       │       │           └─ BranchStatus() → ✓/↓N/↑M/?/(gone)
+            │       │       ├─ SetContent() / SetViewPortContent()  // 写入 gocui.View 缓冲区
+            │       │       └─ setFooter()  // "N of M"
+            │       │
+            │       ├─ 2. 焦点处理
+            │       │   ├─ 当前视图 == c → HandleFocus() → FocusLine(true)
+            │       │   └─ 否则 → FocusLine(false)
+            │       │
+            │       └─ 3. 主视图刷新
+            │           ├─ 当前在主视图且非搜索中 → 侧面板 context.HandleRenderToMain()
+            │           └─ 当前是弹框且 c 是静态上下文 → HandleRenderToMain()
+            │
+            └─ AfterLayout
+                └─ ReApplySearch(context)  // 重新应用搜索高亮
+```
+
+#### 状态栏的特殊刷新 `refreshStatus()`：[refresh_helper.go:748-767](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L748-L767)
+
+状态栏不是通过 postRefreshUpdate，而是直接 `SetViewContent`：
+
+```go
+status := presentation.FormatStatus(
+    repoName,
+    currentBranch,
+    types.ItemOperationNone,      // 状态栏不显示 spinner（spinner 在分支行内显示）
+    linkedWorktreeName,
+    workingTreeState,              // 显示 "(rebasing)" / "(merging)" 等
+    tr,
+    userConfig,
+)
+self.c.SetViewContent(self.c.Views().Status, status)
+```
+
+#### 完整刷新时序（Push 成功后 ASYNC 模式）：
+
+```
+时间轴 →
+│
+│  git push 命令执行完毕 (Worker 线程)
+│  │
+│  ├─ InlineStatusHelper.stop() 清除 ItemOperation（但此时 Model 还是旧数据）
+│  │   └─ (非 Demo 模式) 不立即重绘，靠下方 Refresh 覆盖
+│  │
+│  ▼
+│  RefreshHelper.Refresh(ASYNC) 启动
+│  │
+│  ├─ 线程 1: refreshBranches()
+│  │   ├─ BranchLoader.Load() 读 git → 更新 Model.Branches（ahead/behind 变 0）
+│  │   ├─ [OnUIThread] Branches.HandleRender() → 分支列表显示 ✓
+│  │   └─ refreshStatus() → 状态栏显示 "repo → main ✓"
+│  │
+│  ├─ 线程 2: refreshCommitsAndCommitFiles()
+│  │   └─ 更新 Model.Commits → LocalCommits.HandleRender()
+│  │
+│  ├─ 线程 3: refreshFilesAndSubmodules()
+│  │   ├─ 更新 Model.Files
+│  │   └─ [OnUIThread] Files.HandleRender()
+│  │
+│  ├─ 线程 4: refreshRemotes()
+│  │   └─ 更新 Model.Remotes / RemoteBranches
+│  │
+│  ├─ ... 其他 scope ...
+│  │
+│  ▼
+│  所有 scope 完成，wg.Wait() 返回
+│  │
+│  └─ options.Then() 回调（如果有）
+│
+▼  屏幕最终显示新状态
+```
+
+---
+
+### 4.8 Upstream 提示机制
 
 **代码位置**：[upstream_helper.go:51-56](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/upstream_helper.go#L51-L56)
 
@@ -452,10 +779,21 @@ InlineStatusHelper.stop()
 3. **GIT_SEQUENCE_EDITOR 绕过**：防止交互式 rebase 配置导致 pull 挂起
 4. **锁文件自动重试**：解决 `.git/index.lock` 瞬时冲突问题
 5. **后台 fetch 凭证策略**：`FAIL` 策略（发换行）防止无提示挂起
+6. **刷新并发设计**：
+   - branchesAndRemotesWg / fileWg 等依赖管理
+   - 各 scope 独立 goroutine + 各自 OnUIThread 渲染，避免大锁阻塞
+   - BehindBaseBranch 异步渐进加载，先显示基本信息再补充基分支差距
+7. **冲突解决闭环**：refreshStateFiles 自动 stage 已解决冲突 + 冲突消失自动提示 Continue Rebase
 
 ### 6.2 易错点 / 注意事项
 
 1. **错误消息语言依赖**：冲突检测、落后提示基于英文错误字符串（如 "Updates were rejected"），非英文 Git 环境可能失效
 2. **远程分支信息缺失**：`AheadForPull == "?"` 时无法提前判断是否需要 force-push，只能先尝试普通 push
 3. **Refresh 时序**：push 成功后的 `Refresh(ASYNC)` 是异步的，UI 短暂显示旧的 ahead/behind 计数是预期行为（靠 async refresh 覆盖）
+   - branches、files、remotes 各 scope 完成时间不同，渲染是分批次出现的
+   - BehindBaseBranch 是异步 onWorker 计算，主视图先显示 `✓` 后才会显示 `↓N`
 4. **Demo 模式特殊处理**：InlineStatus stop 时会额外渲染，因为 demo 中 async refresh 被转成 sync
+5. **线程安全**：
+   - `itemOperations` map 有独立 mutex 保护
+   - `Model.Branches` / `Model.Files` 等在 Worker 线程写、UI 线程读，靠整体结构替换（非原地修改）保证可见性
+6. **过滤状态丢失**：每次 `ReApplyFilter(context)` 会重新创建过滤列表，如果用户在搜索中刷新，搜索高亮会在 `AfterLayout` 的 `ReApplySearch` 才恢复
