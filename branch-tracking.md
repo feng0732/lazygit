@@ -4,42 +4,90 @@
 
 ## 一、线程模型概览
 
-lazygit 中涉及四种不同的执行上下文，各自职责严格分离：
+### 1.1 三种执行上下文
 
-| 线程/执行上下文 | 创建者 | 职责 | 能直接做什么 | 不能直接做什么 |
-|---------------|-------|------|------------|-------------|
-| **MainLoop 线程** | gocui `MainLoop()` | 事件循环：处理键盘事件和 userEvents 队列，执行 flush 渲染屏幕 | 执行所有 View 操作（写入 buffer、移动光标、flush） | 阻塞式 I/O（如 git 命令） |
-| **刷新 goroutine** | `refresh()` 闭包内 `go Safe()` | 并发执行 refresh 任务（加载 branches、commits、files 等） | 调 git 命令、写 Model 数据（需 Mutex 保护） | 直接操作 View buffer、直接写屏幕 |
-| **OnWorker goroutine** | `OnWorker()` 内 `go func()` | 注册为 Task 的后台任务 | 调 git 命令、调 `OnUIThread()` 把 UI 工作投递给 MainLoop | 直接操作 View buffer |
-| **UI 线程回调** | `OnUIThread()` → 投递 `userEvents` → MainLoop 消费 | 真正的 UI 修改（渲染、写 Status、刷新 View） | 所有 View 操作（在 MainLoop 中执行） | 阻塞式 I/O |
+lazygit 的分支刷新涉及三种执行上下文：
 
-### 线程协作核心机制
+| 执行上下文 | 创建者 | 典型职责 |
+|----------|-------|--------|
+| **MainLoop 线程** | gocui `MainLoop()` | 事件循环：消费 userEvents 队列，执行 View buffer 写入，flush 渲染屏幕 |
+| **刷新 goroutine** | `refresh()` 内 `go Safe()` 或 `OnWorker()` 内 `go func()` | 调 git 命令、写 Model 数据、调度 UI 更新 |
 
-**投递 → 排队 → 消费**：
+**刷新 goroutine** 是统称，包含 `refresh()` 创建的裸 goroutine 和 `OnWorker` 创建的带 Task goroutine。两者的区别仅在于是否注册 Task（决定是否显示 loading），对 View 写入的线程规则完全相同。
+
+### 1.2 View 写入的两条路径
+
+所有 UI 更新最终都要写 View buffer（`view.SetContent` 或 `view.writeMutex` 保护的内部写方法），但有两条路径：
+
+**路径 A：经 OnUIThread 投递到 MainLoop 执行**
 
 ```
-任意 goroutine (刷新 goroutine / OnWorker goroutine)
-   │
-   │  OnUIThread(f)
-   ▼
-gocui Update(f)
-   │
-   │  go updateAsyncAux() → g.userEvents <- userEvent{f, task}
-   ▼
-userEvents channel (缓冲 20)
-   │
-   ▼
+刷新 goroutine
+  │  refreshView(ctx)  或  OnUIThread(f)
+  ▼
+g.userEvents <- userEvent{f, task}
+  │
+  ▼
 MainLoop 线程 processEvent() 消费
-   │
-   │  执行 f(gui) → 写 View buffer
-   ▼
-flush() 或 flushContentOnly() → 渲染到屏幕
+  │  执行 f → HandleRender() → view.SetContent()
+  ▼
+flush() → view.draw() → 渲染到屏幕
 ```
+
+[refreshView](pkg/gui/controllers/helpers/refresh_helper.go#L785-L809) 内部注释明确说：
+
+> refreshView is called from the worker goroutine that drives async refreshes, so bounce to the UI thread before mutating view content.
+
+它调用 `OnUIThread` → `PostRefreshUpdate` → [HandleRender](pkg/gui/context/list_context_trait.go#L110-L128) → `view.SetContent`，整个链条在 MainLoop 上执行。
+
+**路径 B：刷新 goroutine 中直接写 View buffer**
+
+```
+刷新 goroutine
+  │  refreshStatus()
+  ▼
+RefreshingStatusMutex.Lock()
+  │  SetViewContent(Status, status)
+  │  → view.SetContent(cleanString(status))
+RefreshingStatusMutex.Unlock()
+```
+
+[refreshStatus](pkg/gui/controllers/helpers/refresh_helper.go#L749-L767) **不走 OnUIThread**，直接在当前 goroutine 中调用 [SetViewContent](pkg/gui/view_helpers.go#L48-L50) → `view.SetContent`。
+
+**线程安全性分析**：`view.SetContent` 内部持有 [view.writeMutex](pkg/gocui/view.go#L1049-L1055)，`view.draw`（MainLoop flush 时调用）也持有同一个 [writeMutex](pkg/gocui/view.go#L1215-L1217)。两者通过 per-View 的 `writeMutex` 互斥，所以路径 B 不会导致 buffer 并发损坏。`RefreshingStatusMutex` 只保护多次 `refreshStatus` 调用之间的互斥，真正的 buffer 安全由 `writeMutex` 保证。
+
+**两条路径的实质区别**：不在于线程安全（`writeMutex` 已保证），而在于**执行时机**。路径 A 在 MainLoop 事件循环中执行，写完 buffer 后**同一个 MainLoop 周期**内就会 flush 到屏幕，读写紧凑。路径 B 写完 buffer 后，屏幕更新要等 MainLoop 下一次处理 userEvents 或定时 flush 时才生效，中间可能被其他 goroutine 再次写入同一 View，导致这次写入的内容"被覆盖"而非"被看到"。
+
+### 1.3 refreshBranches 中的 View 写入点清单
+
+[refreshBranches](pkg/gui/controllers/helpers/refresh_helper.go#L486-L543) 内部有 4 处 View 写入操作：
+
+| # | 代码行 | 调用链 | 目标 View | 路径 | 实际执行线程 |
+|---|-------|-------|----------|------|------------|
+| ① | 第 500-506 行 `renderFunc` | `OnUIThread` → `HandleRender(Branches)` + `refreshStatus()` | Branches + Status | A | MainLoop |
+| ② | 第 531 行 | `refreshView(Branches)` → `OnUIThread` → `PostRefreshUpdate` → `HandleRender` | Branches | A | MainLoop |
+| ③ | 第 535-540 行 | `OnUIThread` → `HandleRender(Commits)` | Commits | A | MainLoop |
+| ④ | 第 542 行 | `refreshStatus()` → `SetViewContent(Status)` → `view.SetContent` | Status | B | 刷新 goroutine |
+
+**① 中的 `refreshStatus()`** 在 `OnUIThread` 回调内调用，所以实际在 MainLoop 上执行，走路径 A。
+
+**④ 中的 `refreshStatus()`** 直接在刷新 goroutine 中调用，走路径 B。由于 ① 和 ④ 都写 Status View，且 ① 在 OnUIThread 中排队等待 MainLoop 消费，④ 在刷新 goroutine 中立即执行，**④ 的写入可能先于 ① 生效，但随后被 ① 的 MainLoop 执行覆盖**——最终屏幕上显示的是 ① 的内容。
+
+### 1.4 三种 View 写入函数的线程规则总结
+
+| 函数 | 是否经 OnUIThread | 写入路径 | 说明 |
+|------|-----------------|---------|------|
+| `refreshView(ctx)` | ✅ 是 | A | 包裹在 OnUIThread 中，View 写入在 MainLoop 上，写后即 flush |
+| `OnUIThread(f)` 中调 `HandleRender` / `refreshStatus` | — （已在 MainLoop 上） | A | renderFunc 就是这种模式 |
+| `refreshStatus()` | ❌ 否 | B | 直接写 Status View buffer，内容可能被后续路径 A 的写入覆盖 |
 
 关键代码位置：
 - `OnUIThread` 投递：[gui.go](pkg/gui/gui.go#L1185-L1189) → [gocui/gui.go](pkg/gocui/gui.go#L619-L642)
-- MainLoop 消费：[gocui/gui.go](pkg/gocui/gui.go#L714-L810)
-- OnWorker 调度：[gocui/gui.go](pkg/gocui/gui.go#L650-L675)
+- MainLoop 消费 userEvents：[gocui/gui.go](pkg/gocui/gui.go#L756-L786)
+- `refreshView` bounce 到 UI 线程：[refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L785-L809)
+- `refreshStatus` 直接写 buffer：[refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L749-L767)
+- `view.SetContent` 底层用 writeMutex 保护：[view.go](pkg/gocui/view.go#L1049-L1055)
+- `view.draw` 读取时也用 writeMutex 保护：[view.go](pkg/gocui/view.go#L1215-L1217)
 
 ## 二、数据模型：状态的载体
 
@@ -172,27 +220,27 @@ if loadBehindCounts && self.UserConfig().Gui.ShowDivergenceFromBaseBranch != "no
 }
 ```
 
-**关键机制（三层嵌套 goroutine）**：
+**关键机制（三层 goroutine 嵌套）**：
 
 | 层级 | 执行上下文 | 代码位置 | 做什么 |
 |------|----------|---------|-------|
-| 第 1 层 | 刷新 goroutine（`refresh()` 内 `go Safe()`） | Load 第 139 行 | 判断条件，调用 `onWorker(f)` |
-| 第 2 层 | OnWorker goroutine（`go func()`，注册 Task） | [gocui/gui.go](pkg/gocui/gui.go#L650-L656) | 执行 `GetBehindBaseBranchValuesForAllBranches()` → 调 git 命令算差异 |
-| 第 3 层 | UI 线程回调（MainLoop 消费 userEvents） | `renderFunc()` 内部 | `HandleRender()` 重绘分支列表 + `refreshStatus()` 重绘状态栏 |
+| 第 1 层 | 刷新 goroutine | Load 第 139 行 | 判断条件，调用 `onWorker(f)` |
+| 第 2 层 | 刷新 goroutine（OnWorker 创建的新 goroutine） | [gocui/gui.go](pkg/gocui/gui.go#L650-L656) | 执行 `GetBehindBaseBranchValuesForAllBranches()` → 调 git 命令算差异 |
+| 第 3 层 | MainLoop 线程 | `renderFunc()` 内部 | `HandleRender()` 重绘分支列表（路径 A）+ `refreshStatus()` 重绘状态栏（也在 OnUIThread 回调内，路径 A） |
 
 **`renderFunc()` 的完整定义**（传入 `BranchLoader.Load` 的第 6 个参数）在 [refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L500-L506)：
 
 ```go
 func() {
-    self.c.OnUIThread(func() error {       // ← 再投递给 MainLoop
-        self.c.Contexts().Branches.HandleRender()   // 直接写 View buffer
-        self.refreshStatus()                       // 直接写 Status View
+    self.c.OnUIThread(func() error {       // ← 投递给 MainLoop
+        self.c.Contexts().Branches.HandleRender()   // 路径 A：经 OnUIThread → MainLoop 写 Branches View
+        self.refreshStatus()                       // 也在 OnUIThread 回调内 → 同样在 MainLoop 上，路径 A
         return nil
     })
 }
 ```
 
-⚠️ **重要**：`HandleRender()` 和 `refreshStatus()` 都直接操作 View buffer，**必须**在 UI 线程（即 MainLoop 消费 userEvents 时）执行，否则会并发写 buffer 导致崩溃。
+这里 `refreshStatus()` 在 `OnUIThread` 回调**内部**调用，所以实际在 MainLoop 上执行，走路径 A。这和 `refreshBranches` 末尾直接调用 `refreshStatus()`（第 542 行，不走 OnUIThread，走路径 B）形成对比。
 
 计算路径：
 | 路径 | Git 版本要求 | 方式 |
@@ -330,7 +378,7 @@ MainLoop 线程（用户触发 Refresh 或启动刷新）
 │          步骤 3c: refreshView(Branches)                                                     │
 │              └─ OnUIThread 投递 → 等待 MainLoop 消费                                        │
 │          步骤 3d: refreshStatus()                                                           │
-│              └─ SetViewContent(Status, status)  ⚠️ 线程风险！                               │
+│              └─ SetViewContent(Status, status)  ⚠️ 路径 B：直接写 buffer，可能被路径 A 覆盖   │
 │                                                                                             │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
                                                                                              │
@@ -357,7 +405,7 @@ MainLoop 线程（持续消费 userEvents）  ◄──────────�
 | T3 | 刷新 goroutine | **第一次 refreshBranches(false)** → 同步返回分支列表（reflog 可能为空，分支顺序不准） | 第 303 行 → [第 486-543 行](pkg/gui/controllers/helpers/refresh_helper.go#L486-L543) | `loadBehindCounts=false` | INITIAL |
 | T3a | 刷新 goroutine | 写 Model.Branches = branches | 第 513 行 | — | INITIAL |
 | T3b | 刷新 goroutine | `refreshView(Branches)` → 投递 OnUIThread，**立即返回** | 第 531 行 → [第 785-809 行](pkg/gui/controllers/helpers/refresh_helper.go#L785-L809) | — | INITIAL |
-| T3c | 刷新 goroutine | `refreshStatus()` → **直接写 Status View buffer** | 第 542 行 → [第 749-767 行](pkg/gui/controllers/helpers/refresh_helper.go#L749-L767) | — | INITIAL |
+| T3c | 刷新 goroutine | `refreshStatus()` → **路径 B：直接写 Status View buffer**（writeMutex 保护，无并发损坏风险，但内容可能被后续路径 A 的写入覆盖） | 第 542 行 → [第 749-767 行](pkg/gui/controllers/helpers/refresh_helper.go#L749-L767) | — | INITIAL |
 | T4 | OnWorker goroutine #1 | `refreshReflogCommits()` → 实际加载 reflog | 第 287 行 | — | INITIAL |
 | T5 | OnWorker goroutine #1 | **第二次 refreshBranches(true)** → reflog 已加载，分支按 recency 排序正确 | 第 288 行 | `loadBehindCounts=true` | INITIAL |
 | T5a | OnWorker goroutine #1 | 调度 **OnWorker goroutine #2** 计算 BehindBaseBranch | `Load` 第 139-143 行 | — | INITIAL |
@@ -380,10 +428,10 @@ MainLoop 线程（持续消费 userEvents）  ◄──────────�
    - 第二次重绘：T5b，分支按 recency 正确排序，BehindBaseBranch 仍用继承值或 0
    - 第三次重绘：T7a，BehindBaseBranch 计算完成，显示正确的 ↓N
 
-4. **⚠️ refreshStatus 的线程风险**：
-   - `refreshStatus()` 内部直接调用 `SetViewContent()` → 写 View buffer
-   - 在 T3c（刷新 goroutine）和 T5b（OnWorker goroutine #1）中直接调用，没有走 OnUIThread
-   - 依赖 `RefreshingStatusMutex` 保护，但与 MainLoop 的 flush 之间仍存在 buffer 并发读写的理论风险
+4. **refreshStatus 的两条写入路径**：
+   - 路径 B（T3c/T5b）：刷新 goroutine 中直接调用 `SetViewContent()`，由 `view.writeMutex` 保护，无并发损坏风险
+   - 路径 A（renderFunc 内）：`OnUIThread` 回调中调用，在 MainLoop 上执行
+   - 两条路径都写 Status View，路径 B 的内容可能被后续路径 A 的 MainLoop 执行覆盖——最终屏幕上显示的是路径 A 的内容
 
 #### 4.4.4 COMPLETE 阶段后的行为
 
@@ -566,7 +614,7 @@ MainLoop 线程 (键盘/启动触发 Refresh)
 │  │       ├─ refreshView(Branches)
 │  │       │   └─ OnUIThread → 投递 userEvents ──────────┐
 │  │       │                                               │
-│  │       └─ refreshStatus() (直接写 Status View buffer) │
+│  │       └─ refreshStatus() (路径 B：直接写 Status View buffer，可能被路径 A 覆盖) │
 │  │                                                       │
 │  └─ date/alphabetical 模式:                              │
 │      ├─ refreshBranches(..., true)                       │
@@ -607,11 +655,11 @@ MainLoop 线程 (持续消费 userEvents channel)  ◄────────�
 
 1. **四线程协作模型**：MainLoop 线程负责事件循环和屏幕渲染；刷新 goroutine 负责 git 命令和模型更新；OnWorker goroutine 是注册为 Task 的后台任务；UI 线程回调是 MainLoop 消费 userEvents 时执行的闭包。
 
-2. **三层 goroutine 嵌套（BehindBaseBranch）**：刷新 goroutine → OnWorker goroutine #1 计算差异 → 又通过 OnUIThread 投递到 MainLoop。每一层都有明确职责，绝不跨层直接操作 View buffer。
+2. **三层 goroutine 嵌套（BehindBaseBranch）**：刷新 goroutine → OnWorker goroutine #1 计算差异 → 又通过 `OnUIThread` 投递到 MainLoop（路径 A）。renderFunc 中的 `HandleRender` 和 `refreshStatus` 都在 MainLoop 上执行。
 
-3. **userEvents channel 串行化 UI 修改**：所有写 View buffer 的操作都通过 `OnUIThread()` → `g.userEvents <-` 投递到同一 channel，由 MainLoop 串行消费，天然避免并发写 buffer。
+3. **userEvents channel 串行化路径 A 的 UI 修改**：经 `OnUIThread()` → `g.userEvents <-` 投递的操作由 MainLoop 串行消费，写完 buffer 后同一周期内 flush。但路径 B（`refreshStatus` 直接写）不经过此队列，其内容可能被后续路径 A 覆盖。
 
-4. **refreshStatus 的潜在线程风险**：T3c 和 T5b 中 `refreshStatus()` 直接在刷新 goroutine / OnWorker goroutine 中调用 `SetViewContent()`，未走 OnUIThread。依赖 `RefreshingStatusMutex` 互斥，但与 MainLoop 的 flush 之间仍有并发读写风险。
+4. **View buffer 的 writeMutex 保证并发安全**：`view.SetContent` 和 `view.draw` 都持有 per-View 的 `writeMutex`，即使路径 B 在非 MainLoop 线程写入，也不会与 flush 产生并发损坏。路径 A 和路径 B 的区别在于执行时机而非线程安全。
 
 5. **recency 模式三次渐进重绘**：第一次重绘（分支排序可能不准）→ 第二次重绘（分支按 recency 排序正确）→ 第三次重绘（BehindBaseBranch 值正确）。三次依次排队到 userEvents channel，用户感知为渐进式更新。
 
