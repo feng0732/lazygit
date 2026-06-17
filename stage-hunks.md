@@ -208,67 +208,247 @@ newLen = count(CONTEXT) + count(ADDITION)
 
 ---
 
-## 四、写回流程：从补丁字符串到 Git 索引
+## 四、写回流程：从补丁字符串到索引与工作区
 
-### 4.1 StagingController 的主路径
+### 4.1 写回入口点：两个函数，四种场景
 
-`ToggleStaged` → `applySelectionAndRefresh(reverse=false)` → `applySelection(reverse)`：
-
-核心代码位于 [staging_controller.go#L236-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L236-L280)：
+`StagingController` 对外暴露两个写回入口（[staging_controller.go#L204-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L204-L234)）：
 
 ```go
-func (self *StagingController) applySelection(reverse bool) error {
-    // 1. 从状态层取选中范围
-    firstLineIdx, lastLineIdx := state.SelectedPatchRange()
+// 空格键：暂存 / 取消暂存
+func (self *StagingController) ToggleStaged() error {
+    return self.applySelectionAndRefresh(self.staged)
+    // 主面板 staged=false → reverse=false
+    // 副面板 staged=true  → reverse=true
+}
 
-    // 2. 二次 Parse + Transform（不依赖缓存，保证幂等）
-    patchToApply := patch.
-        Parse(state.GetDiff()).
-        Transform(patch.TransformOpts{
-            Reverse:             reverse,
-            IncludedLineIndices: patch.ExpandRange(firstLineIdx, lastLineIdx),
-            FileNameOverride:    path,
-        }).
-        FormatPlain()
-
-    // 3. 调用 Git 命令层
-    err := self.c.Git().Patch.ApplyPatch(patchToApply, git_commands.ApplyPatchOpts{
-        Reverse: reverse,
-        Cached:  !reverse || self.staged,   // ← 关键参数组合
-    })
+// d 键：丢弃变更
+func (self *StagingController) DiscardSelection() error {
+    // 仅主面板(!staged)且未配置跳过警告时弹窗确认
+    return self.c.ConfirmIf(!self.staged && !skipWarning,
+        ..., HandleConfirm: func() { return self.applySelectionAndRefresh(true) })
+    // 主面板/副面板都是 reverse=true
 }
 ```
 
-### 4.2 ApplyPatchOpts 参数组合矩阵
+两个入口最终都调用 `applySelection(reverse bool)`，参数组合为：
 
-这是理解"暂存/取消暂存/丢弃"三种操作差异的关键：
+| 场景 | 调用 | `reverse` | `self.staged` |
+|------|------|-----------|---------------|
+| ①主面板+空格（暂存） | `ToggleStaged()` | `false` | `false` |
+| ②副面板+空格（取消暂存） | `ToggleStaged()` | `true` | `true` |
+| ③主面板+d（丢弃变更） | `DiscardSelection()` | `true` | `false` |
+| ④副面板+d（丢弃暂存） | `DiscardSelection()` | `true` | `true` |
 
-| 用户操作 | 控制器 | `reverse` 参数 | `staged` 上下文 | `git apply` 标志 | 效果 |
-|---------|--------|---------------|----------------|-----------------|------|
-| **暂存**（按空格） | 主面板（unstaged） | false | false | `--cached` | 工作区变更 → 暂存区 |
-| **取消暂存**（按空格） | 副面板（staged） | false | true | `--cached` | 暂存区变更 → 工作区（反向应用索引补丁） |
-| **丢弃变更**（按 d） | 主面板（unstaged） | true | false | `--cached` `--reverse` | 工作区选中行被丢弃（反向应用） |
-| **丢弃暂存**（按 d） | 副面板（staged） | true | true | `--cached` `--reverse` | 暂存区选中行被丢弃，工作区保留 |
+> **关键洞察：** 场景②和场景④的参数完全相同（reverse=true, staged=true），在副面板中按空格和按 d 走的是完全相同的写回路径，均为"取消暂存"。
 
-`Cached` 标志的计算：`!reverse || self.staged`，解读为：
-- 正向操作（reverse=false）：总是 `--cached`，写入索引
-- 反向操作（reverse=true）：只有在 staged 面板才 `--cached`，否则只改工作区
+### 4.2 背景：主副面板的 Diff 语义
 
-### 4.3 Git 命令执行
+理解写回效果的前提是明确两个面板显示的 diff 含义。`StagingHelper` 刷新时（[staging_helper.go#L56-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/helpers/staging_helper.go#L56-L57)）：
+
+```go
+mainDiff      = WorktreeFileDiff(file, true, false)  // git diff（无 --cached）
+secondaryDiff = WorktreeFileDiff(file, true, true)   // git diff --cached
+```
+
+对应底层的 `git diff` 命令（[working_tree.go#L413-L426](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/git_commands/working_tree.go#L413-L426)）：
+
+| 面板 | Git 命令 | 对比双方 | `-` 含义 | `+` 含义 |
+|------|---------|---------|---------|---------|
+| **主面板（Unstaged）** | `git diff` | **索引 ↔ 工作区** | 索引中有、工作区已删除的行 | 工作区新增、索引中没有的行 |
+| **副面板（Staged）** | `git diff --cached` | **HEAD ↔ 索引** | HEAD 中有、索引已删除的行 | 索引新增、HEAD 中没有的行 |
+
+### 4.3 Reverse 参数的双重语义
+
+`reverse` 参数同时作用于**两个独立环节**，不能混淆：
+
+#### 环节 A：Transform.Reverse → 影响哪些行转 context、哪些行丢弃
+
+位于 [transform.go#L167](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L167)：
+
+```go
+isOldFileLine := (line.Kind == DELETION && !self.opts.Reverse) || (line.Kind == ADDITION && self.opts.Reverse)
+```
+
+这个变量决定了"未选中行"的处理策略：
+
+| Reverse 值 | `isOldFileLine` 为真的行类型 | 未选中时处理 | 另一类行未选中时 |
+|-----------|----------------------------|------------|---------------|
+| **false**（正向） | DELETION（`-` 行） | 转为 ` ` context（保留在旧文件侧） | ADDITION → 直接丢弃 |
+| **true**（反向） | ADDITION（`+` 行） | 转为 ` ` context（保留在旧文件侧） | DELETION → 直接丢弃 |
+
+设计意图：**`isOldFileLine` 标记的是"属于旧文件侧"的行**，对于未选中的旧文件侧行不能真的丢弃（会导致上下文缺失，`git apply` 定位失败），必须转成 context 行保住定位锚点。而属于新文件侧的未选中行本就不存在于旧文件中，直接丢弃不影响上下文。
+
+#### 环节 B：ApplyPatchOpts.Reverse → 传给 `git apply --reverse`
+
+位于 [git_commands/patch.go#L70-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/git_commands/patch.go#L70-L76)：
+
+```
+git apply --reverse <patch>
+```
+
+含义：**把 patch 整体反方向应用**（原本 `+` 的行改为删除，原本 `-` 的行改为新增）。
+
+#### 两个 Cached/Reverse 的计算
+
+`applySelection()` 中的核心代码（[staging_controller.go#L246-L269](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L246-L269)）：
+
+```go
+patchToApply := patch.Parse(state.GetDiff()).
+    Transform(patch.TransformOpts{
+        Reverse:             reverse,          // ← Transform 用
+        IncludedLineIndices: ExpandRange(firstLineIdx, lastLineIdx),
+        FileNameOverride:    path,
+    }).FormatPlain()
+
+err := self.c.Git().Patch.ApplyPatch(patchToApply, git_commands.ApplyPatchOpts{
+    Reverse: reverse,                         // ← git apply 用
+    Cached:  !reverse || self.staged,         // ← --cached 标志
+})
+```
+
+`Cached` 表达式 `!reverse || self.staged` 的真值表：
+
+| reverse | self.staged | Cached | 含义 |
+|---------|-------------|--------|------|
+| false   | false       | true   | 只改索引 |
+| true    | true        | true   | 只改索引 |
+| true    | false       | false  | 只改工作区 |
+| false   | true        | —      | 此组合永远不会出现 |
+
+### 4.4 四条路径的逐行精确推导
+
+#### 路径①：主面板 + 空格（暂存选中行）
+
+**参数：** `reverse=false, self.staged=false, Cached=true`
+**对应 Git 命令：** `git apply --cached <patch>`（正向应用到索引）
+
+**Diff 语义：** 索引 vs 工作区，`-` = 索引内容，`+` = 工作区内容
+
+**Transform(Reverse=false) 的行处理：**
+
+| 原 diff 行 | 选中？ | isOldFileLine=DELETION | 处理结果 |
+|-----------|-------|----------------------|---------|
+| `- old`（索引中被删） | ✅选中 | true（DELETION类） | 保留 `- old`（表示从索引删除） |
+| `- old`（索引中被删） | ❌未选 | true | 转 ` ` context（索引中保留，作为上下文） |
+| `+ new`（工作区新增） | ✅选中 | false（ADDITION类） | 保留 `+ new`（表示加入索引） |
+| `+ new`（工作区新增） | ❌未选 | false | 直接丢弃（不加入索引，留在工作区） |
+| ` ` context | — | — | 原样保留 |
+
+**应用效果：**
+
+| 目标 | 变化 |
+|------|------|
+| ✅ **索引** | 正向应用选中的变更：选中的工作区新增行 → 加入索引；选中的工作区删除行 → 从索引移除 |
+| ✅ **工作区** | `--cached` 标志不触碰工作区文件，**完全不变** |
+
+**变更流向：** 工作区（选中部分） → 索引
+
+---
+
+#### 路径②：副面板 + 空格（取消暂存选中行）
+
+**参数：** `reverse=true, self.staged=true, Cached=true`
+**对应 Git 命令：** `git apply --cached --reverse <patch>`（反向应用到索引）
+
+**Diff 语义：** HEAD vs 索引，`-` = HEAD 内容，`+` = 索引内容
+
+**Transform(Reverse=true) 的行处理：**
+
+| 原 diff 行 | 选中？ | isOldFileLine=ADDITION | 处理结果 |
+|-----------|-------|----------------------|---------|
+| `- old`（HEAD被删） | ✅选中 | false | 保留 `- old`（flush后） |
+| `- old`（HEAD被删） | ❌未选 | false | 直接丢弃（didSeeUnselectedNewFileLine=true） |
+| `+ new`（索引中新增） | ✅选中 | true（ADDITION类） | flush pendingContext 后保留 `+ new` |
+| `+ new`（索引中新增） | ❌未选 | true | 转 ` ` context 入 pendingContext（最后flush） |
+| ` ` context | — | — | 原样保留 |
+
+**git apply --reverse 的效果：** 把 diff 意义反转——原本描述"HEAD → 索引"的补丁，反向应用就是还原回 HEAD。
+
+- patch 中 `+ new_line`（索引比 HEAD 多的行）→ reverse = **从索引中删除 new_line**
+- patch 中 `- old_line`（索引比 HEAD 少的行）→ reverse = **把 old_line 加回索引**
+
+**应用效果：**
+
+| 目标 | 变化 |
+|------|------|
+| ✅ **索引** | 选中的变更被还原为 HEAD 状态（即从索引中撤销） |
+| ✅ **工作区** | `--cached` 标志不触碰工作区文件，**完全不变** |
+
+**视觉上的"流回工作区"：** 工作区本来就包含这些变更（工作区 = HEAD + 全部暂存变更 + 未暂存变更），当从索引中移除选中变更后，它们自动被 Git 状态识别为"未暂存的工作区变更"，所以看起来像是从暂存区"流回"了工作区面板。
+
+**变更流向：** 索引（选中部分） → 还原为 HEAD → 工作区中自动显现
+
+---
+
+#### 路径③：主面板 + d（丢弃工作区选中变更）
+
+**参数：** `reverse=true, self.staged=false, Cached=false`
+**对应 Git 命令：** `git apply --reverse <patch>`（反向应用到工作区，**无 --cached**）
+
+**Diff 语义：** 索引 vs 工作区，`-` = 索引内容，`+` = 工作区内容
+
+**Transform(Reverse=true) 的行处理：** 同路径②（ADDITION 是 oldFileLine 类）
+
+**生成的 patch：** 只保留选中的 +/- 变更行，未选中的 ADDITION 转 context，未选中的 DELETION 丢弃。
+
+**git apply --reverse（无 --cached）的效果：** 反向应用到**工作区**（因为无 --cached 默认作用于工作区）。
+
+- patch 中 `+ new_line`（工作区新增了 new_line）→ reverse = **从工作区中删除 new_line** → 还原为索引状态
+- patch 中 `- old_line`（工作区删除了 old_line）→ reverse = **把 old_line 加回工作区** → 还原为索引状态
+
+**应用效果：**
+
+| 目标 | 变化 |
+|------|------|
+| ✅ **索引** | 无 --cached 标志，索引**完全不变** |
+| ✅ **工作区** | 选中的变更被还原为与索引一致（即丢弃本地修改） |
+
+**变更流向：** 工作区（选中部分） → 被索引内容覆盖
+
+---
+
+#### 路径④：副面板 + d（丢弃暂存区选中变更）
+
+**参数：** `reverse=true, self.staged=true, Cached=true`
+
+> 与路径②的参数完全相同 → 走完全相同的代码路径 → **效果与副面板按空格（取消暂存）完全一致。**
+
+副面板中"丢弃暂存的变更"在设计上被等价于"取消暂存"。如果真的要连同工作区一起彻底丢弃（即 `git checkout HEAD -- file` 的行级等价物），需要先取消暂存（路径②④）回到主面板，再在主面板中执行丢弃（路径③）两步操作。
+
+### 4.5 写回路径总表（修订版）
+
+| # | 场景 | reverse | staged | Cached | git apply 标志 | 索引变化 | 工作区变化 | 用户感知 |
+|---|------|---------|--------|--------|---------------|---------|-----------|---------|
+| ① | 主面板+空格（暂存） | false | false | true | `--cached` | 选中变更加入索引 | 不变 | 选中行从左面板消失 → 出现在右面板 |
+| ② | 副面板+空格（取消暂存） | true | true | true | `--cached --reverse` | 选中变更还原为HEAD | 不变 | 选中行从右面板消失 → 出现在左面板 |
+| ③ | 主面板+d（丢弃变更） | true | false | false | `--reverse` | 不变 | 选中变更还原为索引 | 选中行从左面板消失，文件中恢复为原始内容 |
+| ④ | 副面板+d（丢弃暂存） | true | true | true | `--cached --reverse` | 选中变更还原为HEAD | 不变 | 与②完全相同，取消暂存 |
+
+### 4.6 Git 命令执行细节
 
 `ApplyPatch()` 位于 [git_commands/patch.go#L60-L79](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/git_commands/patch.go#L60-L79)：
 
 ```
-1. SaveTemporaryPatch(patch) → 生成临时文件 ~/lazygit/RepoName/Jun_17_14.30.00.123456.patch
-2. 组装 git apply 参数: --3way / --cached / --index / --reverse 按需组合
+1. SaveTemporaryPatch(patch)
+   → 生成临时文件：~/AppData/Local/Temp/lazygit/RepoName/Jun_17_14.30.00.123456.patch
+
+2. 组装 git apply 参数（按条件组合）：
+   git apply
+     [--3way]       (用于自定义补丁的冲突处理，暂存面板不用)
+     [--cached]     (写入索引，路径①②④使用)
+     [--index]      (用于 PatchBuilder 的移动补丁)
+     [--reverse]    (反向应用，路径②③④使用)
+     <临时文件路径>
+
 3. cmd.New(cmdArgs).Run()
 ```
 
-**为什么不直接 stdin 管道？** 因为 `git apply` 处理中文文件名、换行等边界情况时，临时文件方案更稳定。
+**为什么必须用临时文件？** `git apply` 通过 stdin 处理中文文件名、混合换行符、BOM 头等边界情况时存在兼容性问题；写入临时文件再传路径的方案在跨平台场景下稳定得多。
 
-### 4.4 刷新与光标保持
+### 4.7 刷新与智能光标定位
 
-应用成功后，`applySelectionAndRefresh()` 触发：
+应用成功后，`applySelectionAndRefresh()` 触发（[staging_controller.go#L232](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L232)）：
 
 ```go
 self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.FILES, types.STAGING}})
@@ -276,11 +456,11 @@ self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.FILES, 
 
 `StagingHelper.RefreshStagingPanel()`（[staging_helper.go#L22-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/helpers/staging_helper.go#L22-L115)）会：
 
-1. 重新读取 `WorktreeFileDiff()`（未暂存 + 已暂存两份）
-2. 调用 `patch_exploring.NewState()` 重建状态
-3. `NewState()` 的智能光标定位逻辑（[state.go#L87-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L87-L112)）：
-   - 取旧状态的 `patchLineIdx` → `GetNextChangeIdx()` 跳到下一条变更
-   - 特殊处理"暂存 addition 后 cursor 落在 deletion 上"的重排问题
+1. **重算 Diff：** 再次调用 `WorktreeFileDiff()` 生成 unstaged + staged 两份最新 diff
+2. **重建 State：** `patch_exploring.NewState(diff, ...)` 解析新 diff 并建立索引映射
+3. **智能跳行：** `NewState()` 的光标定位逻辑（[state.go#L87-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L87-L112)）：
+   - 取旧状态的 `patchLineIdx` → `GetNextChangeIdx()` 跳到下一条变更行
+   - 特殊处理重排：暂存 addition 后未选中的 deletion 会被重排到前面，导致 cursor 恰好落在 deletion 上 → 检测到这种状态时跳过所有连续 deletion，再找下一条有效变更
 
 ---
 
