@@ -168,7 +168,21 @@ loadUserConfig(configFiles, base=默认值, isGuiInitialized)
                                ↑ 覆盖           ↑ 保留           ↑ 新增
 ```
 
-影响范围：`AuthorColors`、`BranchColorPatterns`、`CommitPrefixes`、`CustomPager` 等 `map[string]string` 类型字段。
+**UserConfig 中的所有 map 类型字段（完整清单）**：
+
+| 所在结构体 | 字段名 | 类型 | yaml 键 |
+|---|---|---|---|
+| `UserConfig` | `Services` | `map[string]string` | `services` |
+| `GuiConfig` | `AuthorColors` | `map[string]string` | `authorColors` |
+| `GuiConfig` | `BranchColors` | `map[string]string` | `branchColors` (已废弃) |
+| `GuiConfig` | `BranchColorPatterns` | `map[string]string` | `branchColorPatterns` |
+| `GuiConfig.CustomIconsConfig` | `Filenames` | `map[string]IconProperties` | `customIcons.filenames` |
+| `GuiConfig.CustomIconsConfig` | `Extensions` | `map[string]IconProperties` | `customIcons.extensions` |
+| `GitConfig` | `CommitPrefixes` | `map[string][]CommitPrefixConfig` | `git.commitPrefixes` |
+
+> **注意**：之前文档中误列入的 `CustomPager` 并非 map 类型字段。`GitConfig.Pagers` 是 `[]PagingConfig`（切片），整体替换。
+>
+> 对于值为切片或结构体的 map（如 `CommitPrefixes`、`Filenames`），键级合并在**map 键层级**生效：声明的键整体替换该键的值（值内部仍按切片/结构体规则处理），未声明的键全部保留。
 
 #### 切片字段：整体替换
 
@@ -183,13 +197,23 @@ loadUserConfig(configFiles, base=默认值, isGuiInitialized)
 
 ThemeConfig 的所有字段（`ActiveBorderColor`、`InactiveBorderColor`、`SelectedLineBgColor` 等）都是 `[]string` 切片类型，因此**主题配置的每个颜色字段都是整体替换**。
 
+**易被误判为 map 实为切片的字段**：
+- `CustomCommands`（`[]CustomCommand`，但代码中有特殊的 append 追加逻辑）
+- `Git.Pagers`（`[]PagingConfig`，整体替换）
+- `Git.MainBranches`（`[]string`，整体替换）
+- `Theme.ActiveBorderColor` 等全部 ThemeConfig 字段（`[]string`，整体替换）
+
 #### 三种行为总结
 
-| 字段类型 | 合并行为 | 未提及的字段/键 | ThemeConfig 中的影响 |
+| 字段类型 | 合并行为 | 未提及的字段/键 | 涉及的配置字段 |
 |---|---|---|---|
-| 结构体 | 深度合并 | 保留原值 | `Theme` 整体未被提及时保留全部子字段 |
-| `map[string]string` | 键级合并 | 保留原键值 | 不适用于 ThemeConfig 本身，但适用于 `AuthorColors`、`BranchColorPatterns` 等 |
-| `[]string` | 整体替换 | 不适用（整个切片替换） | **ThemeConfig 的每个颜色字段都是整体替换** |
+| 结构体 | 深度合并（逐字段递归反序列化） | 保留原值 | `UserConfig` → `GuiConfig` → `ThemeConfig` → 每个颜色字段；`GitConfig`；`OSConfig` 等全部嵌套结构体 |
+| `map[string]T`（T 任意） | 键级合并（逐键写入或覆盖） | 保留原键值 | 共 7 个：`Services`、`AuthorColors`、`BranchColors`、`BranchColorPatterns`、`CustomIcons.Filenames`、`CustomIcons.Extensions`、`Git.CommitPrefixes` |
+| `[]T`（切片） | 整体替换（重建新切片，旧值丢弃） | 不适用（整个切片替换） | `Theme.ActiveBorderColor` 等全部 `[]string`；`CustomCommands`；`Git.Pagers`；`Git.MainBranches`；`Spinner.Frames`；`Keybinding` 中多键绑定 |
+
+**ThemeConfig 的特殊性**：`ThemeConfig` 本身是结构体（深度合并），但它的**所有 12 个字段都是 `[]string` 切片**（整体替换）。因此：
+- 若 YAML 省略了 `theme:` 段 → 所有主题字段保留原值（结构体深度合并）
+- 若 YAML 中只声明了 `theme.activeBorderColor` → 只有该字段被替换，其余 11 个字段保留（结构体深度合并 + 切片整体替换的嵌套效果）
 
 #### 实际效果示例
 
