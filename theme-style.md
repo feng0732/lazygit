@@ -31,9 +31,10 @@ Lazygit 的配置由多个来源逐层叠加，**后加载的文件覆盖先加�
 | 0 (最低) | 硬编码默认值 | `GetDefaultConfigForPlatform()` 代码内 | 不可修改，始终存在 |
 | 1 | 命令行指定配置 (`--use-config-file`) | 用户指定，逗号分隔多文件 | `ConfigFilePolicyErrorIfMissing` |
 | 1 (alt) | 全局用户配置 | `~/.config/lazygit/config.yml` | `ConfigFilePolicyCreateIfMissing` |
-| 2 | 仓库根目录 `.lazygit.yml` | `/repo-root/.lazygit.yml` | `ConfigFilePolicySkipIfMissing` |
-| 3 | 父目录链 `.lazygit.yml` | `/repo-root/.. /.lazygit.yml` 逐级向上 | `ConfigFilePolicySkipIfMissing` |
-| 4 | Git 目录内配置 | `.git/lazygit.yml` | `ConfigFilePolicySkipIfMissing` |
+| 2 | 父目录链 `.lazygit.yml` | 从仓库父目录逐级向上到根目录 | `ConfigFilePolicySkipIfMissing` |
+| 3 (最高) | Git 目录内配置 | `.git/lazygit.yml` | `ConfigFilePolicySkipIfMissing` |
+
+> **注意**：仓库根目录的 `.lazygit.yml`（即 `/repo-root/.lazygit.yml`）目前是 TODO 状态，**未实现**。代码中 `pkg/gui/gui.go` 第 438 行留有注释 `// TODO: add filepath.Join(gui.git.RepoPaths.RepoPath(), ".lazygit.yml"), // with trust prompt`。
 
 ### 1.2 配置文件的发现与组装
 
@@ -62,19 +63,21 @@ NewAppConfig()
 
 #### 仓库级配置文件定位
 
-`getPerRepoConfigFiles()` (`pkg/gui/gui.go`) 负责收集仓库级配置：
+`getPerRepoConfigFiles()` (`pkg/gui/gui.go`) 负责收集仓库级配置。它的构造逻辑是：先以 `.git/lazygit.yml` 作为初始列表，然后从**仓库的父目录**开始，逐级向上遍历，每一层都用 `utils.Prepend()` 将该层的 `.lazygit.yml` 插入到列表最前面。
 
 ```go
 func (gui *Gui) getPerRepoConfigFiles() []*config.ConfigFile {
     repoConfigFiles := []*config.ConfigFile{
-        // .git/lazygit.yml (仓库 .git 目录内)
-        {Path: filepath.Join(gui.git.RepoPaths.RepoGitDirPath(), "lazygit.yml"),
-         Policy: config.ConfigFilePolicySkipIfMissing},
+        // TODO: add filepath.Join(gui.git.RepoPaths.RepoPath(), ".lazygit.yml"),
+        // with trust prompt
+        {
+            Path:   filepath.Join(gui.git.RepoPaths.RepoGitDirPath(), "lazygit.yml"),
+            Policy: config.ConfigFilePolicySkipIfMissing,
+        },
     }
 
-    // 从仓库根目录向上逐级搜索 .lazygit.yml
     prevDir := gui.c.Git().RepoPaths.RepoPath()
-    dir := filepath.Dir(prevDir)
+    dir := filepath.Dir(prevDir)  // 起点：仓库根目录的父目录
     for dir != prevDir {
         repoConfigFiles = utils.Prepend(repoConfigFiles, &config.ConfigFile{
             Path:   filepath.Join(dir, ".lazygit.yml"),
@@ -87,15 +90,38 @@ func (gui *Gui) getPerRepoConfigFiles() []*config.ConfigFile {
 }
 ```
 
-假设仓库路径为 `/home/user/projects/myrepo`，搜索顺序为：
-1. `/home/user/projects/myrepo/.lazygit.yml` (最先加载，最低优先级)
-2. `/home/user/projects/.lazygit.yml`
-3. `/home/user/.lazygit.yml`
-4. `/home/.lazygit.yml`
-5. `/.lazygit.yml` (最后加载，最高优先级)
-6. `/home/user/projects/myrepo/.git/lazygit.yml` (最终覆盖)
+其中 `utils.Prepend(slice, value)` 的实现是 `append(values, slice...)`，即将新元素插到列表头部。
+
+假设仓库路径为 `/home/user/projects/myrepo`，最终生成的文件列表顺序为：
+
+| 序号 | 路径 | 说明 |
+|---|---|---|
+| 1 | `/.lazygit.yml` | 文件系统根目录，最先加载，优先级最低 |
+| 2 | `/home/.lazygit.yml` |  |
+| 3 | `/home/user/.lazygit.yml` |  |
+| 4 | `/home/user/projects/.lazygit.yml` | 仓库父目录 |
+| 5 | `/home/user/projects/myrepo/.git/lazygit.yml` | Git 目录内，最后加载，优先级最高 |
+
+> **加载顺序与覆盖优先级的关系**：`loadUserConfig` 按列表顺序依次 `yaml.Unmarshal` 到同一个 `base` 上，后面的文件覆盖前面的文件。因此**列表越靠后的文件优先级越高**。
 
 所有仓库级配置的 `Policy` 均为 `SkipIfMissing`——文件不存在时静默跳过。
+
+#### 全局配置与仓库配置的组装
+
+`ReloadUserConfigForRepo()` (`pkg/config/app_config.go`) 将全局配置与仓库配置拼接为一个列表：
+
+```go
+func (c *AppConfig) ReloadUserConfigForRepo(repoConfigFiles []*ConfigFile) error {
+    configFiles := append(c.globalUserConfigFiles, repoConfigFiles...)
+    userConfig, err := loadUserConfigWithDefaults(configFiles, true)
+    // ...
+    c.userConfig = userConfig
+    c.userConfigFiles = configFiles
+    return nil
+}
+```
+
+由于使用 `append(global, repo...)`，全局配置在前、仓库配置在后，因此**仓库级配置的优先级整体高于全局配置**。
 
 ### 1.3 配置合并机制：loadUserConfig()
 
@@ -614,12 +640,14 @@ SetCustomBranches(customBranchColors, isRegex)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  配置来源 (按加载顺序)                                                │
+│  配置来源 (按加载顺序，越靠后优先级越高)                              │
 │                                                                      │
 │  ① GetDefaultConfigForPlatform() → 硬编码默认 ThemeConfig            │
 │  ② 全局 ~/.config/lazygit/config.yml  或  LG_CONFIG_FILE 指定文件    │
-│  ③ 仓库级 /repo-root/.lazygit.yml (逐级向上搜索)                     │
-│  ④ 仓库级 .git/lazygit.yml                                          │
+│  ③ 父目录链 .lazygit.yml (从仓库父目录逐级向上到文件系统根)           │
+│  ④ 仓库级 .git/lazygit.yml (最高优先级)                              │
+│                                                                      │
+│  注: 仓库根目录的 .lazygit.yml 目前为 TODO 状态，未实现              │
 │                                                                      │
 │  合并规则: yaml.Unmarshal 逐文件覆盖 base                            │
 │    - 结构体字段: 深度合并 (子字段级别覆盖)                             │
