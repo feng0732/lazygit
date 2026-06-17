@@ -6,7 +6,7 @@
 
 ## 一、消息编辑流程
 
-消息编辑涉及三种主要操作场景：**Reword（重命名提交）**、**Amend（修改提交）**、以及**CreateAmendCommit（创建 amend! 提交）**。它们都共用同一套消息面板机制。
+涉及消息编辑的操作场景有三种：**Reword（重命名提交）**和**CreateAmendCommit（创建 amend! 提交）**共用同一套消息面板机制；而**Amend（修改提交）**不经过消息编辑面板，用户确认后直接保留原消息并合并暂存区内容。
 
 ### 1.1 入口：触发编辑操作
 
@@ -86,7 +86,22 @@ func (self *CommitCommands) GetCommitMessage(commitHash string) (string, error) 
 - HEAD → 用 GpgHelper 封装执行 `RewordLastCommit`
 - 非 HEAD → `WithWaitingStatus` 中调用 `Rebase.RewordCommit` 完成后 `Refresh(ASYNC)`
 
-#### 1.6.2 CreateAmendCommit 的确认回调（OnConfirm 闭包）
+#### 1.6.2 Amend 的确认流程（不走消息面板）
+
+普通 Amend 操作（`amendTo`）不打开消息编辑面板，而是弹出确认对话框 [local_commits_controller.go:838-L843](pkg/gui/controllers/local_commits_controller.go#L838-L843)：
+
+```go
+return self.c.ConfirmIf(!self.c.UserConfig().Gui.SkipAmendWarning,
+    types.ConfirmOpts{
+        Title:         self.c.Tr.AmendCommitTitle,
+        Prompt:        self.c.Tr.AmendCommitPrompt,
+        HandleConfirm: handleCommit,
+    })
+```
+
+用户确认后直接执行 `handleCommit`，保留原提交消息不变（`--no-edit`），只将暂存区内容合并到目标提交。具体路径见第二章 2.3 和 2.4 节。
+
+#### 1.6.3 CreateAmendCommit 的确认回调（OnConfirm 闭包）
 
 `createAmendCommit` 的 OnConfirm 在 [local_commits_controller.go:1106-L1121](pkg/gui/controllers/local_commits_controller.go#L1106-L1121) 内联定义，执行步骤：
 
@@ -580,7 +595,11 @@ func (self *RefreshHelper) refreshCommitsWithLimit() error {
 - 刷新作者缓存
 - 更新工作树状态（是否在 rebase/merge 中）
 
-对 stacked branch 场景，`refreshCommitsWithLimit` 通过 `IncludeRebaseCommits: true` 和 `GetRebaseUpdateRefs()` 的配置，重新加载 stacked branch 的分支头位置，让刚被 `MoveFixupCommitDown` 移动的 fixup!/amend! 提交在列表中显示在正确的位置。
+对 stacked branch 场景，`rebase.updateRefs` 配置的作用体现在两个环节：
+
+1. **移动前置条件**：`moveFixupCommitToOwnerStackedBranch` [local_commits_controller.go:1066-L1069](pkg/gui/controllers/local_commits_controller.go#L1066-L1069) 检查 `GetRebaseUpdateRefs()` 是否开启，只有开启时才允许将 fixup!/amend! 提交移到 owner stacked branch。如果未开启，移动操作会跳过，因为此时 rebase 不会自动更新下游分支指针，移动 commit 会破坏 stacked branch 的结构。
+
+2. **分支头展示**：`refreshCommitsWithLimit` 固定传入 `IncludeRebaseCommits: true`，使得 `CommitLoader.GetCommits` 在加载提交列表时调用 `MergeRebasingCommits`，将 rebase TODO 文件中的条目（包括 `update-ref` 行）与已完成的 commit 合并展示。当 `rebase.updateRefs` 开启时，交互式 rebase 的 TODO 中会包含 `update-ref` 指令，`MergeRebasingCommits` 将这些指令作为虚拟提交项插入列表，使各 stacked branch 的分支头位置在界面上正确标注。刚被 `MoveFixupCommitDown` 移动的 fixup!/amend! 提交因此能在正确的 stacked branch 位置显示。
 
 #### 步骤 5：Rebase Commits 单独刷新
 
