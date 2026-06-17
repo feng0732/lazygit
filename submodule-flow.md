@@ -99,6 +99,37 @@ if scopeSet.Includes(types.FILES) || scopeSet.Includes(types.SUBMODULES) {
 
 > ⚠️ **关键设计**：刷新 SUBMODULES 时必然连带刷新 FILES，反之亦然。这是为了保证两者数据一致（submodule 状态变化会体现在 file 列表中）。
 
+#### 🔍 为什么 FILES 和 SUBMODULES 同时在 scope 中只触发一次刷新？
+
+这是 **`||` 短路逻辑 + `Set` 去重 + 单次 if 块** 共同作用的结果：
+
+**Step 1: Scope 转换为 Set**
+[Refresh L106](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L106) 将传入的 Scope slice 转为 Set：
+```go
+scopeSet = set.NewFromSlice(options.Scope)
+```
+[Set.NewFromSlice](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/vendor/github.com/jesseduffield/generics/set/set.go#L13-L17) 底层是 `map[T]bool`，自动去重：
+```go
+func NewFromSlice[T comparable](slice []T) *Set[T] {
+    result := &Set[T]{hashMap: make(map[T]bool, len(slice))}
+    result.Add(slice...)  // map 自动去重，相同 key 不会重复
+    return result
+}
+```
+
+**Step 2: `||` 短路判断**
+判断条件是 `scopeSet.Includes(FILES) || scopeSet.Includes(SUBMODULES)`：
+- 如果 `Includes(FILES)` 为 `true`，短路求值，不会再判断 `Includes(SUBMODULES)`
+- 如果 `Includes(FILES)` 为 `false`，才会判断 `Includes(SUBMODULES)`
+- 无论哪种情况，整个 `||` 表达式只有一个布尔结果
+
+**Step 3: 单次 if 块，单次 refresh 调用**
+无论 scope 是 `[FILES]`、`[SUBMODULES]` 还是 `[FILES, SUBMODULES]`，`||` 判断都只有两种结果：
+- `true` → **进入一次** if 块 → **调用一次** `refresh("files", ...)` → **执行一次** `refreshFilesAndSubmodules()`
+- `false` → 不进入 if 块
+
+**结论**：即使 `remove()` 调用 `Refresh(Scope: [SUBMODULES, FILES])`，Set 会去重（虽然这两个是不同枚举值不会被去重），但关键是 `||` 判断只会进入一次 if 块，因此永远只会触发**一次**联合刷新。
+
 ### 2.4 Context 与 Model 的连接
 
 [SubmodulesContext](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/context/submodules_context.go#L16-L45) 通过闭包持有对 `Model.Submodules` 的引用：
@@ -358,15 +389,38 @@ type RefreshOptions struct {
 
 **后果**：如果需要在刷新完成后做某些事（如重新定位选中项），没有可靠的时序保证。
 
-#### 原因 4：嵌套 submodule 删除时的双重刷新问题
+#### 原因 4：remove() 操作的 Scope 冗余（之前误判为双重锁等待）
 
-`remove()` 操作额外刷新了 FILES：
+`remove()` 操作传入的 Scope 包含两项：
 
 ```go
 self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.SUBMODULES, types.FILES}})
 ```
 
-虽然 `FILES` 和 `SUBMODULES` 最终都走 `refreshFilesAndSubmodules()`（见 2.3 节绑定逻辑），但 Mutex `RefreshingFilesMutex` 会串行化两次调用，导致多余的锁等待。
+**⚠️ 之前的误判纠正**：不存在双重锁等待。
+
+**正确分析**：
+
+根据 2.3 节的 scope 合并逻辑，`||` 判断只会进入一次 if 块，因此：
+1. `refreshFilesAndSubmodules()` **只会被调用一次**
+2. `RefreshingFilesMutex` **只会 Lock/Unlock 一次**
+3. 不会有两次锁等待，也不会有两次刷新
+
+**真正的问题是 Scope 冗余**：
+- 只传 `[SUBMODULES]` 或只传 `[FILES]` 效果完全相同（都会触发联合刷新）
+- 传 `[SUBMODULES, FILES]` 是冗余的，不会带来额外效果
+- 但也不会造成性能问题，只是代码写法不够简洁
+
+**对比其他操作**：
+| 操作 | Scope 参数 | 实际刷新效果 |
+|------|-----------|-------------|
+| update | `[SUBMODULES]` | ✅ 一次联合刷新 |
+| init | `[SUBMODULES]` | ✅ 一次联合刷新 |
+| editURL | `[SUBMODULES]` | ✅ 一次联合刷新 |
+| add | `[SUBMODULES]` | ✅ 一次联合刷新 |
+| remove | `[SUBMODULES, FILES]` | ⚠️ 一次联合刷新（Scope 冗余） |
+
+**remove() 设计意图**：可能是为了强调删除 submodule 一定会影响 file 列表，但从代码实现角度看，单独传任何一个都足够。
 
 ---
 
@@ -638,3 +692,34 @@ type SubmoduleConfig struct {
                   └─ wg.Wait() → Refresh 返回
                      ⚠️ 但 OnUIThread 中的渲染是异步投递，此时不一定已完成
 ```
+
+#### 对比：remove() 操作的端到端流程（Scope 冗余示例）
+
+用户在 submodule 视图按 `d`（Delete）：
+
+```
+1. 用户按键 'd'
+      ↓
+2. 匹配 Remove 的 Binding → 弹出 Confirm 对话框
+      ↓
+3. 用户确认后，HandleConfirm 执行
+      ↓
+4. LogAction → Git().Submodule.Delete(submodule)
+      ↓
+5. Refresh(Scope: [SUBMODULES, FILES])   ← Scope 有两项
+      ↓
+6. scopeSet = Set{SUBMODULES, FILES}    ← Set 去重（两个不同值，实际不影响）
+      ↓
+7. if Includes(FILES) || Includes(SUBMODULES)
+      → Includes(FILES) = true → 短路求值，不判断 Includes(SUBMODULES)
+      → 进入一次 if 块
+      ↓
+8. 调用一次 refreshFilesAndSubmodules()
+      ├─ RefreshingFilesMutex.Lock()   ← 仅一次锁获取
+      ├─ GetConfigs(nil) → Model.Submodules = 新数据
+      ├─ refreshStateFiles() → Model.Files = 新数据
+      ├─ OnUIThread { refreshView(Submodules); refreshView(Files) }
+      └─ RefreshingFilesMutex.Unlock() ← 仅一次锁释放
+```
+
+**关键点**：虽然 Scope 传了 `[SUBMODULES, FILES]` 两项，但 `||` 判断只会进入一次 if 块，Mutex 只会加锁/解锁一次。`remove()` 的 Scope 写法是**冗余但功能正确**。
