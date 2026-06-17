@@ -20,6 +20,7 @@ Lazygit 的交互式 rebase 系统围绕 **待办列表 (Todo)**、**已完成�
 | 工作树状态 | [pkg/commands/models/working_tree_state.go](pkg/commands/models/working_tree_state.go) + [pkg/commands/git_commands/status.go](pkg/commands/git_commands/status.go) | 检测当前是否处于 rebase/merge/cherry-pick 状态 |
 | 提交模型 | [pkg/commands/models/commit.go](pkg/commands/models/commit.go) | Commit 数据结构，包含 Action / Status 等 todo 相关字段 |
 | 测试用例 | [pkg/commands/git_commands/commit_loader_test.go](pkg/commands/git_commands/commit_loader_test.go) | `getConflictedCommitImpl` 的测试用例，清晰展示各状态组合 |
+| 集成测试 | [pkg/integration/tests/interactive_rebase/](pkg/integration/tests/interactive_rebase/) | 多种场景的端到端测试 |
 
 ---
 
@@ -32,37 +33,56 @@ Git 在交互式 rebase 进行中会在 `.git/rebase-merge/` 目录下维护一�
 | 文件 | 角色 | 说明 |
 |------|------|------|
 | `git-rebase-todo` | **待执行队列** | 自上而下排列，顶部 = 下一个要执行的命令 |
-| `done` | **已完成队列** | 按执行顺序追加，末尾 = 最近完成的命令 |
+| `done` | **已完成队列** | 按执行顺序追加，末尾 = 最近完成或最近开始处理的命令 |
 | `stopped-sha` | **当前停止点** | 当前停下处的提交 SHA（缩写），只有 stopped 状态时有意义 |
-| `amend` | **edit 模式标记** | 文件存在表示用户已执行过 `git commit --amend` |
+| `amend` | **edit 模式标记** | edit 命令**成功应用**时由 Git 自动创建，标记"下一次 commit 应以 --amend 模式执行" |
 | `message` | **提交信息暂存** | 存放 edit/reword 命令的原始提交信息 |
 | `head-name` | **原始分支名** | 正在被 rebase 的分支全名 |
 
-### 2.2 双队列流转示意
+### 2.2 关键理解：amend 文件的真实含义
+
+> **这是之前理解错误的核心点**
+
+`amend` 文件**不是**用户执行 `git commit --amend` 时才创建的。它是 Git 在 edit 命令**成功应用提交并正常停下时，自动创建**的。
+
+它的作用是：标记当前处于 edit 模式，后续的 `git commit` 操作应该自动使用 `--amend` 模式。所以 amend 文件的存在就意味着 **edit 命令已经成功应用了提交，正在等待用户编辑**。
+
+对应代码注释（[pkg/commands/git_commands/commit_loader.go](pkg/commands/git_commands/commit_loader.go) 第 454-455 行）：
+```go
+// Special case for "edit": if the "amend" file exists, the "edit"
+// command was successful, otherwise it wasn't
+```
+
+### 2.3 双队列流转示意
 
 ```
-git-rebase-todo (待执行)            done (已完成)
-┌───────────────────────┐           ┌───────────────────────┐
-│  pick C (下一个)       │──执行成功─▶│  pick A               │
-│  pick D                │           │  pick B               │
-│  ...                   │           │  ...                  │
-│  旧的在下面             │           │  旧的在下面             │
-└───────────────────────┘           └───────────────────────┘
+git-rebase-todo (待执行)               done (已处理)
+┌──────────────────────────┐           ┌──────────────────────────┐
+│  pick C (下一个)          │──执行成功─▶│  pick A                   │
+│  pick D                   │           │  pick B                   │
+│  ...                      │           │  edit C  (当前停下处)     │ ← amend 存在 = edit 成功
+│  旧的在下面                │           │  ...                      │
+└──────────────────────────┘           └──────────────────────────┘
          ▲
          │ 失败则 rescheduled（重新放回顶部）
          ▼
     stopped-sha = 当前卡住的提交
 ```
 
-### 2.3 Lazygit 中的展示顺序
+**重要**：命令一旦被 Git 从 todo 顶部取出来开始处理，就会被**立即写入 done 文件**，无论它最终是成功还是失败。所以 done 文件的最后一条可能是：
+- 已经成功完成的命令（继续下一条）
+- 正在处理中但因为 edit/break/reword 而正常停下的命令
+- 尝试执行但失败（冲突）的命令
+
+### 2.4 Lazygit 中的展示顺序
 
 Git 的 todo/done 文件都是"旧的在上、新的在下"，但 Lazygit 的提交视图是"新的在上、旧的在下"。因此加载时需要做一次倒序转换。
 
 在 `getRebasingCommits` 函数（[pkg/commands/git_commands/commit_loader.go](pkg/commands/git_commands/commit_loader.go) 第 341 行）中：
 
-1. 先检测是否有冲突提交，如果有，追加到列表末尾
-2. 然后遍历 todos，每一条都用 `Prepend` 插到列表前面
-3. 最终实现倒序：新的 todo 在上，旧的在下
+1. 先检测是否有冲突提交，如果有，用 `append` 追加到列表**末尾**
+2. 然后遍历 todos，每一条都用 `Prepend` 插到列表**前面**
+3. 最终实现倒序：新的 todo 在上，旧的在下；冲突提交在 todo 和真实提交之间
 
 例如 todo 文件内容是：
 ```
@@ -73,11 +93,11 @@ pick commit-C (新，下一个执行)
 
 倒序后展示为：
 ```
-pick commit-C   ← 最上面，下一个要执行的
-pick commit-B
-pick commit-A   ← 最下面，最旧的
-[冲突提交]      ← 如果有冲突，在 todo 和真实提交之间
-真实提交...
+pick commit-C       ← 最上面，下一个要执行的（StatusRebasing）
+pick commit-B       ← StatusRebasing
+pick commit-A       ← StatusRebasing
+[冲突提交]          ← 如果有冲突，在 todo 和真实提交之间（StatusConflicted）
+真实提交...          ← 从 HEAD 开始的真实提交
 ```
 
 ---
@@ -98,104 +118,230 @@ func getConflictedCommitImpl(
 ) *models.Commit
 ```
 
-- **返回 nil**：当前不是冲突状态（是正常停止，或者状态无法判断）
+- **返回 nil**：当前不是冲突状态（是正常停止，或者状态无法判断，或者被 rescheduled）
 - **返回 Commit 对象**：当前处于冲突状态，返回的 commit 状态为 `StatusConflicted`
 
-### 3.2 完整判定流程
+### 3.2 完整判定流程（严格对照代码）
 
-以下是完整的判定逻辑（按代码执行顺序）：
+以下是完整的判定逻辑，**完全按照代码执行顺序**：
 
 ```
 输入：todos, doneTodos, amendFileExists, messageFileExists
     │
     ▼
-┌─ 1. done 为空？ ────────────────────┐
-│  是 → 返回 nil（防御性检查）         │
-└─────────────────────────────────────┘
+┌─ 1. done 为空？ ────────────────────────┐
+│  是 → 返回 nil（防御性检查，不可能发生） │
+└──────────────────────────────────────────┘
     │
     ▼
-┌─ 2. 最后一条 done 是 break/exec/reword？ ─┐
-│  是 → 返回 nil（正常停止，不是冲突）      │
-│                                            │
-│  说明：                                    │
-│   - break: 用户插入的断点                  │
-│   - exec: 执行外部命令停下                 │
-│   - reword: 等待用户编辑提交信息           │
-└───────────────────────────────────────────┘
-    │
-    ▼
-┌─ 3. Rescheduled 检测（标准情况） ────────────────┐
-│  done 最后一条 == todo 第一条？                    │
-│  是 → 返回 nil（命令被重新调度了）                 │
-│                                                    │
-│  说明：                                            │
-│   当一个命令因冲突失败时，Git 会把它重新放回        │
-│   todo 列表的顶部，这叫 "rescheduled"。            │
-│   这时候 todo 和 done 各有一份相同的记录。          │
-│   因为 todo 里已经有这条命令了，不需要额外加一个。  │
-└───────────────────────────────────────────────────┘
-    │
-    ▼
-┌─ 4. Rescheduled 检测（老版本 Git bug） ───────────┐
-│  len(done) >= 3 且                                │
-│  done 倒数第二条 == todo 第一条 且                  │
-│  done 最后一条 == done 倒数第三条？                 │
-│  是 → 返回 nil（也是 rescheduled）                 │
-│                                                    │
-│  说明：                                            │
-│   老版本 Git 有个 bug：命令 rescheduled 时，       │
-│   会把"上一个成功的命令"再追加一份到 done 末尾。    │
-│   需要额外检测这种情况，避免误判。                 │
-└───────────────────────────────────────────────────┘
-    │
-    ▼
-┌─ 5. 如果最后一条 done 是 edit ────────────────────┐
-│  ┌─ 5a. amend 文件存在？ ──┐                      │
-│  │  是 → 返回 nil           │                      │
-│  │  说明：edit 模式下，用户 │                      │
-│  │  已执行了 amend，编辑正  │                      │
-│  │  常进行中，不是冲突。    │                      │
-│  └─────────────────────────┘                      │
-│         │                                          │
-│         ▼ 否                                      │
-│  ┌─ 5b. message 文件不存在？ ─┐                    │
-│  │  是 → 返回 nil             │                    │
-│  │  说明：message 文件消失了， │                    │
-│  │  可能是 cherry-pick/revert │                    │
-│  │  等操作干扰了状态，不判为   │                    │
-│  │  冲突。                     │                    │
-│  └─────────────────────────┘                      │
-│         │                                          │
-│         ▼ 否（有 message 但没有 amend）            │
-│    继续往下（可能是冲突）                          │
-└───────────────────────────────────────────────────┘
-    │
-    ▼
-┌─ 6. 最后一条 done 没有 commit hash？ ──────────┐
-│  是 → 返回 nil（安全检查，没有提交 hash 无法显示） │
-└─────────────────────────────────────────────────┘
-    │
-    ▼
-┌─ 7. 其他情况 → 判定为冲突 ──────────────────────┐
-│  返回 StatusConflicted 的 Commit 对象            │
+┌─ 2. done 最后一条是 break / exec / reword？ ───┐
+│  是 → 返回 nil（这是正常停止，不是冲突）        │
 │                                                  │
-│  包括的场景：                                    │
-│   - pick / squash / fixup 等命令冲突             │
-│   - edit 命令在应用阶段冲突（有 message 无 amend）│
-└─────────────────────────────────────────────────┘
+│  说明：                                          │
+│   - break:  用户插入的断点，主动停下             │
+│   - exec:   执行外部命令，停下等用户确认         │
+│   - reword: 等待用户编辑提交信息                 │
+│  这三种都是 Git 预期内的正常停止，不算冲突。      │
+└──────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ 3. Rescheduled 检测（标准情况） ──────────────────────────────┐
+│  done[最后一条] == todo[第一条]？                                │
+│  是 → 返回 nil                                                  │
+│                                                                  │
+│  说明（注释 416-421 行）：                                       │
+│   当一个命令失败时（如补丁覆盖了未跟踪文件，或冲突），Git 会把   │
+│   这条命令重新放回 todo 列表的顶部等待重试，这叫 "rescheduled"。 │
+│   此时 done 和 todo 各有一份相同的记录。                         │
+│   因为 todo 列表里已经有这条命令了（StatusRebasing），不需要     │
+│   额外再添加一个冲突提交，否则会重复显示。                       │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ 4. Rescheduled 检测（老版本 Git bug） ─────────────────────────┐
+│  len(done) >= 3 且                                              │
+│  done[倒数第二条] == todo[第一条] 且                             │
+│  done[最后一条] == done[倒数第三条]？                            │
+│  是 → 返回 nil                                                   │
+│                                                                  │
+│  说明（注释 427-445 行）：                                       │
+│   老版本 Git 有 bug：命令 rescheduled 时，会把"上一个成功的     │
+│   命令"再追加一份到 done 末尾，导致 done 最后两条相同。需要额    │
+│   外检测这种情况，避免误判。                                     │
+│                                                                  │
+│  示例：                                                          │
+│    todo 序列：pick A → exec make → pick B → exec make           │
+│    pick B 冲突 rescheduled 后：                                  │
+│      done = [pick A, exec make, pick B, pick A]  ← pick A 重复了 │
+│      todo = [exec make]                                         │
+│    此时 done[倒数第二]=exec make == todo[第一]=exec make，       │
+│    且 done[最后] == done[倒数第三] → 判定为 rescheduled。        │
+└──────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ 5. 如果 done 最后一条是 edit 命令 ─────────────────────────┐
+│  ┌─ 5a. amend 文件存在？ ───────────────────────────────┐   │
+│  │  是 → 返回 nil                                        │   │
+│  │                                                        │   │
+│  │  注释 454-455 行：                                    │   │
+│  │  "if the 'amend' file exists, the 'edit' command      │   │
+│  │   was successful, otherwise it wasn't"                │   │
+│  │                                                        │   │
+│  │  含义：amend 文件是 Git 在 edit 命令成功应用提交后     │   │
+│  │  自动创建的。它存在 = edit 命令成功了，正在等用户      │   │
+│  │  编辑。这是正常停止，不是冲突。                        │   │
+│  └───────────────────────────────────────────────────────┘   │
+│         │                                                     │
+│         ▼ 否（amend 不存在）                                  │
+│  ┌─ 5b. message 文件不存在？ ───────────────────────────┐   │
+│  │  是 → 返回 nil                                        │   │
+│  │                                                        │   │
+│  │  注释 459-463 行：                                    │   │
+│  │  message 文件不存在说明有其他操作（如 multi-commit     │   │
+│  │  cherry-pick 或 revert）干扰了 rebase 状态，删除了    │   │
+│  │  amend 和 message 文件。这种情况不判定为冲突。        │   │
+│  └───────────────────────────────────────────────────────┘   │
+│         │                                                     │
+│         ▼ 否（有 message 但没有 amend）                       │
+│    继续往下走（edit 命令在应用阶段冲突了）                    │
+└───────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ 6. done 最后一条没有 commit hash？ ──────────────┐
+│  是 → 返回 nil（安全检查，没有提交 hash 无法显示） │
+└────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─ 7. 其他情况 → 判定为冲突 ───────────────────────────────┐
+│  返回 StatusConflicted 的 Commit 对象                     │
+│                                                           │
+│  包含的场景：                                              │
+│   - pick / squash / fixup / drop / merge 等命令冲突       │
+│   - edit 命令在应用阶段冲突（有 message，没有 amend）      │
+└───────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 Rescheduled 的深入理解
+### 3.3 Edit 状态的三种组合（对照测试用例）
 
-**什么是 rescheduled？**
+以下三个测试用例来自 [pkg/commands/git_commands/commit_loader_test.go](pkg/commands/git_commands/commit_loader_test.go) 第 476-516 行，清晰展示了 done 最后一条是 edit 时的三种情况：
 
-当一个 rebase 命令失败时（比如应用补丁时覆盖了未跟踪的文件，或者发生了冲突），Git 会把这条命令**重新放回 todo 列表的顶部**，等待用户处理后重试。这就是 "rescheduled"（重新调度）。
+| 场景 | done 最后一条 | amend 文件 | message 文件 | 判定结果 | 代码分支 | 含义 |
+|------|-------------|-----------|-------------|----------|----------|------|
+| **edit 正常停止** | edit commit-X | 存在 | 存在/不存在 | **不是冲突**（nil） | 5a | edit 成功应用了提交，Git 自动创建了 amend 文件，正在等用户编辑。这是正常状态。 |
+| **edit 应用阶段冲突** | edit commit-X | 不存在 | 存在 | **是冲突**（StatusConflicted） | 穿透 5a 和 5b，到第 7 步 | edit 命令在应用（pick）阶段就冲突了，还没到创建 amend 文件那一步。 |
+| **状态被干扰** | edit commit-X | 不存在 | 不存在 | **不是冲突**（nil） | 5b | 其他操作（如 cherry-pick/revert）删除了 amend 和 message 文件，状态不可信。 |
 
-**为什么 rescheduled 就不需要额外添加冲突提交？**
+### 3.4 Edit 冲突 vs Edit 正常停止：状态对比
 
-因为命令已经在 todo 列表里了（作为第一条），虽然它的状态是 `StatusRebasing` 而不是 `StatusConflicted`，但用户可以通过文件视图中的冲突文件感知到冲突状态。
+这是理解整个系统的关键。让我们把 edit 命令的执行过程拆解，观察各状态文件的变化：
 
-如果此时再额外添加一个冲突提交，就会出现重复显示。
+```
+edit 命令完整生命周期：
+
+  阶段 0：命令还在 todo 列表里
+    git-rebase-todo 顶部 = edit commit-X
+    done 文件中没有 edit
+    ─────────────────────────────
+    rebase 还没处理到这条命令
+
+  阶段 1：Git 取出 edit 命令，开始处理
+    Git 把 edit commit-X 追加到 done 文件末尾
+    （无论后续成功还是失败，先写入 done）
+    ─────────────────────────────
+    done 最后一条 = edit commit-X
+
+  阶段 2：尝试应用提交（pick 阶段）
+    ├─ 应用成功
+    │   ├─ Git 创建 message 文件（保存原始提交信息）
+    │   ├─ Git 创建 amend 文件（标记 edit 模式）
+    │   ├─ 设置 stopped-sha = commit-X
+    │   └─ 停下，等待用户
+    │     ─────────────────────────────
+    │     done 最后一条 = edit commit-X
+    │     amend 存在 ✓
+    │     message 存在 ✓
+    │     → 代码判定：不是冲突（走分支 5a）
+    │     → UI 显示：正常，用户可以编辑
+    │
+    └─ 应用失败（冲突）
+        ├─ Git 创建 message 文件
+        ├─ 不创建 amend 文件（还没到那一步）
+        ├─ 设置 stopped-sha = commit-X
+        ├─ 可能把 edit 命令重新放回 todo 顶部（rescheduled）
+        └─ 停下，返回错误
+          ─────────────────────────────
+          如果没有 rescheduled：
+            done 最后一条 = edit commit-X
+            amend 不存在 ✗
+            message 存在 ✓
+            → 代码判定：是冲突（到第 7 步）
+            → UI 显示：StatusConflicted 的冲突提交
+
+          如果被 rescheduled：
+            todo 第一条 = edit commit-X
+            done 最后一条 = edit commit-X
+            → 代码判定：不是冲突（走分支 3，rescheduled）
+            → UI 显示：todo 列表里有 edit commit-X（StatusRebasing）
+                       用户通过文件视图的 UU 文件感知冲突
+
+  阶段 3：用户执行 git commit --amend（可选）
+    amend 文件已经存在（阶段 2 成功时创建的）
+    此操作不改变 amend 文件的存在性
+    ─────────────────────────────
+    状态不变：仍然不是冲突
+
+  阶段 4：用户执行 git rebase --continue
+    Git 把当前 edit 命令标记为已完成（已经在 done 里了）
+    从 todo 取下一条命令继续
+    ─────────────────────────────
+    rebase 继续运行
+```
+
+### 3.5 非 Edit 命令冲突的情况
+
+对于 pick / squash / fixup / drop / merge 等非 edit 命令，判定逻辑更简单：
+
+如果 rebase 停下了，且 done 最后一条是这些命令之一，说明该命令执行失败了。因为：
+- 这些命令如果成功执行，会继续下一条，不会停下
+- 只有失败（冲突）才会停下来
+
+除非它被 rescheduled（检测 done[last] == todo[first]），否则直接判定为冲突。
+
+**典型场景**：`AmendCommitWithConflict` 集成测试（[pkg/integration/tests/interactive_rebase/amend_commit_with_conflict.go](pkg/integration/tests/interactive_rebase/amend_commit_with_conflict.go)）
+
+用户对历史提交执行 AmendToCommit，Lazygit 先创建一个 fixup commit，然后启动 rebase 把它移动到目标提交下方。fixup 命令应用时发生冲突：
+
+```
+此时状态：
+  done 最后一条 = fixup commit-X
+  todo 第一条   = pick commit-Y（下一个要执行的）
+  fixup != pick → 不是 rescheduled
+  不是 edit → 跳过 edit 分支
+  commit hash 存在
+  → 判定为冲突
+
+UI 显示：
+  --- Pending rebase todos ---
+  pick commit-Y                          ← todo 列表，倒序
+  fixup <-- CONFLICT --- fixup! target   ← 额外的冲突提交（StatusConflicted）
+  --- Commits ---
+  真实提交...
+```
+
+### 3.6 Rescheduled 的深入理解
+
+**什么情况下会发生 rescheduled？**
+
+根据代码注释（第 416-418 行）：
+- 补丁会覆盖未跟踪的文件
+- exec 命令执行失败
+- 发生合并冲突（某些 Git 版本）
+
+**rescheduled 发生时，为什么不需要额外显示冲突提交？**
+
+因为该命令已经存在于 todo 列表的第一条（状态为 `StatusRebasing`）。虽然它没有被标记为红色 "CONFLICT"，但用户可以通过文件视图中的 UU（未合并）文件感知到冲突状态。
+
+如果此时再额外添加一个 StatusConflicted 的提交，就会出现重复 —— 同一个提交既出现在 todo 列表里，又出现在冲突位置上。
 
 **两种 rescheduled 检测的区别：**
 
@@ -203,66 +349,6 @@ func getConflictedCommitImpl(
 |----------|----------|----------|
 | 标准检测 | 新版 Git | `done[last] == todo[first]` |
 | Bug 检测 | 老版 Git | `done[last-1] == todo[first]` 且 `done[last] == done[last-2]` |
-
-老版本 Git 的 bug 表现：当命令 rescheduled 时，会把"上一个成功的命令"重复追加到 done 末尾，导致 done 最后出现两条相同的记录。
-
-### 3.4 Edit 停止状态的三种情况
-
-Edit 命令是最特殊的，因为它有"正常停下"和"冲突停下"两种停止原因，需要通过辅助文件进一步区分。
-
-从测试用例 `TestCommitLoader_getConflictedCommitImpl`（[pkg/commands/git_commands/commit_loader_test.go](pkg/commands/git_commands/commit_loader_test.go) 第 476-516 行）可以清晰看到三种情况：
-
-| 场景 | amend 文件 | message 文件 | 判定结果 | 含义 |
-|------|-----------|-------------|----------|------|
-| edit + amend | 存在 | - | **不是冲突**（返回 nil） | 用户已执行 `git commit --amend`，edit 正常进行中 |
-| edit + 无amend + 有message | 不存在 | 存在 | **是冲突**（返回 StatusConflicted） | edit 命令在应用阶段就冲突了 |
-| edit + 无amend + 无message | 不存在 | 不存在 | **不是冲突**（返回 nil） | 状态被干扰（如 cherry-pick），不判定 |
-
-**为什么"有 message 但没有 amend"是冲突？**
-
-这需要理解 edit 命令的两阶段执行：
-
-```
-edit 命令执行流程：
-
-  阶段 1：应用提交（pick 阶段）
-     │
-     ├─ 成功 → 进入阶段 2
-     │
-     └─ 失败（冲突）→ 停下
-          → message 文件存在（Git 准备了原始消息）
-          → amend 文件不存在（还没到那一步）
-          → 这就是冲突状态
-
-  阶段 2：等待用户编辑
-     → message 文件存在
-     → amend 文件不存在（用户还没 amend）
-     → 这是正常停止，不是冲突
-
-  阶段 3：用户执行了 commit --amend
-     → message 文件存在
-     → amend 文件被创建
-     → 仍然是正常编辑中
-```
-
-等等，按照这个流程，"阶段 2"也是"有 message 无 amend"，但应该是正常停止，不是冲突啊？
-
-**关键在于：edit 命令正常停下时，它在 done 列表里吗？**
-
-答案是：**不在**。
-
-当 edit 命令成功应用并正常停下时，这条 edit 命令**还没有被写入 done 文件**（因为 edit 命令还没"完成"，需要用户 continue 之后才算完成）。此时 done 的最后一条应该是上一个成功执行的命令（比如上一个 pick）。
-
-只有当 edit 命令在**应用阶段就失败**（冲突）时，Git 才会把 edit 命令写入 done 文件（标记为"尝试过但失败了"）。这时候 done 的最后一条就是 edit，同时满足"有 message 无 amend"。
-
-这就是为什么代码中 `lastTodo.Command == todo.Edit` 的情况下，还需要进一步用 amend 和 message 文件来判断：
-- 如果 done 的最后一条是 edit，说明 edit 命令的执行出了问题
-- 再结合 amend/message 文件判断具体原因
-- 有 amend → 用户成功 amend 了，正常
-- 没 amend 但有 message → 应用阶段冲突了
-- 都没有 → 状态被干扰了
-
-> **注意**：以上关于"edit 正常停下时不在 done 里"的推理是基于代码逻辑反推的。实际 Git 内部实现可能更复杂，但 lazygit 的判定逻辑是清晰的，可以通过测试用例验证。
 
 ---
 
@@ -283,7 +369,7 @@ skip     → git rebase --skip
 执行 `git rebase --continue` 后，Git 内部发生的状态文件变化：
 
 ```
-当前状态：stopped（可能是冲突停下，也可能是 edit/break 正常停下）
+当前状态：stopped（可能是冲突停下，也可能是 edit/break/reword 正常停下）
     │
     │  用户执行 continue
     ▼
@@ -293,18 +379,27 @@ skip     → git rebase --skip
    - 没有改动 → 直接继续
     │
     ▼
-2. 把当前命令追加到 done 文件尾部
-   （标记为已完成）
+2. 当前命令已经在 done 里了（从 todo 取出时就写入了）
+   如果是 edit 且用户 amend 过，amend 文件可能还在
     │
     ▼
 3. 从 git-rebase-todo 顶部取下一条命令
     │
     ▼
-4. 执行该命令
-   ├─ 成功 → 回到步骤 2，继续循环
-   ├─ 失败（冲突）→ 停止，更新 stopped-sha
-   │   → 该命令可能被 rescheduled（放回 todo 顶部）
-   └─ 遇到 break/edit/reword → 停止，等待用户
+4. 把这条命令追加到 done 文件末尾（标记为"开始处理"）
+    │
+    ▼
+5. 执行该命令
+   ├─ 成功
+   │   ├─ 如果是 edit → 创建 amend 和 message 文件，停下
+   │   ├─ 如果是 break/exec/reword → 停下
+   │   └─ 如果是 pick/squash/fixup → 回到步骤 3，继续下一条
+   ├─ 失败（冲突）
+   │   ├─ 创建 message 文件（如果需要）
+   │   ├─ 不创建 amend 文件（如果是 edit 且在应用阶段失败）
+   │   ├─ 可能把该命令重新放回 todo 顶部（rescheduled）
+   │   └─ 停止，返回错误
+   └─ ...
     │
     ▼
 全部执行完毕 → 删除 rebase-merge 目录，rebase 结束
@@ -508,7 +603,7 @@ func isRenderedTodo(t todo.Todo, isInRebase bool) bool {
 
 **不显示的项**：
 - label / reset / comment / break
-- 在 cherry-pick/revert  sequencer 中的 update-ref / exec
+- 在 cherry-pick/revert sequencer 中的 update-ref / exec
 
 ---
 
@@ -557,97 +652,191 @@ Effective 状态决定了 UI 显示哪种状态的标题和操作菜单。
 
 ---
 
-## 八、典型场景：Edit + Amend 完整流程
+## 八、典型场景详解
 
-以"修改历史中第 3 个提交"为例，完整走一遍状态流转：
+### 场景 A：Edit + Amend 正常流程（无冲突）
 
-### 阶段 1：启动 Rebase
+以集成测试 `EditAndAutoAmend`（[pkg/integration/tests/interactive_rebase/edit_and_auto_amend.go](pkg/integration/tests/interactive_rebase/edit_and_auto_amend.go)）为例：修改历史中第 2 个提交（commit-02）。
 
-用户选中第 3 个提交，按 `e`（edit）：
+提交历史：
+```
+commit-03 (最新，HEAD)
+commit-02 (目标：edit 它)
+commit-01 (最旧，作为 rebase base)
+```
+
+#### 阶段 1：启动 Rebase
+
+用户选中 commit-02，按 `e`（edit）：
 - `BeginInteractiveRebaseForCommit` 被调用
-- 构造 `ChangeTodoAction`：将该提交从 pick 改为 edit
-- `PrepareInteractiveRebaseCommand` 构建 `git rebase -i <base>` 命令
+- 构造 `ChangeTodoAction`：将 commit-02 从 pick 改为 edit
+- `PrepareInteractiveRebaseCommand` 构建 `git rebase -i commit-01` 命令
 - 设置 daemon 指令为 `ChangeTodoActions`
 - 启动 git 命令
 
 Git 内部：
-1. 启动交互式 rebase
+1. 启动交互式 rebase，reset 到 base（commit-01）
 2. 调用 GIT_SEQUENCE_EDITOR（lazygit daemon）
-3. daemon 修改 git-rebase-todo 文件（pick → edit）
-4. 继续执行 rebase，应用前 2 个提交
-5. 遇到第 3 个提交的 edit 命令，应用成功 → 停下
+3. daemon 修改 git-rebase-todo 文件（pick commit-02 → edit commit-02）
+4. Git 继续执行
 
-### 阶段 2：Edit 正常停止状态
+#### 阶段 2：处理 commit-02（应用成功，正常停下）
+
+Git 从 todo 取出 edit commit-02：
+1. 把 `edit commit-02` 追加到 done 文件末尾
+2. 尝试应用 commit-02 的补丁
+3. 应用成功！
+4. 创建 `message` 文件（保存 commit-02 的原始提交信息）
+5. 创建 `amend` 文件（标记进入 edit 模式）
+6. 设置 `stopped-sha = commit-02`
+7. 停下，等待用户
 
 此时 `.git/rebase-merge/` 中的状态：
-- `git-rebase-todo`：剩下的提交（第 4 个及以后）
-- `done`：前 2 个 pick（注意：没有 edit，因为 edit 还没完成）
-- `stopped-sha`：第 3 个提交的哈希
-- `amend`：不存在（用户还没 amend）
-- `message`：存在（原始提交信息）
+- `git-rebase-todo`：`pick commit-03`（剩下的）
+- `done`：`edit commit-02`
+- `stopped-sha`：`commit-02`
+- `amend`：**存在**（Git 自动创建的）
+- `message`：存在
 
-**重点**：edit 正常停下时，edit 命令**不在 done 里**（因为还没完成）。所以 `getConflictedCommit` 的 lastTodo 是上一个 pick 命令，不会判定为冲突。
+Lazygit 加载状态：
+1. `getRebasingCommits` 读取 todo → `[pick commit-03]`
+2. 调用 `getConflictedCommit`：
+   - done 最后一条 = `edit commit-02`
+   - 不是 break/exec/reword → 继续
+   - `done[last]=edit 02` vs `todo[first]=pick 03` → 不是 rescheduled
+   - lastTodo 是 edit，检查 amend：**amend 存在** → **返回 nil（不是冲突）**
+3. todo 倒序 + Prepend → `[pick commit-03 (StatusRebasing)]`
+4. 冲突提交 = nil，不追加
 
-UI 表现：
-- 第 3 个提交在哪里？它不是 todo（因为已经从 todo 里取出来了），也不是冲突提交
-- 实际上，这个提交就是当前 HEAD，可以通过正常的提交视图看到
-- 下方的 todo 列表显示为 "Pending rebase todos"
+最终 UI 显示：
+```
+--- Pending rebase todos ---
+pick commit-03                ← StatusRebasing
+--- Commits ---
+commit-02 (HEAD，当前)         ← 真实提交，正常显示
+commit-01
+```
 
-### 阶段 3：用户修改并 Amend
+没有冲突标记！一切正常。
 
-用户修改文件、暂存，然后执行 amend：
-1. `git commit --amend --no-edit`
-2. 提交被修改（哈希变化）
-3. `amend` 文件被创建（标记 edit 正在进行中）
+#### 阶段 3：用户修改并自动 Amend
 
-这一步不涉及 continue，rebase 仍然是 stopped 状态。
+用户：
+1. 创建新文件并 stage
+2. 按 continue
 
-如果此时检查 done 文件，最后一条仍然是上一个 pick。edit 命令本身仍然不在 done 里。
+Lazygit 执行 `git rebase --continue`：
+- Git 检测到有 staged 改动 + amend 文件存在 → 自动执行 `git commit --amend`
+- commit-02 被修改（哈希变化）
+- edit 命令完成
 
-### 阶段 4：Continue
+Git 继续：
+1. 从 todo 取出 pick commit-03
+2. 追加到 done 文件末尾
+3. 应用 commit-03 → 成功
+4. 没有更多 todo → 删除 rebase-merge 目录
+5. rebase 完成
 
-用户按 continue：
-1. `git rebase --continue`
-2. Git 发现是 edit 模式 → 把 edit 命令追加到 done
-3. 从 todo 取下一条（第 4 个提交）
-4. 如果是 pick 且无冲突 → 追加到 done，继续下一条...
-5. 直到全部完成 → 删除 rebase-merge 目录
+#### 阶段 4：完成
 
-如果有 onSuccessfulContinue 回调（比如批量 amend 多个提交）：
-- 成功 continue 后自动执行回调
-- 回调可能启动下一轮修改
+UI 刷新：
+- `WorkingTreeState.Rebasing` = false
+- 不再加载 todo 项
+- 显示最终的提交列表（commit-02 哈希已变）
 
-### 阶段 5：如果中途冲突
+---
 
-假设第 4 个提交冲突：
-1. Git 停止，返回错误
-2. `stopped-sha` 指向第 4 个提交
-3. 第 4 个提交可能被 rescheduled（回到 todo 顶部）
-4. Lazygit 的 CheckForConflicts 检测到冲突
-5. 弹出冲突处理菜单
+### 场景 B：Edit 应用阶段冲突
 
-此时有两种子情况：
+假设在场景 A 的阶段 2，commit-02 在应用时发生冲突：
 
-**子情况 A：被 rescheduled**
-- todo 第一条 = pick commit-4
-- done 最后一条 = pick commit-4
-- `getConflictedCommit` 检测到 rescheduled → 返回 nil
-- UI 上 todo 列表第一条就是冲突的提交（但状态是 StatusRebasing）
-- 用户通过文件视图的冲突文件感知冲突
+Git 处理 edit commit-02：
+1. 把 `edit commit-02` 追加到 done 文件末尾
+2. 尝试应用 commit-02 的补丁 → **冲突！**
+3. 创建 `message` 文件（准备了原始提交信息）
+4. **不创建 amend 文件**（应用阶段就失败了，还没到那一步）
+5. 设置 `stopped-sha = commit-02`
+6. 可能把 `edit commit-02` 重新放回 todo 顶部（rescheduled，取决于 Git 版本）
+7. 停下，返回错误
 
-**子情况 B：没有被 rescheduled**
-- todo 列表里没有 commit-4
-- done 最后一条 = pick commit-4
-- `getConflictedCommit` 判定为冲突 → 返回 StatusConflicted 的提交
-- UI 上 todo 列表和真实提交之间多了一条红色 "CONFLICT" 标记的提交
+有两种子情况：
 
-### 阶段 6：完成
+#### 子情况 B1：没有被 rescheduled
 
-所有 todo 执行完毕：
-- `rebase-merge/` 目录被 Git 自动清理
-- `WorkingTreeState.Rebasing` 变为 false
-- CommitLoader 不再加载 todo 项
-- UI 显示最终的提交列表
+此时 `.git/rebase-merge/` 中的状态：
+- `git-rebase-todo`：`pick commit-03`
+- `done`：`edit commit-02`
+- `amend`：**不存在**
+- `message`：存在
+
+Lazygit 判定：
+- done 最后一条 = `edit commit-02`
+- 不是 break/exec/reword
+- done[last] != todo[first] → 不是 rescheduled
+- lastTodo 是 edit：
+  - amend 不存在 → 继续检查
+  - message 存在 → 不返回 nil，继续往下
+- commit hash 存在 → **返回 StatusConflicted**
+
+UI 显示：
+```
+--- Pending rebase todos ---
+pick commit-03                          ← StatusRebasing
+edit <-- CONFLICT --- commit-02         ← StatusConflicted（额外追加的）
+--- Commits ---
+commit-01
+```
+
+#### 子情况 B2：被 rescheduled
+
+此时 `.git/rebase-merge/` 中的状态：
+- `git-rebase-todo`：`edit commit-02`（被放回顶部）, `pick commit-03`
+- `done`：`edit commit-02`
+- `amend`：不存在
+- `message`：存在
+
+Lazygit 判定：
+- done 最后一条 = `edit commit-02`
+- `done[last] == todo[first]` → **是 rescheduled，返回 nil**
+
+UI 显示：
+```
+--- Pending rebase todos ---
+pick commit-03                          ← StatusRebasing
+edit commit-02                          ← StatusRebasing（不是红色冲突标记）
+--- Commits ---
+commit-01
+```
+
+用户通过文件视图中的 UU 文件感知冲突。
+
+---
+
+### 场景 C：Fixup 冲突（非 edit 命令）
+
+以集成测试 `AmendCommitWithConflict`（[pkg/integration/tests/interactive_rebase/amend_commit_with_conflict.go](pkg/integration/tests/interactive_rebase/amend_commit_with_conflict.go)）为例：
+
+用户对历史提交 "two" 执行 AmendToCommit（把暂存改动合入 "two"）：
+1. Lazygit 先创建一个 fixup commit（`fixup! two`）
+2. 启动 rebase，把 fixup commit 移动到 "two" 下方
+3. fixup commit 在应用时冲突
+
+此时状态：
+- `git-rebase-todo`：`pick three`
+- `done`：`..., pick two, fixup! two`（最后一条是 fixup）
+- fixup != pick three → 不是 rescheduled
+- 不是 edit → 跳过 edit 分支
+- commit hash 存在 → **返回 StatusConflicted**
+
+UI 显示：
+```
+--- Pending rebase todos ---
+pick three                                ← StatusRebasing
+fixup <-- CONFLICT --- fixup! two         ← StatusConflicted
+--- Commits ---
+two
+one
+```
 
 ---
 
@@ -667,16 +856,25 @@ Git 在命令失败时会把命令重新放回 todo 队列顶部（rescheduled�
 
 ### 4. Edit 状态的三级判定
 
-Edit 命令是唯一需要通过辅助文件（amend/message）进一步区分的命令。从"done 里有没有 edit"到"amend 存不存在"再到"message 存不存在"，三级判定精细地区分了"冲突"和"正常编辑中"两种状态。
+Edit 命令是唯一需要通过辅助文件（amend/message）进一步区分的命令：
+1. amend 存在 → edit 成功应用，正常停下
+2. amend 不存在但 message 存在 → edit 在应用阶段冲突
+3. 两者都不存在 → 状态被干扰，不判定
 
-### 5. onSuccessfulContinue 回调链
+其中 amend 文件的存在是"edit 成功"的决定性标志 —— 它是 Git 在 edit 命令成功应用后自动创建的，不是用户 amend 之后才创建的。
+
+### 5. "Done" 的含义是"已处理"，不是"已成功"
+
+Done 文件记录的是所有被 Git 从 todo 取出并开始处理的命令，无论它们最终是成功、失败还是暂停等待。所以 done 最后一条可能是成功完成的命令，也可能是正在等用户的 edit，还可能是失败的冲突命令。需要结合 amend/message 文件和 todo 列表才能判断具体状态。
+
+### 6. onSuccessfulContinue 回调链
 
 通过注册回调函数的方式，支持多步骤的 rebase 操作（如批量 amend 多个 commit）。每步完成后自动触发下一步，对用户透明。
 
-### 6. 多状态叠加与优先级
+### 7. 多状态叠加与优先级
 
 WorkingTreeState 支持四态叠加，Effective 状态确保用户永远处理最内层的操作。例如 rebase 中的 cherry-pick 冲突，用户必须先解决 cherry-pick，才能继续 rebase。
 
-### 7. 移动时跳过非渲染项
+### 8. 移动时跳过非渲染项
 
 移动 todo 时跳过 label/reset/comment/break 等不可见项，保证用户移动提交时的直觉正确 —— 按一下移动一个"可见提交"，而不是卡在看不见的内部命令上。
