@@ -30,7 +30,7 @@ Lazygit 的暂存区按块编辑由以下核心模块协作完成：
 | 状态管理 | [state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go) | 光标位置、选择模式、视口-补丁行索引映射 |
 | 暂存控制器 | [staging_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go) | 键盘绑定、`ToggleStaged` / `DiscardSelection` / `EditHunk` |
 | 补丁数据结构 | [patch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch.go) | `Patch` / `Hunk` / `PatchLine` 三层模型 |
-| 补丁转换 | [transform.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go) | 按选中行过滤、hunk拆分、行重排序（核心算法） |
+| 补丁转换 | [transform.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go) | 按选中行过滤、hunk 内容过滤、行重排序（核心算法） |
 | 补丁构建器 | [patch_builder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_builder.go) | 自定义补丁的文件级行集合管理 |
 | Git 命令 | [patch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/git_commands/patch.go) | `git apply` 参数组合、临时 patch 文件 |
 | 辅助刷新 | [staging_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/helpers/staging_helper.go) | 双面板 diff 渲染、状态同步 |
@@ -204,7 +204,198 @@ newLen = count(CONTEXT) + count(ADDITION)
 
 ### 3.5 空 Hunk 过滤
 
-`transformHunks()`（[transform.go#L92-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L92-L109)）最后检查 `formattedHunk.containsChanges()`，没有任何 +/- 的纯上下文 hunk 会被整体丢弃。这就是"拆分"的本质：**一个原始 @@ hunk 经行过滤后，可能被切成 0 个、1 个或多个新的 @@ hunk**。
+`transformHunks()`（[transform.go#L92-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L92-L109)）遍历所有原始 hunk，对每个 hunk 调用 `transformHunk()`，然后检查 `formattedHunk.containsChanges()`，没有任何 +/- 的纯上下文 hunk 会被整体丢弃。
+
+```go
+func (self *patchTransformer) transformHunks() []*Hunk {
+    newHunks := make([]*Hunk, 0, len(self.patch.hunks))
+    startOffset := 0
+    for i, hunk := range self.patch.hunks {
+        startOffset, formattedHunk = self.transformHunk(hunk, startOffset, self.patch.HunkStartIdx(i))
+        if formattedHunk.containsChanges() {
+            newHunks = append(newHunks, formattedHunk)
+        }
+    }
+    return newHunks
+}
+```
+
+**一个关键事实：** `transformHunk()` 签名返回 `(int, *Hunk)`，单个原始 hunk 输入 → 单个新 hunk 输出。**一个原始 @@ hunk 经过 Transform 后，最多产出 1 个新 @@ hunk（或因无变更被丢弃），永远不会被拆成多个新 @@ hunk。** 之前认为"会被切成多个"是错误理解。
+
+---
+
+### 3.6 拆分机制真相：内容拆分 ≠ 边界拆分
+
+#### 3.6.1 算法层面的两个硬约束
+
+从代码结构可以推导出两个硬约束：
+
+| 约束 | 代码证据 | 含义 |
+|------|---------|------|
+| ① 1:1 映射 | `transformHunk()` 返回单个 `*Hunk`，不是 `[]*Hunk` | 一个原始 hunk → 0 或 1 个新 hunk，边界不会被拆分 |
+| ② 顺序保留 | `transformHunkLines()` 按原始顺序遍历 `hunk.bodyLines`，输出是单 `[]*PatchLine` | 单个 hunk 内部行不会被切开分配到多个 hunk |
+
+#### 3.6.2 "拆分"到底是什么？
+
+用户感知的"按块拆分"其实是 **hunk 内部的内容过滤**，不是 hunk 边界的拆分。看测试用例 `TestTransform` → `"adding part of a hunk"`（[patch_test.go#L485-L501](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_test.go#L485-L501)）：
+
+**输入（原始 diff，1 个 @@ hunk 内含两处变更）：**
+```diff
+@@ -1,5 +1,5 @@
+ apple
+-grape          // 变更1：删除 grape
++kiwi           // 变更1：新增 kiwi
+ orange
+-pear           // 变更2：删除 pear
++banana         // 变更2：新增 banana
+ lemon
+```
+
+**用户选中范围：** lineIndex 6-7（只选中第一处变更 `-grape` 和 `+kiwi`）
+
+**Transform(Reverse=false) 行处理：**
+
+| 原行 | 选中？ | isOldFileLine | 处理结果 |
+|------|-------|--------------|---------|
+| ` apple` | — | — | 保留 context |
+| `-grape` | ✅ | true（DELETION） | 保留 `-grape` |
+| `+kiwi` | ✅ | false（ADDITION） | flush pendingContext 后保留 `+kiwi` |
+| ` orange` | — | — | flush pendingContext 后保留 context |
+| `-pear` | ❌ | true（DELETION） | 转 ` pear` context 入 pendingContext |
+| `+banana` | ❌ | false（ADDITION） | 直接丢弃，didSeeUnselectedNewFileLine=true |
+| ` lemon` | — | — | flush pendingContext（` pear`）后保留 context |
+
+**输出（仍然是 1 个 @@ hunk）：**
+```diff
+@@ -1,5 +1,5 @@
+ apple
+-grape
++kiwi
+ orange
+ pear     // ← 原本的 -pear 变成了 context 行
+ lemon
+```
+
+> **关键发现：** 输出仍然只有 1 个 @@ hunk。未选中的 `-pear` 被转成 context 行保住了定位锚点，未选中的 `+banana` 被丢弃。hunk 边界从始至终没有变化，变化的只是** hunk 内部的内容**（哪些行被保留、哪些行被转 context、哪些行被丢弃）。
+
+#### 3.6.3 什么时候输出会有多个 @@ hunk？
+
+只有当**用户选中的范围跨越了多个原始 @@ hunk 的边界**时，输出才会有多个 hunk。看测试用例 `"staging part of both hunks"`（[patch_test.go#L406-L429](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_test.go#L406-L429)）：
+
+**输入（原始 diff，2 个 @@ hunk）：**
+```diff
+@@ -1,5 +1,5 @@    // hunk 0：line 0-9
+ apple
+-grape
++orange
+ ...
+ ...
+ ...
+@@ -8,6 +8,8 @@    // hunk 1：line 10-19
+ ...
+ ...
+ ...
++pear
++lemon
+ ...
+ ...
+ ...
+```
+
+**用户选中范围：** lineIndex 7-15（跨越 hunk 0 和 hunk 1 的边界）
+- line 7 属于 hunk 0（`+orange`）
+- line 15 属于 hunk 1（`+pear`）
+
+**输出（2 个 @@ hunk，对应原始 2 个 hunk）：**
+```diff
+@@ -1,5 +1,6 @@    // hunk 0：只保留了选中的 +orange，-grape 转 context
+ apple
++orange
+ grape
+ ...
+ ...
+ ...
+@@ -8,6 +9,7 @@    // hunk 1：只保留了选中的 +pear，+lemon 被丢弃
+ ...
+ ...
+ ...
++pear
+ ...
+ ...
+ ...
+```
+
+每个原始 hunk 各自独立处理、各自产出 1 个新 hunk。**输出 hunk 数量 = 被选中范围覆盖的原始 hunk 数量**，和原始 hunk 数量是线性对应的。
+
+#### 3.6.4 pendingContext 冲刷机制对 hunk 边界的影响
+
+`pendingContext` 缓冲和冲刷是**单 hunk 内部的行重排序机制**（[transform.go#L137-L203](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L137-L203)），不会跨越 hunk 边界：
+
+1. **缓冲生命周期：** `pendingContext` 在 `transformHunkLines()` 入口处初始化 `= []*PatchLine{}`，在函数末尾 `flushPendingContext()`，随函数调用栈结束而销毁
+2. **冲刷时机：** 遇到 context 行、遇到选中的 oldFileLine、遇到跳过新增行后的选中新增行、遇到 NEWLINE_MESSAGE、遍历结束时
+3. **跨 hunk 隔离：** 每个 hunk 调用 `transformHunkLines()` 时有独立的 `pendingContext`，前一个 hunk 未冲刷的上下文绝不会泄漏到后一个 hunk
+
+**为什么需要 pendingContext？** 看这个变更块：
+
+```diff
+- old 1    // 未选中 → 转 context，入 pendingContext
+- old 2    // ✅选中 → flush pendingContext（old 1 先输出），再输出 -old 2
++ new A    // ✅选中 → 输出 +new A
++ new B    // 未选中 → 丢弃，didSeeUnselectedNewFileLine=true
+```
+
+如果没有缓冲直接输出，顺序会是：`-old 2` → `+new A` → ` old 1`（未选中的 old 1 跑到了最后）。pendingContext 保证了正确顺序：` old 1` → `-old 2` → `+new A`。
+
+但这**完全是单个 hunk 内部的行重排序**，不会产生新的 hunk 边界。
+
+#### 3.6.5 不会拆分的边界情况验证
+
+即使在最"应该"拆分的场景下，算法也不会真的拆分 hunk 边界：
+
+**场景：** 一个 hunk 内有两处不相邻的变更，只选中第一处和第三处，跳过中间第二处。
+
+```diff
+@@ -1,9 +1,9 @@
+ line 1
+-del A      // 选中
++add A      // 选中
+ line 3
+ line 4
+-del B      // 未选中
++add B      // 未选中
+ line 6
+ line 7
+-del C      // 选中
++add C      // 选中
+```
+
+**Transform 后输出（仍然 1 个 hunk）：**
+```diff
+@@ -1,9 +1,9 @@
+ line 1
+-del A
++add A
+ line 3
+ line 4
+ del B      // 未选中的 -del B 转 context
+ line 6
+ line 7
+-del C
++add C
+```
+
+未选中的 `-del B` 转成 context 行、`+add B` 被丢弃，中间用 context 行"桥接"起来，整体仍然是**一个连续的 @@ hunk**。算法永远不会在中间插入新的 `@@ ... @@` 行把它切成两个。
+
+#### 3.6.6 拆分机制总结
+
+| 维度 | 事实 | 误区纠正 |
+|------|------|---------|
+| **hunk 边界** | 原始 hunk 边界是硬边界，不会被切开 | ❌ 一个原始 hunk 会被拆成多个 |
+| **输出 hunk 数** | = 选中范围覆盖的原始 hunk 数 | ❌ 可以任意拆分出更多 hunk |
+| **pendingContext** | 单 hunk 内部行重排序，不跨边界 | ❌ 会在 hunk 之间传递 |
+| **"拆分"的真正含义** | hunk 内部行的选择性保留（+/-）与转 context（未选中的旧文件行） | ❌ 物理上切成多个独立 @@ 块 |
+
+这个设计保证了 `git apply` 始终能通过连续的上下文行定位到正确的应用位置——如果真的把一个 hunk 切成两个，中间的 context 行就会断裂，`git apply` 可能定位失败。
 
 ---
 
@@ -614,3 +805,5 @@ applySelection(reverse=false)
 | 只选中了上下文行（空格开头） | `LineIndicesOfAddedOrDeletedLines` 返回空 → 不操作 | [state.go#L376-L387](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L376-L387) |
 | 视图宽度变化（换行改变） | `OnViewWidthChanged()` 重建索引映射并保留选中行锚点 | [state.go#L127-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L127-L142) |
 | 跨视图面板切换 | `TogglePanel()` 在主/副面板间跳转而不返回文件面板 | [staging_controller.go#L196-L202](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L196-L202) |
+| 选中范围跨越多个原始 hunk | 每个原始 hunk 独立处理、独立产出 1 个新 hunk，输出 hunk 数 = 被覆盖的原始 hunk 数 | [transform.go#L92-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L92-L109) |
+| 单个 hunk 内部分变更被跳过 | 未选中的 old file 行转 context 行桥接，不会在中间插入新 `@@` 头拆分 hunk | [transform.go#L125-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L125-L205) |
