@@ -42,7 +42,7 @@ Lazygit 的命令执行与日志系统采用了清晰的分层架构，从命令
 
 ### 1.1 GitCommandBuilder - Git 命令参数构建器
 
-**文件**: [git_command_builder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/git_commands/git_command_builder.go)
+**文件**: [git_command_builder.go](pkg/commands/git_commands/git_command_builder.go)
 
 **职责**: 以流式 API 构建 git 命令的参数列表，支持条件参数。
 
@@ -66,7 +66,7 @@ cmdArgs := NewGitCmd("log").
 
 ### 1.2 CmdObjBuilder - 命令对象构建器
 
-**文件**: [cmd_obj_builder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj_builder.go)
+**文件**: [cmd_obj_builder.go](pkg/commands/oscommands/cmd_obj_builder.go)
 
 **职责**: 将参数数组包装为可执行的 CmdObj，并注入 runner。
 
@@ -78,7 +78,7 @@ cmdArgs := NewGitCmd("log").
 
 ### 1.3 gitCmdObjBuilder - Git 命令构建器装饰器
 
-**文件**: [git_cmd_obj_builder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/git_cmd_obj_builder.go)
+**文件**: [git_cmd_obj_builder.go](pkg/commands/git_cmd_obj_builder.go)
 
 **职责**: 对基础 CmdObjBuilder 进行 git 特定增强：
 - 添加 `GIT_OPTIONAL_LOCKS=0` 环境变量
@@ -90,7 +90,7 @@ cmdArgs := NewGitCmd("log").
 
 ## 二、命令对象层 (CmdObj)
 
-**文件**: [cmd_obj.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj.go)
+**文件**: [cmd_obj.go](pkg/commands/oscommands/cmd_obj.go)
 
 **核心结构体**: `CmdObj` - 命令对象，封装 `exec.Cmd` 并提供丰富的配置选项。
 
@@ -135,7 +135,7 @@ cmdArgs := NewGitCmd("log").
 
 ### 3.1 ICmdObjRunner 接口
 
-**文件**: [cmd_obj_runner.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj_runner.go)
+**文件**: [cmd_obj_runner.go](pkg/commands/oscommands/cmd_obj_runner.go)
 
 ```go
 type ICmdObjRunner interface {
@@ -185,7 +185,7 @@ onRun 回调处理输出（不同场景有不同回调）
 
 ### 3.3 gitCmdObjRunner - Git 命令运行器装饰器
 
-**文件**: [git_cmd_obj_runner.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/git_cmd_obj_runner.go)
+**文件**: [git_cmd_obj_runner.go](pkg/commands/git_cmd_obj_runner.go)
 
 **职责**: 为 git 命令添加**锁冲突重试**逻辑。
 
@@ -208,14 +208,14 @@ Runner 在启动命令时会选择创建不同的 handler：
 | `getCmdHandlerPty` | Windows | 回退到 NonPty | 同左 | 无操作 | Windows 无 PTY 支持 |
 | `getCmdHandlerNonPty` | 通用 | io.Pipe 读取端 | Buffer | 无操作 | 流式输出 / 普通命令 |
 
-**文件**: [cmd_obj_runner_default.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj_runner_default.go) (非 Windows)
-**文件**: [cmd_obj_runner_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj_runner_windows.go) (Windows)
+**文件**: [cmd_obj_runner_default.go](pkg/commands/oscommands/cmd_obj_runner_default.go) (非 Windows)
+**文件**: [cmd_obj_runner_windows.go](pkg/commands/oscommands/cmd_obj_runner_windows.go) (Windows)
 
 ---
 
 ## 四、GUI IO 桥接层 (guiIO)
 
-**文件**: [gui_io.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/gui_io.go)
+**文件**: [gui_io.go](pkg/commands/oscommands/gui_io.go)
 
 **设计思想**: 命令层不直接依赖 GUI，而是通过注入回调函数实现双向通信。
 
@@ -240,7 +240,7 @@ type guiIO struct {
 
 ### 4.3 初始化位置
 
-**文件**: [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/gui.go#L776-L781)
+**文件**: [gui.go](pkg/gui/gui.go#L776-L781)
 
 ```go
 guiIO := oscommands.NewGuiIO(
@@ -257,7 +257,7 @@ guiIO := oscommands.NewGuiIO(
 
 ### 5.1 命令日志面板 (Extras Panel)
 
-**文件**: [command_log_panel.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/command_log_panel.go)
+**文件**: [command_log_panel.go](pkg/gui/command_log_panel.go)
 
 **两个核心概念**:
 - **Action (动作)**: 人类可读的描述，如 "Stage File"，黄色显示
@@ -277,13 +277,13 @@ Unstage File:
 
 ### 5.2 getCmdWriter - 命令输出写入器
 
-**文件**: [extras_panel.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/extras_panel.go#L96-L98)
+**文件**: [extras_panel.go](pkg/gui/extras_panel.go#L96-L98)
 
 返回一个 `prefixWriter`，首次写入时自动添加紫色 "Git output:" 前缀，后续写入直接透传到 Extras 面板视图。
 
 ### 5.3 主视图任务系统 (ViewBufferManager)
 
-**文件**: [tasks.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/tasks/tasks.go)
+**文件**: [tasks.go](pkg/tasks/tasks.go)
 
 对于需要在主视图展示输出的命令（如 `git show`、`git diff`），使用任务系统管理：
 
@@ -333,10 +333,10 @@ CommitLoader.GetCommits()
 
 推送命令是 lazygit 中最复杂的命令流程之一，它**不使用** `StreamOutput()`，而是通过 `PromptOnCredentialRequest()` 走凭证处理路径。凭证处理路径内部会复用 `runAndStreamAux` 的流式输出能力，同时叠加了凭证检测逻辑。
 
-**文件**: [sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/git_commands/sync.go) (命令构造)
-**文件**: [sync_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/controllers/sync_controller.go) (GUI 入口)
-**文件**: [cmd_obj_runner.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/oscommands/cmd_obj_runner.go#L314-L444) (凭证运行时)
-**文件**: [credentials_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/controllers/helpers/credentials_helper.go) (凭证 UI)
+**文件**: [sync.go](pkg/commands/git_commands/sync.go) (命令构造)
+**文件**: [sync_controller.go](pkg/gui/controllers/sync_controller.go) (GUI 入口)
+**文件**: [cmd_obj_runner.go](pkg/commands/oscommands/cmd_obj_runner.go#L314-L444) (凭证运行时)
+**文件**: [credentials_helper.go](pkg/gui/controllers/helpers/credentials_helper.go) (凭证 UI)
 
 #### 第一阶段：GUI 触发与命令构造
 
@@ -432,7 +432,7 @@ processOutput(reader, writer, promptFn, closeFunc, cmdObj)
 
 #### 第五阶段：凭证 UI 弹窗
 
-**文件**: [credentials_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/controllers/helpers/credentials_helper.go)
+**文件**: [credentials_helper.go](pkg/gui/controllers/helpers/credentials_helper.go)
 
 ```
 CredentialsHelper.PromptUserForCredential(passOrUname)
@@ -480,7 +480,7 @@ SyncController.pushAux:
 
 ### 6.4 后台 Fetch 命令（无凭证提示）
 
-**文件**: [sync.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/commands/git_commands/sync.go#L77-L84)
+**文件**: [sync.go](pkg/commands/git_commands/sync.go#L77-L84)
 
 后台 fetch 是推送的对照场景，展示了 `FailOnCredentialRequest` + `DontLog` + `SuppressOutputUnlessError` 的组合使用：
 
@@ -508,7 +508,7 @@ cmdObjRunner.Run(cmdObj)
 
 ### 6.5 流式输出命令（如 git commit 通过 GpgHelper）
 
-**文件**: [gpg_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/controllers/helpers/gpg_helper.go)
+**文件**: [gpg_helper.go](pkg/gui/controllers/helpers/gpg_helper.go)
 
 与推送不同，`git commit` 通过 `GpgHelper.runAndStream` 使用 `StreamOutput()` 模式：
 
@@ -531,7 +531,7 @@ GpgHelper.runAndStream(cmdObj, waitingStatus, onSuccess, refreshScope)
 
 ### 6.6 子进程挂起模式（如编辑文件）
 
-**文件**: [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/38-lazygit/pkg/gui/gui.go#L986-L1062)
+**文件**: [gui.go](pkg/gui/gui.go#L986-L1062)
 
 ```
 runSubprocessWithSuspense(cmdObj)
