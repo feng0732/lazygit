@@ -418,8 +418,12 @@ status += fmt.Sprintf("%s → %s", repoName, name)
 
 最终 Status 格式示例：
 - 主树：`my-repo → main`
-- Linked worktree：`my-repo( feature-x) → feature-x`
-- 图标开启时 worktree 名前加 `LINKED_WORKTREE_ICON`，青色（FgCyan）显示
+- Linked worktree（图标开启）：`my-repo(󰌹 feature-x) → feature-x`
+- 图标：`LINKED_WORKTREE_ICON`，worktree 名用青色（FgCyan）显示
+
+图标来源：与 worktree 列表面板的 worktree 图标完全相同——两者都调用 `IconForWorktree(false)` → `LINKED_WORKTREE_ICON`，定义见 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)
+- Nerd Font v3 模式：`\U000f0339` → `󰌹`
+- 兼容 Nerd Font v2 模式：`\uf838` → ``
 
 ### 5.6 文件状态中 linked worktree 的识别与渲染
 
@@ -484,7 +488,8 @@ customIcons.Filenames → nameIconMap → customIcons.Extensions → extIconMap
 ```
 
 Linked worktree 的图标配置：
-- 图标：`LINKED_WORKTREE_ICON`（Nerd Font：`󰌹` / 兼容模式：``）
+- 与 Status 栏、Worktrees 面板共用同一个 `LINKED_WORKTREE_ICON`（三者均调用 `IconForWorktree(false)`）
+- Nerd Font v3 模式：`\U000f0339` → `󰌹`；兼容 Nerd Font v2 模式：`\uf838` → ``
 - 颜色：`#4E4E4E`（深灰）
 - 定义在 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)
 
