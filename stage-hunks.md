@@ -220,7 +220,9 @@ func (self *patchTransformer) transformHunks() []*Hunk {
 }
 ```
 
-**一个关键事实：** `transformHunk()` 签名返回 `(int, *Hunk)`，单个原始 hunk 输入 → 单个新 hunk 输出。**一个原始 @@ hunk 经过 Transform 后，最多产出 1 个新 @@ hunk（或因无变更被丢弃），永远不会被拆成多个新 @@ hunk。** 之前认为"会被切成多个"是错误理解。
+**一个关键事实：** `transformHunk()` 签名返回 `(int, *Hunk)`，单个原始 hunk 输入 → 单个新 hunk 输出（或因空块被过滤掉）。**一个原始 @@ hunk 经过 Transform 后，最多产出 1 个新 @@ hunk，永远不会被拆成多个新 @@ hunk。**
+
+**空块的本质：** hunk 内没有任何一条变更行被选中（详见 3.7.2 节的充要条件分析）。
 
 ---
 
@@ -325,7 +327,7 @@ func (self *patchTransformer) transformHunks() []*Hunk {
  ...
 ```
 
-每个原始 hunk 各自独立处理、各自产出 1 个新 hunk。**输出 hunk 数量 = 被选中范围覆盖的原始 hunk 数量**，和原始 hunk 数量是线性对应的。
+每个原始 hunk 各自独立处理、各自产出 0 或 1 个新 hunk。**输出 hunk 数量 ≤ 被选中范围覆盖的原始 hunk 数量**（差集为被覆盖但无选中变更行的空块），和原始 hunk 数量是线性对应（不增）的关系。
 
 #### 3.6.4 pendingContext 冲刷机制对 hunk 边界的影响
 
@@ -391,7 +393,7 @@ func (self *patchTransformer) transformHunks() []*Hunk {
 | 维度 | 事实 | 误区纠正 |
 |------|------|---------|
 | **hunk 边界** | 原始 hunk 边界是硬边界，不会被切开 | ❌ 一个原始 hunk 会被拆成多个 |
-| **输出 hunk 数** | = 选中范围覆盖的原始 hunk 数 | ❌ 可以任意拆分出更多 hunk |
+| **输出 hunk 数** | ≤ 选中范围覆盖的原始 hunk 数（差集为空块） | ❌ 可以任意拆分出更多 hunk |
 | **pendingContext** | 单 hunk 内部行重排序，不跨边界 | ❌ 会在 hunk 之间传递 |
 | **"拆分"的真正含义** | hunk 内部行的选择性保留（+/-）与转 context（未选中的旧文件行） | ❌ 物理上切成多个独立 @@ 块 |
 
@@ -401,15 +403,13 @@ func (self *patchTransformer) transformHunks() []*Hunk {
 
 ### 3.7 输出补丁块数量的精确计算公式
 
-输出补丁块（即新 @@ hunk）的数量可以通过以下公式精确计算，适用于所有场景：
+输出补丁块（即新 @@ hunk）的数量可以通过以下公式精确计算，适用于所有场景（暂存面板、Patch Builder、EditHunk 等）：
 
 **单文件输出 hunk 数公式：**
 ```
-OutputHunkCount(file) = Σ(
+OutputHunkCount(file) = count(
     for each 原始 hunk H in file:
-        if H 包含至少 1 条选中的变更行
-           AND transform(H) 后 containsChanges() == true
-        then 1 else 0
+        H 内至少有 1 条选中的变更行（ADDITION 或 DELETION）
 )
 ```
 
@@ -418,9 +418,11 @@ OutputHunkCount(file) = Σ(
 TotalOutputHunkCount = Σ(OutputHunkCount(file) for each file in patch)
 ```
 
-公式的两层含义：
+> **简化等价表述：** `OutputHunkCount = 被选中且 containsChanges() == true 的原始 hunk 数量`
+> 
+> 这两个条件其实是等价的——只要 hunk 内有选中的变更行，`containsChanges()` 就必然为 true；反之，如果没有任何选中的变更行，`containsChanges()` 必然为 false（因为未选中的 old file 行转 context、未选中的 new file 行丢弃，都不会留下 +/-）。
 
-#### 第一层：hunk 边界必须被选中范围覆盖
+#### 3.7.1 第一层判断：hunk 是否与选中范围有交集
 
 `HunkStartIdx(hunkIndex)`（[patch.go#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch.go#L65-L73)）计算每个原始 hunk 在整个补丁中的起始行号：
 
@@ -428,7 +430,7 @@ TotalOutputHunkCount = Σ(OutputHunkCount(file) for each file in patch)
 func (self *Patch) HunkStartIdx(hunkIndex int) int {
     result := len(self.header)
     for i := range hunkIndex {
-        result += self.hunks[i].lineCount()  // +1 因为包含 hunk 头行
+        result += self.hunks[i].lineCount()  // 每个 hunk 含 1 行 header + bodyLines
     }
     return result
 }
@@ -436,9 +438,11 @@ func (self *Patch) HunkStartIdx(hunkIndex int) int {
 
 一个原始 hunk 是否被选中范围覆盖，取决于它的行号区间 `[HunkStartIdx(i), HunkEndIdx(i)]` 是否与 `IncludedLineIndices` 有交集。
 
-#### 第二层：containsChanges() 的空块过滤
+> **"覆盖" ≠ "有选中的变更行"：** 选中范围可能只覆盖了 hunk 的 header 行或 context 行，完全不包含任何 +/- 变更行。这种情况下 hunk 被"覆盖"了但不会产生输出（见 3.7.2 节空块过滤）。
 
-即使 hunk 被选中范围覆盖，如果 Transform 后没有任何真正的变更（所有 +/- 都被转成 context 或丢弃），`containsChanges()`（[hunk.go#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/hunk.go#L36-L38)）会返回 false，这个 hunk 会被丢弃：
+#### 3.7.2 第二层过滤：containsChanges() 的空块丢弃
+
+对每个被覆盖的 hunk，Transform 后会检查 `containsChanges()`（[hunk.go#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/hunk.go#L36-L38)），没有任何变更的纯上下文 hunk 会被整体丢弃：
 
 ```go
 func (self *Hunk) containsChanges() bool {
@@ -446,18 +450,40 @@ func (self *Hunk) containsChanges() bool {
 }
 ```
 
-**空块丢弃的典型场景：** 用户只选中了 hunk 中的 `-` 删除行，且 `Reverse=true`。此时 `-` 行属于 new file 行，未选中时直接丢弃；如果这恰好是 hunk 内唯一的变更行，Transform 后 hunk 就只剩 context 行，`containsChanges() == false`，整个 hunk 被丢弃。
+**空块产生的充要条件：** hunk 内**没有任何一条变更行被选中**。
 
-**输出块数的极端情况：**
+推理链条：
+- 选中的变更行 → 保留原 kind（ADDITION 或 DELETION）→ 贡献 change → containsChanges() 为 true
+- 未选中的 old file 行 → 转 CONTEXT → 不贡献 change
+- 未选中的 new file 行 → 直接丢弃 → 不贡献 change
+- 原 context 行 → 保持 CONTEXT → 不贡献 change
 
-| 场景 | OutputHunkCount | 说明 |
-|------|----------------|------|
-| 所有 hunk 都未选中 | 0 | 空 patch，不执行 git apply |
-| 2 个原始 hunk，都覆盖但 1 个变空块 | 1 | 另一个 hunk 被丢弃 |
-| 3 个原始 hunk，全部选中且都有变更 | 3 | 与原始 hunk 数相同 |
-| 选中范围跨越 2 个原始 hunk 边界，都有变更 | 2 | 每个原始 hunk 各产出 1 个 |
+所以：**有选中的变更行 ⟺ containsChanges() == true**，两者完全等价。
 
-> **关键结论：** `OutputHunkCount ≤ 原始 hunk 数`，永远不会大于。因为一个原始 hunk 最多产出 1 个新 hunk，且可能因空块被丢弃。
+**空块丢弃的典型场景：**
+| 场景 | 结果 | 原因 |
+|------|------|------|
+| 选中范围只覆盖 hunk 的开头 context 行 | 空块丢弃 | 没有选中任何变更行 |
+| 选中范围只覆盖 hunk 的 `@@` header 行 | 空块丢弃 | header 行不算 bodyLines，且不含变更 |
+| 纯新增 hunk（全是 `+` 行），一行都没选中 | 空块丢弃 | 所有 `+` 行都被丢弃了 |
+| 纯删除 hunk（全是 `-` 行），一行都没选中 | 空块丢弃 | 所有 `-` 行都转 context 了，但没有变更行 |
+
+**非空块的反例（容易被误认为是空块）：**
+- ❌ "只选中了删除行" → 不是空块，选中的 `-` 行保留 DELETION kind
+- ❌ "只选中了新增行" → 不是空块，选中的 `+` 行保留 ADDITION kind
+- ❌ "只选中了一处变更但 hunk 很大" → 不是空块，只要有一条 +/- 就不算空
+
+#### 3.7.3 输出块数的极端情况
+
+| 场景 | 原始 hunk 数 | OutputHunkCount | 说明 |
+|------|-------------|----------------|------|
+| 所有 hunk 都未被选中 | N | 0 | 空 patch，不执行 git apply |
+| 选中范围覆盖 2 个 hunk，其中 1 个无选中变更行 | 2+ | 1 | 有变更的 hunk 输出，空块被丢弃 |
+| 3 个原始 hunk，全部覆盖且都有选中变更行 | 3 | 3 | 与覆盖数相同 |
+| 选中范围跨越 2 个原始 hunk 边界，都有选中变更 | 2 | 2 | 每个原始 hunk 各产出 1 个 |
+| 单个原始 hunk 内非连续选中多处变更 | 1 | 1 | 仍只有 1 个 hunk，中间用 context 桥接 |
+
+> **关键结论（单调性）：** `OutputHunkCount ≤ 原始 hunk 数`，永远不会大于。因为一个原始 hunk 最多产出 1 个新 hunk，且可能因空块被丢弃。输出 hunk 数是原始 hunk 数的**单调非递增函数**。
 
 ---
 
@@ -477,6 +503,10 @@ func (self *Hunk) containsChanges() bool {
 #### 3.8.1 ① 空块丢弃（Transform 内部机制）
 
 **行为：** 对每个原始 hunk Transform 后，检查 `containsChanges()`。如果 hunk 内没有任何 ADDITION 或 DELETION 行（全是 context），则从输出中丢弃。
+
+**充要条件：** hunk 内没有任何一条变更行被选中。
+- 只要有 1 条选中的变更行 → containsChanges() == true → 输出该 hunk
+- 0 条选中的变更行 → containsChanges() == false → 空块被丢弃
 
 **这不是用户操作，是 Transform 的内部安全机制**——防止生成无意义的纯上下文补丁导致 `git apply` 出错。
 
@@ -1046,9 +1076,13 @@ applySelection(reverse=false)
 | 场景 | 处理方式 | 代码位置 |
 |------|---------|---------|
 | Diff 上下文为 0 | 直接拒绝操作并提示增加上下文 | [staging_controller.go#L205-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L205-L208) |
-| Transform 后生成空 patch | `patchToApply == ""` 时直接 return，不调 git apply | [staging_controller.go#L256-L258](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L256-L258) |
+| Transform 后生成空 patch（无任何 hunk） | `patchToApply == ""` 时直接 return，不调 git apply | [staging_controller.go#L256-L258](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L256-L258) |
 | 只选中了上下文行（空格开头） | `LineIndicesOfAddedOrDeletedLines` 返回空 → 不操作 | [state.go#L376-L387](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L376-L387) |
 | 视图宽度变化（换行改变） | `OnViewWidthChanged()` 重建索引映射并保留选中行锚点 | [state.go#L127-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/patch_exploring/state.go#L127-L142) |
 | 跨视图面板切换 | `TogglePanel()` 在主/副面板间跳转而不返回文件面板 | [staging_controller.go#L196-L202](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L196-L202) |
-| 选中范围跨越多个原始 hunk | 每个原始 hunk 独立处理、独立产出 1 个新 hunk，输出 hunk 数 = 被覆盖的原始 hunk 数 | [transform.go#L92-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L92-L109) |
-| 单个 hunk 内部分变更被跳过 | 未选中的 old file 行转 context 行桥接，不会在中间插入新 `@@` 头拆分 hunk | [transform.go#L125-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L125-L205) |
+| 选中范围跨越多个原始 hunk | 每个原始 hunk 独立处理，输出 hunk 数 ≤ 被覆盖的原始 hunk 数（差集为空块） | [transform.go#L92-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L92-L109) |
+| 单个 hunk 内部分变更被跳过 | 未选中的 old file 行转 context 行桥接，不会插入新 `@@` 头拆分 hunk | [transform.go#L125-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L125-L205) |
+| hunk 内无任何选中的变更行 | `containsChanges() == false` → 整个 hunk 被丢弃（空块过滤） | [hunk.go#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/hunk.go#L36-L38) |
+| PatchBuilder 选中范围跨越已选/未选区域 | 以**第一条选中的变更行**的状态为准，批量 add 或 remove | [patch_building_controller.go#L160-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/patch_building_controller.go#L160-L164) |
+| PatchBuilder 整文件选中 | mode = WHOLE，直接返回原始 diff，跳过 Parse+Transform 优化 | [patch_builder.go#L190-L195](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_builder.go#L190-L195) |
+| 副面板按 d（丢弃暂存） | 与副面板按空格（取消暂存）走完全相同的写回路径，效果一致 | [staging_controller.go#L218-L222](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/staging_controller.go#L218-L222) |
