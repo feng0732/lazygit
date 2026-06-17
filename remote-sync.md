@@ -324,18 +324,20 @@ WaitTime   = 50 * time.Millisecond
 
 #### ❗ 核心纠正：三种刷新模式的真实区别
 
-之前的理解有误，**ASYNC 是串行，SYNC 才是并行**。关键代码在 `refresh()` 包装函数 [refresh_helper.go:110-128](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L110-L128)：
+之前的理解有误，**ASYNC 和 SYNC 都是并行，区别在于 Refresh() 是否等待所有 scope 完成**。
+
+关键代码在 `refresh()` 包装函数 [refresh_helper.go:110-128](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L110-L128)：
 
 ```go
 refresh := func(name string, f func()) {
     if !self.c.InDemo() && options.Mode == types.ASYNC {
-        // ASYNC: OnWorker 串行调度（gocui worker 池 FIFO）
+        // ASYNC: 每次调 OnWorker 都启动一个独立 goroutine
         self.c.OnWorker(func(t gocui.Task) error {
             f()
             return nil
         })
     } else {
-        // SYNC / BLOCK_UI: 每个 scope 独立 goroutine 并行执行
+        // SYNC / BLOCK_UI: 每次也启动一个独立 goroutine，但参与 wg
         wg.Add(1)
         go utils.Safe(func() {
             defer wg.Done()
@@ -345,13 +347,49 @@ refresh := func(name string, f func()) {
 }
 ```
 
+**OnWorker 的底层实现** [gui.go:650-656](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gocui/gui.go#L650-L656)：
+```go
+func (g *Gui) OnWorker(f func(Task) error) {
+    task := g.NewTask()
+    go func() {          // ← 每次调 OnWorker 都启动一个独立 goroutine！
+        g.onWorkerAux(f, task)
+        task.Done()
+    }()
+}
+```
+
+**ASYNC 和 SYNC 的真正区别不是"串行 vs 并行"，而是"fire-and-forget vs 等待完成"：**
+
+- **ASYNC**：每个 scope 启动独立 goroutine → `wg.Wait()` 无事可等（scope 不调 `wg.Add`）→ `Refresh()` 立即返回
+- **SYNC**：每个 scope 启动独立 goroutine + `wg.Add(1)` → `wg.Wait()` 阻塞到所有 scope 完成 → `Refresh()` 在所有 scope 完成后才返回
+- **BLOCK_UI**：`f()` 在 UI 线程上执行（scope 内部仍是 goroutine 并行），`wg.Wait()` 阻塞 UI 线程
+
 三种模式对比：
 
-| 模式 | 调度方式 | `Refresh()` 是否等待 | scope 执行顺序 | 能否立即读 `Model.*` | 典型场景 |
-|------|---------|---------------------|---------------|---------------------|----------|
-| **ASYNC** | `OnWorker` 串行队列 | ❌ 立即返回 | 按代码顺序**一个接一个**执行 | ❌ 不能 | push/pull 成功后 |
-| **SYNC** | 每个 scope `go func()` 独立 goroutine | ✅ `wg.Wait()` 阻塞 | **同时**并行执行 | ✅ 能（所有 scope 完成后） | PromptToContinueRebase 需立即读 Model.Files |
-| **BLOCK_UI** | `OnUIThread` 直接执行 | ✅ 同步阻塞 UI | UI 线程顺序执行 | ✅ 能 | 切换分支等关键操作 |
+| 模式 | scope 启动方式 | scope 间关系 | `Refresh()` 是否等待 | 能否立即读 `Model.*` | 典型场景 |
+|------|---------------|-------------|---------------------|---------------------|----------|
+| **ASYNC** | `OnWorker` → `go func()` | **并行**（各自独立 goroutine） | ❌ 立即返回 | ❌ 不能 | push/pull 成功后 |
+| **SYNC** | `go utils.Safe()` + `wg.Add` | **并行**（各自独立 goroutine） | ✅ `wg.Wait()` 阻塞 | ✅ 能（所有 scope 完成后） | PromptToContinueRebase |
+| **BLOCK_UI** | `OnUIThread` 上执行 `f()`，scope 内仍是 `go func()` | **并行** | ✅ 阻塞 UI 线程等 wg | ✅ 能 | 切换分支 |
+
+**ASYNC 下 `wg.Wait()` 为什么空转？** 因为 ASYNC 分支不调 `wg.Add(1)`，所以 `wg` 计数器始终为 0，`wg.Wait()` 立即返回。这就是 ASYNC + `Then` 组合会 panic 的原因 [refresh_helper.go:64-66](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L64-L66)——Then 本应在所有 scope 完成后执行，但 wg 不跟踪 scope，Then 无法保证时机。
+
+**ASYNC 下 `Refresh()` 的 `f()` 何时执行？** 
+
+[refresh_helper.go:228-236](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L228-L236)：
+```go
+if options.Mode == types.BLOCK_UI {
+    self.c.OnUIThread(func() error { f(); return nil })
+    return
+}
+f()   // ← ASYNC 和 SYNC 都在调用线程直接执行 f()
+```
+
+`f()` 包含两件事：
+1. 逐个调 `refresh()` 提交 scope（ASYNC 下每次 `OnWorker` 启动新 goroutine）
+2. 调 `refreshStatus()` 和 `wg.Wait()`
+
+所以 ASYNC 模式下，`f()` 在调用线程**同步执行**，但 scope 的实际工作（如 `refreshBranches()`）已经在各自的 goroutine 中**并行**开始了。`f()` 执行到 `wg.Wait()` 时因为 wg 为空立即返回，`Refresh()` 结束。
 
 #### ❗ CheckMergeOrRebase 实际用 ASYNC，不是 SYNC
 
@@ -499,47 +537,56 @@ worktrees             ─┘
 
 **ASYNC 模式（push/pull 成功后）：**
 ```
-调用方线程 (Worker 线程，执行 push/pull 回调)
+调用方线程 (Worker goroutine，执行 push/pull 回调)
 ├─ Refresh(ASYNC)
-│   ├─ refresh("commits", ...) → OnWorker(task1)
-│   ├─ refresh("branches", ...) → OnWorker(task2)  // 排队，等 task1 完成
-│   ├─ refresh("files", ...) → OnWorker(task3)     // 排队，等 task2 完成
-│   └─ ...
+│   ├─ f() 在当前线程同步执行:
+│   │   ├─ refresh("commits", ...) → OnWorker → go goroutine_A  ─┐
+│   │   ├─ refresh("branches", ...) → OnWorker → go goroutine_B  │ 同时并行！
+│   │   ├─ refresh("files", ...) → OnWorker → go goroutine_C     │
+│   │   ├─ ...                                                    │
+│   │   ├─ refreshStatus()   // branches 还没完成，大概率 early return
+│   │   └─ wg.Wait()         // wg 为空，立即返回
+│   └─ Refresh() 立即返回 → 调用方继续执行（InlineStatus stop 等）
 │
-└─ Refresh() 立即返回 → 调用方继续执行（InlineStatus stop 等）
-
-gocui Worker 池 (串行 FIFO)
-├─ task1 执行: refreshCommitsAndCommitFiles()
-│   └─ refreshView(LocalCommits) → OnUIThread 渲染
-├─ task2 执行: refreshBranches()
-│   └─ refreshView(Branches) → OnUIThread 渲染
-└─ task3 执行: refreshFilesAndSubmodules()
-    └─ refreshView(Files) → OnUIThread 渲染
+├────── 各 scope goroutine 并行执行 ──────
+│
+│  goroutine_A: refreshCommitsAndCommitFiles()
+│    └─ refreshView(LocalCommits) → OnUIThread → 渲染
+│
+│  goroutine_B: refreshBranches()
+│    ├─ refreshView(Branches) → OnUIThread → 渲染（✓ 出现）
+│    └─ refreshStatus()  // 状态栏真正更新的地方
+│
+│  goroutine_C: refreshFilesAndSubmodules()
+│    ├─ refreshStateFiles()  // 冲突自动处理
+│    └─ OnUIThread: refreshView(Files) → 渲染
+│
+│  ... 其他 scope goroutine 并行执行
 ```
 
 **SYNC 模式（PromptToContinueRebase）：**
 ```
 调用方线程 (UI 线程，弹 Continue 确认框回调)
 ├─ Refresh(SYNC, Scope: [FILES])
-│   ├─ refresh("files", ...)
-│   │   └─ wg.Add(1) + go func() {
-│   │              refreshFilesAndSubmodules()  // 新 goroutine 并行
-│   │              wg.Done()
-│   │          }
-│   ├─ ... (其他 scope 同样 go func())
+│   ├─ f() 在当前线程同步执行:
+│   │   ├─ refresh("files", ...)
+│   │   │   └─ wg.Add(1) + go goroutine_X {
+│   │   │              refreshFilesAndSubmodules()  // 独立 goroutine 并行
+│   │   │              wg.Done()
+│   │   │          }
+│   │   │
+│   │   └─ wg.Wait()  // ⚠️ 阻塞当前线程，直到 goroutine_X 完成
 │   │
-│   └─ wg.Wait()  // ⚠️ 阻塞当前线程，直到所有 goroutine 完成
+│   └─ Refresh() 返回 → Model.Files 已是最新 ✅
 │
-└─ Refresh() 返回 → Model.Files 已是最新 ✅
-
-// 现在可以安全地读 Model.Files
-unstagedFiles := GetUnstagedFilesExceptSubmodules(self.c.Model().Files, ...)
-if len(unstagedFiles) > 0 {
-    // 弹确认框询问是否 auto-stage
-}
+│  // 现在可以安全地读 Model.Files
+│  unstagedFiles := GetUnstagedFilesExceptSubmodules(self.c.Model().Files, ...)
+│  if len(unstagedFiles) > 0 {
+│      // 弹确认框询问是否 auto-stage
+│  }
 ```
 
-**注意**：BLOCK_UI 模式与 SYNC 类似，但是在 UI 线程同步执行，完全阻塞用户交互。
+**注意**：BLOCK_UI 模式与 SYNC 类似，但 `f()` 在 UI 线程上执行（通过 `OnUIThread` 提交到 `userEvents` channel，在主循环中被取出执行），scope 内部仍用 `go func()` 并行。UI 线程被 `wg.Wait()` 阻塞直到所有 scope 完成，期间不处理按键和渲染。
 
 #### refreshView 总是 OnUIThread 异步渲染
 
@@ -837,58 +884,55 @@ func() {
 ```
 时间轴 →
 │
-│  git push 命令执行完毕 (Worker 线程，即 WithInlineStatus 的 callback 线程)
+│  git push 命令执行完毕 (在 WithInlineStatus 的 OnWorker goroutine 内)
 │  │
 │  ├─ InlineStatusHelper.stop()
 │  │   ├─ ClearItemOperation(branch)
 │  │   └─ 非 Demo 模式：不立即重绘
 │  │
 │  ▼
-│  RefreshHelper.Refresh(ASYNC) 启动  ← 在 Worker 线程内同步执行 f()
+│  RefreshHelper.Refresh(ASYNC)  ← 在当前 goroutine 同步执行 f()
 │  │
-│  ├─ 逐个 scope 提交到 OnWorker 队列（FIFO 串行）
-│  │   ├─ refresh("commits and commit files") → OnWorker(task1)
-│  │   ├─ refresh("branches")                → OnWorker(task2)  [排队等 task1]
-│  │   ├─ refresh("files")                   → OnWorker(task3)  [排队等 task2]
-│  │   ├─ refresh("remotes")                 → OnWorker(task4)
-│  │   └─ ...
-│  │
-│  ├─ ❗ refreshStatus()  [立即执行，但 branches 还没跑，直接 return]
-│  │
-│  ├─ wg.Wait()  ← ASYNC 模式下什么都不等，几乎立即返回
+│  ├─ f() 同步执行调度逻辑:
+│  │   ├─ refresh("commits")      → OnWorker → go goroutine_A  ─┐
+│  │   ├─ refresh("branches")     → OnWorker → go goroutine_B  │ 各自独立 goroutine
+│  │   ├─ refresh("files")        → OnWorker → go goroutine_C  │ 同时并行开始
+│  │   ├─ refresh("remotes")      → OnWorker → go goroutine_D  │
+│  │   ├─ ...                                                    │
+│  │   ├─ refreshStatus()    // branches 还没完成 → early return
+│  │   └─ wg.Wait()          // wg 为空 → 立即返回
 │  │
 │  ▼
-│  Refresh() 返回，pushAux 继续执行
+│  Refresh() 返回 → pushAux 继续
 │
-├────── gocui Worker 队列开始串行执行 ──────
+├────── 以下各 goroutine 并行执行，谁先完成取决于 git 命令耗时 ──────
 │
-│  task1: refreshCommitsAndCommitFiles()
+│  goroutine_A: refreshCommitsAndCommitFiles()
 │    ├─ Model.Commits = newCommits
-│    └─ refreshView(LocalCommits) → OnUIThread: ReApplyFilter → PostRefreshUpdate → HandleRender
+│    └─ refreshView(LocalCommits) → OnUIThread(userEvents channel) → UI 主循环取出执行
 │
-│  task2: refreshBranches()
+│  goroutine_B: refreshBranches()
 │    ├─ BranchLoader.Load() → Model.Branches = newBranches
-│    │   └─ 异步提交 BehindBaseBranch 计算（OnWorker(taskN)，排在 task4 之后）
-│    ├─ refreshView(Branches) → OnUIThread: Branches.HandleRender()
-│    │                          → 显示 ✓，BehindBaseBranch 仍为旧值
-│    └─ refreshStatus() → 状态栏刷新 ✅  （这才是状态栏真正更新的地方）
+│    │   └─ 异步提交 BehindBaseBranch 计算（OnWorker → 又一个独立 goroutine）
+│    ├─ refreshView(Branches) → OnUIThread → 渲染（✓ 出现，BehindBaseBranch 可能旧值）
+│    └─ refreshStatus() → 状态栏刷新 ✅ （这才是状态栏真正更新的地方）
 │
-│  task3: refreshFilesAndSubmodules()
+│  goroutine_C: refreshFilesAndSubmodules()
 │    ├─ refreshStateFiles()
 │    │   ├─ 自动 stage 已解决冲突
 │    │   ├─ 冲突消失检测 → OnUIThread: PromptToContinueRebase()
 │    │   └─ 文件过滤自动切换
 │    └─ OnUIThread: refreshView(Files) + refreshView(Submodules)
 │
-│  task4: refreshRemotes()
+│  goroutine_D: refreshRemotes()
 │    ├─ Model.Remotes = newRemotes
 │    └─ refreshView(Remotes) + refreshView(RemoteBranches)
 │
-│  ...
+│  ... 其他 scope goroutine 并行
 │
-│  taskN: 异步 BehindBaseBranch 计算完成
+│  BehindBaseBranch goroutine: （稍后完成）
 │    └─ OnUIThread:
-│        ├─ Branches.HandleRender()  → 显示 ↓N
+│        ├─ Branches.HandleRender()  → ↓N 出现或更新
 │        └─ refreshStatus()
 │
 ▼  屏幕最终稳定显示新状态
@@ -1034,7 +1078,7 @@ InlineStatusHelper.stop()
 
 1. **错误消息语言依赖**：冲突检测、落后提示基于英文错误字符串（如 "Updates were rejected"），非英文 Git 环境可能失效
 2. **远程分支信息缺失**：`AheadForPull == "?"` 时无法提前判断是否需要 force-push，只能先尝试普通 push
-3. **ASYNC 不是并发，是串行**：ASYNC 模式下各 scope 提交到 `OnWorker` 全局 FIFO 队列，**按提交顺序一个接一个执行**，不是并行；只有 SYNC/BLOCK_UI 模式下才是每个 scope 独立 goroutine 并发
+3. **ASYNC 和 SYNC 都是并行执行 scope**，区别在于 `Refresh()` 是否等待：ASYNC 下 `wg` 为空，`wg.Wait()` 立即返回，`Refresh()` fire-and-forget；SYNC 下 `wg` 跟踪所有 scope，`wg.Wait()` 阻塞到全部完成
 4. **ASYNC + Then 会 panic**：因为 ASYNC 不参与 wg，`wg.Wait()` 不等任何 scope，Then 无法在所有 scope 完成后执行，代码直接 panic
 5. **状态栏有两个刷新入口**，ASYNC 模式下 Refresh 主流程末尾的 refreshStatus() 大概率因为 branches 还没完成而 early return，真正更新在 refreshBranches() 内部
 6. **MERGE_CONFLICTS scope 和 FILES scope 是并行的**：不保证谁先完成，RefreshMergeState 靠"当前上下文是不是 MergeConflicts"判断要不要干活，不依赖 fileWg
