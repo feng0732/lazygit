@@ -398,8 +398,97 @@ refreshStatus()
 │   // 当前在 linked worktree → 返回名称；在主树 → 空串
 │
 └─► FormatStatus(repoName, currentBranch, op, linkedWorktreeName, state, ...)
-    → Status 视图的 Subtitle 中显示 "wt: <name>"
 ```
+
+**Status 中 linked worktree 的显示格式**（不是单独的 "wt: <name>" 标记，而是拼接到仓库名后）：
+
+[status.go:L37-L46](pkg/gui/presentation/status.go#L37-L46)
+
+```go
+name := GetBranchTextStyle(currentBranch.Name).Sprint(currentBranch.Name)
+if linkedWorktreeName != "" {
+    icon := ""
+    if icons.IsIconEnabled() {
+        icon = icons.LINKED_WORKTREE_ICON + " "
+    }
+    repoName = fmt.Sprintf("%s(%s%s)", repoName, icon, style.FgCyan.Sprint(linkedWorktreeName))
+}
+status += fmt.Sprintf("%s → %s", repoName, name)
+```
+
+最终 Status 格式示例：
+- 主树：`my-repo → main`
+- Linked worktree：`my-repo( feature-x) → feature-x`
+- 图标开启时 worktree 名前加 `LINKED_WORKTREE_ICON`，青色（FgCyan）显示
+
+### 5.6 文件状态中 linked worktree 的识别与渲染
+
+文件面板中，linked worktree 目录会被识别为特殊文件类型（区别于普通目录），并显示专用图标。整条链路分为 **识别层** 和 **渲染层** 两部分。
+
+#### 5.6.1 识别层：File.IsWorktree 的标记流程
+
+```
+git status --porcelain
+      │
+      ▼
+FileLoader.GetStatusFiles()
+      │
+      ├─ 第一步：解析 git status 输出 → []*File（此时 IsWorktree 全为 false）
+      │
+      └─ 第二步：标记 worktree 文件 [file_loader.go:L85-L103](pkg/commands/git_commands/file_loader.go#L85-L103)
+          │
+          ├─ linkedWortkreePaths(Fs, repoGitDirPath)
+          │   │   // 注意：函数名有拼写错误（Wortkree=Worktree）
+          │   │
+          │   └─ [repo_paths.go:L142-L172](pkg/commands/git_commands/repo_paths.go#L142-L172)
+          │       ├─ 遍历 <repo>/.git/worktrees/ 下的子目录
+          │       ├─ 每个子目录中读 gitdir 文件 → 得到 worktree 的 .git 目录绝对路径
+          │       └─ filepath.Dir(gitdir) → worktree 工作目录绝对路径列表
+          │
+          └─ 双重循环匹配：
+              对每个 file，对每个 worktreePath：
+                if filepath.Abs(file.Path) == worktreePath:
+                    file.IsWorktree = true
+                    file.Path = TrimSuffix(file.Path, "/")  // 去掉尾斜杠，避免被当普通目录渲染
+                    break
+```
+
+**关键设计**：
+- `IsWorktree` 标记的是**在当前仓库视角下**作为子目录存在的 linked worktree（即其他 worktree 路径嵌套在当前仓库工作区内的情况）
+- 去掉尾斜杠是为了不让文件树把它渲染成普通文件夹（带展开箭头和 null file）
+
+#### 5.6.2 渲染层：图标与样式
+
+文件树渲染时，通过 `isLinkedWorktree` 标志选择专用图标：
+
+[files.go:L159-L167](pkg/gui/presentation/files.go#L159-L167)
+
+```go
+isSubmodule := file != nil && file.IsSubmodule(submoduleConfigs)
+isLinkedWorktree := file != nil && file.IsWorktree
+isDirectory := file == nil
+
+if showFileIcons {
+    icon := icons.IconForFile(name, isSubmodule, isLinkedWorktree, isDirectory, customIconsConfig)
+    paint := color.HEX(icon.Color, false)
+    output += paint.Sprint(icon.Icon) + nameColor.Sprint(" ")
+}
+```
+
+**IconForFile 优先级**（先匹配先返回）：
+[file_icons.go:L769-L794](pkg/gui/presentation/icons/file_icons.go#L769-L794)
+
+```
+customIcons.Filenames → nameIconMap → customIcons.Extensions → extIconMap
+    → isSubmodule → isLinkedWorktree → isDirectory → DEFAULT_FILE_ICON
+```
+
+Linked worktree 的图标配置：
+- 图标：`LINKED_WORKTREE_ICON`（Nerd Font：`󰌹` / 兼容模式：``）
+- 颜色：`#4E4E4E`（深灰）
+- 定义在 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)
+
+**注意**：commit file tree（提交文件视图）中 `isLinkedWorktree` 恒为 false，因为提交记录里没有 worktree 概念。
 
 ---
 
