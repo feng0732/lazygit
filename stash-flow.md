@@ -102,9 +102,18 @@ func (self *FilesController) handleStashSave(stashFunc func(message string) erro
 }
 ```
 
-**⚠️ 关键边界结论 1 — 入栈刷新策略：**
-- ✅ **成功** → `Refresh({STASH, FILES})`
-- ❌ **失败** → **不刷新任何视图**，`stashFunc` 返回的 error 由 Prompt 的 OnConfirm 沿 keybinding → `ErrorHandler` 冒泡，最终弹出 Alert 显示红色错误消息
+**⚠️ 关键边界结论 1 — 入栈刷新策略（分两类命令）：**
+
+**简单入栈**（`Push` / `StashAndKeepIndex` / `StashIncludeUntrackedChanges`，一条 git 命令即完成）：
+- ✅ 成功 → `Refresh({STASH, FILES})`
+- ❌ 失败 → 不刷新，**仓库与执行前完全一致**（单条 git 命令的原子性保证），旧 UI 仍然正确
+
+**复合入栈**（`SaveStagedChanges` / `StashUnstagedChanges`，多步 git 命令串行执行）：
+- ✅ 成功 → `Refresh({STASH, FILES})`
+- ❌ 中途失败 → **仍不刷新**，但此时**仓库状态已发生部分不可逆改变**（前几步命令已成功执行）。故意不刷新的原因见 §2.2 的各复合命令失败边界分析
+
+**失败时错误提示路径两类命令一致**：
+`stashFunc` 返回 error → Prompt 的 OnConfirm → keybinding handler 返回 err → gocui 的 `handleError` → `PopupHandler.ErrorHandler` → Alert 红色错误弹窗
 
 ---
 
@@ -127,6 +136,37 @@ return self.cmd.New(cmdArgs).Run()  // 返回 error
 | [SaveStagedChanges(message)](pkg/commands/git_commands/stash.go#L133-L193) | Git≥2.35: `git stash push --staged -m <msg>`<br>Git<2.35: **6 步复合操作**（见下文） | 仅暂存区入栈 |
 | [StashUnstagedChanges(message)](pkg/commands/git_commands/stash.go#L112-L130) | **3 步复合**：临时commit→stash→reset soft | 仅未暂存入栈 |
 | [Store(hash, message)](pkg/commands/git_commands/stash.go#L63-L72) | `git stash store [-m msg] <hash>` | Rename 内部使用 |
+
+#### 简单入栈的失败边界（Push / StashAndKeepIndex / StashIncludeUntrackedChanges）
+
+三条方法均为**单条 `git stash push` 命令**，对应一条原子 Git 操作：
+
+```go
+// Push（56-61 行）
+cmdArgs := NewGitCmd("stash").Arg("push", "-m", message).ToArgv()
+return self.cmd.New(cmdArgs).Run()
+
+// StashAndKeepIndex（105-110 行）
+cmdArgs := NewGitCmd("stash").Arg("push", "--keep-index", "-m", message).ToArgv()
+return self.cmd.New(cmdArgs).Run()
+
+// StashIncludeUntrackedChanges（195-200 行）
+cmdArgs := NewGitCmd("stash").Arg("push", "--include-untracked", "-m", message).ToArgv()
+return self.cmd.New(cmdArgs).Run()
+```
+
+**Git 单条 `stash push` 的原子性保证**：Git 内部在写入任何 ref（`refs/stash`、工作树、索引）之前，会先将 stash 对象完整写入 object database。若中途出错（如磁盘满、权限不足、信号中断），Git 会回滚所有已做的修改，因此：
+
+| 场景 | 失败后的磁盘/仓库状态 | 是否需要刷新 UI |
+|------|----------------------|---------------|
+| 没有任何可 stash 的改动 | `No local changes to save`，仓库原样 | 不需要（旧 UI 正确）|
+| 工作树与另一个 stash 改动冲突 | Git 不写入任何东西，仓库原样 | 不需要（旧 UI 正确）|
+| 磁盘 I/O 错误 / 信号中断 | Git 回滚已做的修改，仓库原样 | 不需要（旧 UI 正确）|
+| 权限不足 / git 二进制缺失 | 仓库原样 | 不需要（旧 UI 正确）|
+
+**设计理由**：简单入栈失败 = 什么都没发生 = 旧 UI 完全正确，刷新是多余的 I/O。外层 `handleStashSave` 统一 `if err != nil { return }` 跳过 Refresh，依赖 ErrorHandler 弹出 Alert 告诉用户失败原因。
+
+---
 
 #### 复合命令细节与失败边界：SaveStagedChanges（Git < 2.35 兼容方案）
 
@@ -397,13 +437,14 @@ type StashEntry struct {
 
 ### 5.1 各操作刷新策略对照表
 
-| 操作 | git 命令位置 | Refresh 调用位置 | ✅ 成功时 | ❌ 失败/冲突时 |
-|------|-------------|-----------------|----------|---------------|
-| **入栈 Push**（5 种） | `stashFunc(msg)` 之后 | `if err != nil { return }` 之后 | ✅ `Refresh({STASH, FILES})` | ❌ **不刷新**，error 上抛至 ErrorHandler |
-| **Apply** | `Apply(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err） |
-| **Pop** | `Pop(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err） |
-| **Drop**（多选） | 每次 `Drop` 之后 | 每删一个后立即 `Refresh({STASH})` | ✅ 全部删完后 `CollapseRangeSelectionToTop` | ✅ 已执行的 Refresh 已生效，中途停止 |
-| **Rename** | `Rename` 之后 | err 分支和成功分支**都** `Refresh({STASH})` | ✅ 刷新 + 选第 0 项 + Focus | ✅ **刷新**（Drop 失败但已生效的状态） |
+| 操作 | 命令类型 | git 命令位置 | Refresh 调用位置 | ✅ 成功时 | ❌ 失败/冲突时 |
+|------|---------|-------------|-----------------|----------|---------------|
+| **简单入栈**（Push/KeepIndex/IncludeUntracked） | 单条 git 命令（原子） | `stashFunc(msg)` 之后 | `if err != nil { return }` 之后 | ✅ `Refresh({STASH, FILES})` | ❌ **不刷新**，仓库与执行前一致（git 原子性保证），旧 UI 仍正确 |
+| **复合入栈**（SaveStagedChanges/StashUnstagedChanges） | 多步串行 git 命令（非原子） | `stashFunc(msg)` 内部任一步之后 | `if err != nil { return }` 之后（外层框架位置） | ✅ `Refresh({STASH, FILES})` | ❌ **不刷新**，但**仓库状态已部分改变**（前几步已不可逆）。错误由 Alert 提示，需用户手动恢复 |
+| **Apply** | 单条 git 命令 | `Apply(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err，冲突时磁盘已写） |
+| **Pop** | 单条 git 命令 | `Pop(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err，冲突时磁盘已写） |
+| **Drop**（多选） | 每条单条 git 命令 | 每次 `Drop` 之后 | 每删一个后立即 `Refresh({STASH})` | ✅ 全部删完后 `CollapseRangeSelectionToTop` | ✅ 已执行的 Refresh 已生效，中途停止 |
+| **Rename** | 3 步复合（Hash→Drop→Store） | `Rename` 之后 | err 分支和成功分支**都** `Refresh({STASH})` | ✅ 刷新 + 选第 0 项 + Focus | ✅ **刷新**（Drop 中间失败但已改变的状态需要显示） |
 
 ### 5.2 Apply/Pop 冲突场景的状态更新先后分析
 
@@ -468,23 +509,34 @@ Step 1  用户按 <space>（Apply）
 ### Stash Push 入栈边界（键位 s / S）
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  1. 入口层  FilesController                                       │
-│     • s → stash() → handleStashSave(Push)                        │
-│     • S → createStashMenu() → 5 选项 → handleStashSave(5种func)  │
-│     • Prompt(AllowEmptyInput) → 输入 message（可空）               │
-│     • HandleConfirm 内：LogAction → stashFunc → 成功才 Refresh    │
-├──────────────────────────────────────────────────────────────────┤
-│  2. 命令层  StashCommands.*                                       │
-│     • NewGitCmd("stash").Arg(...).ToArgv()                       │
-│     • self.cmd.New(cmdArgs).Run() → 返回 error                   │
-│     • 复合命令多步执行，任一步失败即 error 终止                    │
-├──────────────────────────────────────────────────────────────────┤
-│  3. 状态层  Refresh({STASH, FILES}) ← 仅成功时执行               │
-│     • parallel: refreshStashEntries() + refreshFilesAndSubmodules│
-│     • Model.StashEntries ← StashLoader.GetStashEntries()         │
-│     • refreshView(StashContext) 重绘列表                          │
-└──────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│  1. 入口层  FilesController                                            │
+│     • s → stash() → handleStashSave(Push)                             │
+│     • S → createStashMenu() → 5 选项 → handleStashSave(5种func)       │
+│     • Prompt(AllowEmptyInput) → 输入 message（可空）                    │
+│     • HandleConfirm 内：LogAction → stashFunc → 成功才 Refresh         │
+├───────────────────────────────────────────────────────────────────────┤
+│  2. 命令层  StashCommands.*（两类命令，失败语义不同）                   │
+│                                                                       │
+│  ┌─ 简单入栈（Push / KeepIndex / IncludeUntracked，共 3 种）─┐        │
+│  │  • 单条 NewGitCmd("stash").Arg(...).ToArgv()                 │        │
+│  │  • self.cmd.New(cmdArgs).Run() → git 原子性保证：失败零副作用  │        │
+│  └──────────────────────────────────────────────────────────────┘        │
+│                                                                       │
+│  ┌─ 复合入栈（SaveStagedChanges<Git2.35> / StashUnstagedChanges，共 2 种）┐│
+│  │  • 多步串行：每步 NewGitCmd(...).Run() 各自可能成功或失败       │        │
+│  │  • 任一步 return err 立即终止，但之前已成功的步骤不可逆              │        │
+│  └──────────────────────────────────────────────────────────────────┘    │
+├───────────────────────────────────────────────────────────────────────┤
+│  3. 状态层  Refresh({STASH, FILES}) ← 仅 stashFunc 完全成功时才执行     │
+│     • 两类命令无论哪类，失败都不触发 Refresh（策略统一）                │
+│     • parallel: refreshStashEntries() + refreshFilesAndSubmodules     │
+│     • Model.StashEntries ← StashLoader.GetStashEntries()              │
+│     • refreshView(StashContext) 重绘列表                               │
+│                                                                       │
+│  • 简单入栈失败：旧 UI 仍是正确反映 → Alert 提示即可                    │
+│  • 复合入栈中途失败：旧 UI 不完全准确，但刷新反而误导 → Alert 提示+手动排查│
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Stash Apply / Pop 应用边界（键位 space / g）
@@ -519,10 +571,11 @@ Step 1  用户按 <space>（Apply）
    - 入栈/应用/弹出：`{STASH, FILES}`（stash 内容变更 + 工作树变更）
    - 删除/重命名：`{STASH}`（仅列表变动）
 
-3. **刷新时机因场景差异是核心**：
-   - **入栈**：失败不刷新（命令失败 = 什么都没发生，旧 UI 仍是正确状态）
-   - **Apply/Pop**：先刷新再报错误（Git 即使冲突也改了磁盘，先确保 UI 显示真实状态）
-   - **Rename**：成败都刷新（Drop 中间步骤失败可能丢失条目，需要显示）
+3. **刷新时机因场景差异是核心（四种刷新语义）**：
+   - **简单入栈失败**：不刷新 + Alert 提示 — 单条 git 命令具备原子性，失败零副作用，旧 UI 仍正确反映真实状态
+   - **复合入栈中途失败**：不刷新 + Alert 提示 — 仓库状态已部分改变，但刷新 UI 反而会展示误导性的中间态画面（如 Files 显示空暂存区但 Commit 面板多出 `[lazygit]` 临时 commit），不如保留操作前旧 UI 配合 Alert 告知用户"命令执行到一半出问题"，提示用户手动排查
+   - **Apply/Pop 失败**：先刷新 + Alert 提示 — Git 即使冲突也已写入磁盘（冲突标记或工作树变更），刷新先确保 UI 展示真实磁盘状态，再通过 Alert 告诉用户哪里有冲突
+   - **Rename / Drop 失败**：成败都刷新（或每步即刷新）— Rename 中 Drop 失败可能丢失 stash 条目，Drop 循环中前面成功的删除已生效，必须刷新反映真实状态
 
 4. **索引安全策略**：多选 Drop **倒序**从大 index 向小 index 删除，避免 `stash@{n}` 重新编号错位。
 
