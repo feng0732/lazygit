@@ -8,24 +8,24 @@
 
 | 层级 | 文件 | 职责 |
 |------|------|------|
-| 数据模型 | [worktree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/models/worktree.go) | `Worktree` 结构体定义 |
-| Git 命令封装 | [worktree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree.go) | `New / Delete / Detach` 等 git 命令构造 |
-| Git 状态加载 | [worktree_loader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree_loader.go) | 解析 `git worktree list --porcelain`，构建 Worktree 模型数组 |
-| UI 控制器 | [worktrees_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktrees_controller.go) | Worktrees 面板的按键绑定、主视图渲染 |
-| 选项控制器 | [worktree_options_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktree_options_controller.go) | 在其他面板（如分支面板）触发 worktree 选项菜单 |
-| 业务辅助层 | [worktree_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go) | 创建/切换/删除/分离等核心业务流程编排 |
-| Repo 切换层 | [repos_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/repos_helper.go) | `DispatchSwitchTo` 切库/切 worktree 的公共切换逻辑 |
-| 刷新编排 | [refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/refresh_helper.go) | `loadWorktrees / refreshWorktrees` 数据重加载与视图刷新 |
-| 上下文/数据绑定 | [worktrees_context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/context/worktrees_context.go) | 列表视图模型与 `Model().Worktrees` 的绑定 |
-| 视图渲染 | [worktrees.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/presentation/worktrees.go) | 将 Worktree 模型转为显示字符串 |
-| GUI 入口 | [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/gui.go) | `onNewRepo` 切换仓库时重建整个 GUI 状态 |
-| 分支联动 | [branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/branches_controller.go) | 分支检出时检查 worktree 占用、跨 worktree 快进 |
+| 数据模型 | [worktree.go](pkg/commands/models/worktree.go) | `Worktree` 结构体定义 |
+| Git 命令封装 | [worktree.go](pkg/commands/git_commands/worktree.go) | `New / Delete / Detach` 等 git 命令构造 |
+| Git 状态加载 | [worktree_loader.go](pkg/commands/git_commands/worktree_loader.go) | 解析 `git worktree list --porcelain`，构建 Worktree 模型数组 |
+| UI 控制器 | [worktrees_controller.go](pkg/gui/controllers/worktrees_controller.go) | Worktrees 面板的按键绑定、主视图渲染 |
+| 选项控制器 | [worktree_options_controller.go](pkg/gui/controllers/worktree_options_controller.go) | 在其他面板（如分支面板）触发 worktree 选项菜单 |
+| 业务辅助层 | [worktree_helper.go](pkg/gui/controllers/helpers/worktree_helper.go) | 创建/切换/删除/分离等核心业务流程编排 |
+| Repo 切换层 | [repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | `DispatchSwitchTo` 切库/切 worktree 的公共切换逻辑 |
+| 刷新编排 | [refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go) | `loadWorktrees / refreshWorktrees` 数据重加载与视图刷新 |
+| 上下文/数据绑定 | [worktrees_context.go](pkg/gui/context/worktrees_context.go) | 列表视图模型与 `Model().Worktrees` 的绑定 |
+| 视图渲染 | [worktrees.go](pkg/gui/presentation/worktrees.go) | 将 Worktree 模型转为显示字符串 |
+| GUI 入口 | [gui.go](pkg/gui/gui.go) | `onNewRepo` 切换仓库时重建整个 GUI 状态 |
+| 分支联动 | [branches_controller.go](pkg/gui/controllers/branches_controller.go) | 分支检出时检查 worktree 占用、跨 worktree 快进 |
 
 ---
 
 ## 1. 数据模型（Worktree Struct）
 
-定义在 [worktree.go:L4-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/models/worktree.go#L4-L28)
+定义在 [worktree.go:L4-L28](pkg/commands/models/worktree.go#L4-L28)
 
 ```
 Worktree
@@ -53,13 +53,13 @@ Worktree
 有两条入口路径：
 
 **路径 A：Worktrees 面板按 `n`（New）**
-[worktrees_controller.go:L120-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktrees_controller.go#L120-L122)
+[worktrees_controller.go:L120-L122](pkg/gui/controllers/worktrees_controller.go#L120-L122)
 ```
 add() ──► WorktreeHelper.NewWorktree()
 ```
 
 **路径 B：Branches/Commits 等面板按 worktree 快捷键**
-[worktree_options_controller.go:L49-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktree_options_controller.go#L49-L51)
+[worktree_options_controller.go:L49-L51](pkg/gui/controllers/worktree_options_controller.go#L49-L51)
 ```
 viewWorktreeOptions(ref) ──► WorktreeHelper.ViewWorktreeOptions(ctx, ref)
   └─► ViewBranchWorktreeOptions(branchName, canCheckoutBase)
@@ -68,7 +68,7 @@ viewWorktreeOptions(ref) ──► WorktreeHelper.ViewWorktreeOptions(ctx, ref)
 
 ### 2.2 新建交互流程（NewWorktree → NewWorktreeCheckout）
 
-[worktree_helper.go:L57-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go#L57-L155)
+[worktree_helper.go:L57-L155](pkg/gui/controllers/helpers/worktree_helper.go#L57-L155)
 
 ```
 NewWorktree()
@@ -98,7 +98,7 @@ NewWorktree()
 
 ### 2.3 执行 git 命令 + 自动切换
 
-[worktree_helper.go:L103-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go#L103-L112)
+[worktree_helper.go:L103-L112](pkg/gui/controllers/helpers/worktree_helper.go#L103-L112)
 
 ```
 WithWaitingStatus("Adding worktree")
@@ -107,7 +107,7 @@ WithWaitingStatus("Adding worktree")
 │
 ├─► WorktreeCommands.New(opts)
 │   └─► git worktree add [--detach] [-b <branch>] <path> <base>
-│       [worktree.go:L32-L43](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree.go#L32-L43)
+│       [worktree.go:L32-L43](pkg/commands/git_commands/worktree.go#L32-L43)
 │
 └─► reposHelper.DispatchSwitchTo(opts.Path, ...)
     └─► 创建完成后立即切换到新 worktree
@@ -122,13 +122,13 @@ WithWaitingStatus("Adding worktree")
 ### 3.1 入口
 
 **路径 A：Worktrees 面板按 Enter**
-[worktrees_controller.go:L140-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktrees_controller.go#L140-L142)
+[worktrees_controller.go:L140-L142](pkg/gui/controllers/worktrees_controller.go#L140-L142)
 ```
 enter(worktree) ──► WorktreeHelper.Switch(worktree, WORKTREES_CONTEXT_KEY)
 ```
 
 **路径 B：分支面板检出被占用的分支**
-[branches_controller.go:L443-L455](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/branches_controller.go#L443-L455)
+[branches_controller.go:L443-L455](pkg/gui/controllers/branches_controller.go#L443-L455)
 ```
 press(branch)
 └─► 若分支已被其他 worktree 检出:
@@ -138,7 +138,7 @@ press(branch)
 
 ### 3.2 Switch → DispatchSwitchTo
 
-[worktree_helper.go:L157-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go#L157-L165)
+[worktree_helper.go:L157-L165](pkg/gui/controllers/helpers/worktree_helper.go#L157-L165)
 ```go
 func Switch(worktree, contextKey) {
     if worktree.IsCurrent → 报错 AlreadyInWorktree
@@ -149,7 +149,7 @@ func Switch(worktree, contextKey) {
 
 ### 3.3 DispatchSwitchTo：公共切换逻辑
 
-[repos_helper.go:L148-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/repos_helper.go#L148-L197)
+[repos_helper.go:L148-L197](pkg/gui/controllers/helpers/repos_helper.go#L148-L197)
 
 ```
 DispatchSwitchTo(path, errMsg, contextKey)
@@ -175,7 +175,7 @@ DispatchSwitchTo(path, errMsg, contextKey)
 
 ### 3.4 onNewRepo：GUI 全量重建
 
-[gui.go:L320-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/gui.go#L320-L434)
+[gui.go:L320-L434](pkg/gui/gui.go#L320-L434)
 
 ```
 onNewRepo(startArgs, contextKey)
@@ -210,7 +210,7 @@ onNewRepo(startArgs, contextKey)
 ### 4.1 入口
 
 Worktrees 面板按 `d`（Remove）：
-[worktrees_controller.go:L124-L134](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/worktrees_controller.go#L124-L134)
+[worktrees_controller.go:L124-L134](pkg/gui/controllers/worktrees_controller.go#L124-L134)
 ```
 remove(worktree)
 ├─ worktree.IsMain    → 报错 CantDeleteMainWorktree
@@ -220,7 +220,7 @@ remove(worktree)
 
 ### 4.2 删除流程
 
-[worktree_helper.go:L167-L207](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go#L167-L207)
+[worktree_helper.go:L167-L207](pkg/gui/controllers/helpers/worktree_helper.go#L167-L207)
 
 ```
 Remove(worktree, force)
@@ -235,7 +235,7 @@ Remove(worktree, force)
         │
         ├─ WorktreeCommands.Delete(worktree.Path, force)
         │   └─► git worktree remove [-f] <path>
-        │       [worktree.go:L45-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree.go#L45-L49)
+        │       [worktree.go:L45-L49](pkg/commands/git_commands/worktree.go#L45-L49)
         │
         ├─ 若报错且信息含 "--force" 或 submodule 相关:
         │   └─ force=false 时 → 递归调用 Remove(worktree, force=true) 重试
@@ -245,7 +245,7 @@ Remove(worktree, force)
 ```
 
 **补充：Detach 流程**（将 worktree 从分支上 detach，转为 detached HEAD）
-[worktree_helper.go:L209-L220](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/worktree_helper.go#L209-L220)
+[worktree_helper.go:L209-L220](pkg/gui/controllers/helpers/worktree_helper.go#L209-L220)
 ```
 Detach(worktree)
 └─► git checkout --detach --git-dir=<worktree.Path>/.git
@@ -298,7 +298,7 @@ Detach(worktree)
 
 ### 5.2 WorktreeLoader.GetWorktrees 详解
 
-[worktree_loader.go:L24-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree_loader.go#L24-L144)
+[worktree_loader.go:L24-L144](pkg/commands/git_commands/worktree_loader.go#L24-L144)
 
 ```
 GetWorktrees()
@@ -333,7 +333,7 @@ GetWorktrees()
 
 ### 5.3 刷新触发链路（RefreshHelper）
 
-[refresh_helper.go:L63-L237](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237)
+[refresh_helper.go:L63-L237](pkg/gui/controllers/helpers/refresh_helper.go#L63-L237)
 
 ```
 Refresh(options)
@@ -362,7 +362,7 @@ Refresh(options)
             └─ refreshView(Worktrees)   // worktrees 列表面板
 ```
 
-**`loadWorktrees()`**：[refresh_helper.go:L722-L730](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L722-L730)
+**`loadWorktrees()`**：[refresh_helper.go:L722-L730](pkg/gui/controllers/helpers/refresh_helper.go#L722-L730)
 ```go
 func loadWorktrees() {
     worktrees, err := Git().Loaders.Worktrees.GetWorktrees()
@@ -372,7 +372,7 @@ func loadWorktrees() {
 
 ### 5.4 Context 数据绑定
 
-[worktrees_context.go:L9-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/context/worktrees_context.go#L9-L48)
+[worktrees_context.go:L9-L48](pkg/gui/context/worktrees_context.go#L9-L48)
 
 ```go
 NewWorktreesContext():
@@ -388,7 +388,7 @@ Worktrees 面板的**渲染不持有数据副本**，每次 `HandleRender()` 都
 
 ### 5.5 Status 状态栏显示
 
-[refresh_helper.go:L749-L767](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L749-L767)
+[refresh_helper.go:L749-L767](pkg/gui/controllers/helpers/refresh_helper.go#L749-L767)
 
 ```
 refreshStatus()
@@ -407,7 +407,7 @@ refreshStatus()
 
 ### 6.1 检出分支时的 worktree 占用检查
 
-[branches_controller.go:L443-L485](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/branches_controller.go#L443-L485)
+[branches_controller.go:L443-L485](pkg/gui/controllers/branches_controller.go#L443-L485)
 
 ```
 press(selectedBranch)
@@ -426,7 +426,7 @@ press(selectedBranch)
 
 ### 6.2 跨 Worktree 快进
 
-[branches_controller.go:L691-L739](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/branches_controller.go#L691-L739)
+[branches_controller.go:L691-L739](pkg/gui/controllers/branches_controller.go#L691-L739)
 
 ```
 fastForward(branch)
@@ -448,11 +448,11 @@ fastForward(branch)
 
 | 设计点 | 实现方式 | 所在位置 |
 |--------|---------|---------|
-| **切换等价于切库** | 所有数据（Model/Helpers/Controllers）全量重建，不做增量更新 | [gui.go:L320-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/gui.go#L320-L434) |
-| **Worktree ↔ 分支 关联** | Worktree.Branch 字段，rebase/bisect 期间通过读文件补全 | [worktree_loader.go:L115-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree_loader.go#L115-L141) |
-| **分支占用检查** | `WorktreeForBranch()` 在 `Model().Worktrees` 中线性查找 | [worktree.go:L57-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree.go#L57-L65) |
-| **跨 worktree 执行 git** | 传 `--git-dir=<wt.GitDir>` 或 `-C <wt.Path>` 切换 git 上下文 | [worktree.go:L51-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree.go#L51-L55) （Detach 方法示例） |
-| **刷新依赖** | refreshBranches 可选联动 loadWorktrees；refreshWorktrees 必联动 refreshView(Branches) | [refresh_helper.go:L486-L543](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L486-L543) |
-| **Context 切换上下文保留** | DispatchSwitchTo 接收 contextKey，onNewRepo 末尾按 key 定位并光标归零 | [gui.go:L418-L427](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/gui/gui.go#L418-L427) |
-| **GitDir 并行加载** | 每个 worktree 的 rev-parse 调用独立 goroutine，WaitGroup 聚合 | [worktree_loader.go:L78-L96](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree_loader.go#L78-L96) |
-| **主树/当前树识别** | Path 与 `repoPaths.RepoPath()` / `WorktreePath()` 比较 | [worktree_loader.go:L55-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/27-lazygit/pkg/commands/git_commands/worktree_loader.go#L55-L69) |
+| **切换等价于切库** | 所有数据（Model/Helpers/Controllers）全量重建，不做增量更新 | [gui.go:L320-L434](pkg/gui/gui.go#L320-L434) |
+| **Worktree ↔ 分支 关联** | Worktree.Branch 字段，rebase/bisect 期间通过读文件补全 | [worktree_loader.go:L115-L141](pkg/commands/git_commands/worktree_loader.go#L115-L141) |
+| **分支占用检查** | `WorktreeForBranch()` 在 `Model().Worktrees` 中线性查找 | [worktree.go:L57-L65](pkg/commands/git_commands/worktree.go#L57-L65) |
+| **跨 worktree 执行 git** | 传 `--git-dir=<wt.GitDir>` 或 `-C <wt.Path>` 切换 git 上下文 | [worktree.go:L51-L55](pkg/commands/git_commands/worktree.go#L51-L55) （Detach 方法示例） |
+| **刷新依赖** | refreshBranches 可选联动 loadWorktrees；refreshWorktrees 必联动 refreshView(Branches) | [refresh_helper.go:L486-L543](pkg/gui/controllers/helpers/refresh_helper.go#L486-L543) |
+| **Context 切换上下文保留** | DispatchSwitchTo 接收 contextKey，onNewRepo 末尾按 key 定位并光标归零 | [gui.go:L418-L427](pkg/gui/gui.go#L418-L427) |
+| **GitDir 并行加载** | 每个 worktree 的 rev-parse 调用独立 goroutine，WaitGroup 聚合 | [worktree_loader.go:L78-L96](pkg/commands/git_commands/worktree_loader.go#L78-L96) |
+| **主树/当前树识别** | Path 与 `repoPaths.RepoPath()` / `WorktreePath()` 比较 | [worktree_loader.go:L55-L69](pkg/commands/git_commands/worktree_loader.go#L55-L69) |
