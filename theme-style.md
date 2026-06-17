@@ -5,9 +5,9 @@
 Lazygit 的主题与样式系统分为三大阶段，形成一条清晰的链路：
 
 ```
-用户配置文件 (config.yml)
-    ↓ YAML 反序列化
-ThemeConfig 结构体
+多层配置文件 (默认值 → 全局 → 仓库级)
+    ↓ 逐层 YAML 反序列化覆盖
+ThemeConfig 结构体 (最终合成配置)
     ↓ UpdateTheme() / GetTextStyle() / GetGocuiStyle()
 双轨样式对象 (TextStyle + gocui.Attribute)
     ↓ Sprint() / 视图属性赋值 / tcell 渲染
@@ -20,27 +20,147 @@ ThemeConfig 结构体
 
 ---
 
-## 第一阶段：配置读取
+## 第一阶段：配置读取与合并
 
-### 1.1 配置文件定位与加载
+### 1.1 配置来源与优先级
 
-入口在 [app_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/config/app_config.go#L72-L101) 的 `NewAppConfig()`：
+Lazygit 的配置由多个来源逐层叠加，**后加载的文件覆盖先加载的文件中同名字段**。覆盖优先级从低到高：
+
+| 优先级 | 来源 | 文件路径 | 加载策略 |
+|---|---|---|---|
+| 0 (最低) | 硬编码默认值 | `GetDefaultConfigForPlatform()` 代码内 | 不可修改，始终存在 |
+| 1 | 命令行指定配置 (`--use-config-file`) | 用户指定，逗号分隔多文件 | `ConfigFilePolicyErrorIfMissing` |
+| 1 (alt) | 全局用户配置 | `~/.config/lazygit/config.yml` | `ConfigFilePolicyCreateIfMissing` |
+| 2 | 仓库根目录 `.lazygit.yml` | `/repo-root/.lazygit.yml` | `ConfigFilePolicySkipIfMissing` |
+| 3 | 父目录链 `.lazygit.yml` | `/repo-root/.. /.lazygit.yml` 逐级向上 | `ConfigFilePolicySkipIfMissing` |
+| 4 | Git 目录内配置 | `.git/lazygit.yml` | `ConfigFilePolicySkipIfMissing` |
+
+### 1.2 配置文件的发现与组装
+
+#### 全局配置文件定位
+
+`NewAppConfig()` (`pkg/config/app_config.go`) 是配置加载的起始点：
 
 ```
 NewAppConfig()
-  → findOrCreateConfigDir()              // 定位 XDG 配置目录 (~/.config/lazygit/)
-  → loadUserConfigWithDefaults()         // 加载配置
-      → loadUserConfig()
-          → GetDefaultConfigForPlatform() // 先生成默认值
-          → yaml.Unmarshal(content, base) // 用 YAML 内容覆盖默认值
-          → base.Validate()               // 校验
+  → findOrCreateConfigDir()
+      → 检查 CONFIG_DIR 环境变量
+      → 若未设置: 按 XDG 规范搜索
+          → 旧路径: XDG_CONFIG_HOME/jesseduffield/lazygit/config.yml
+          → 新路径: XDG_CONFIG_HOME/lazygit/config.yml
+  → 检查 LG_CONFIG_FILE 环境变量
+      → 若已设置: 按逗号拆分为多个路径 (Policy=ErrorIfMissing)
+      → 若未设置: 使用全局默认路径 (Policy=CreateIfMissing)
+  → loadUserConfigWithDefaults(configFiles, false)
 ```
 
-关键点：**默认值先填充，再被用户配置覆盖**。这意味着用户只需在 `config.yml` 中声明需要修改的字段，未声明的字段保持默认。
+**`LG_CONFIG_FILE` 的两种来源**：
+1. 环境变量直接设置：`LG_CONFIG_FILE=/path/a.yml,/path/b.yml lazygit`
+2. 命令行参数转换：`lazygit --use-config-file /path/a.yml` → `os.Setenv("LG_CONFIG_FILE", "/path/a.yml")`
 
-### 1.2 ThemeConfig 结构体
+当 `LG_CONFIG_FILE` 被设置时，**全局默认配置文件 (`~/.config/lazygit/config.yml`) 不会被加载**，完全由指定文件替代。
 
-定义在 [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/config/user_config.go#L215-L241)：
+#### 仓库级配置文件定位
+
+`getPerRepoConfigFiles()` (`pkg/gui/gui.go`) 负责收集仓库级配置：
+
+```go
+func (gui *Gui) getPerRepoConfigFiles() []*config.ConfigFile {
+    repoConfigFiles := []*config.ConfigFile{
+        // .git/lazygit.yml (仓库 .git 目录内)
+        {Path: filepath.Join(gui.git.RepoPaths.RepoGitDirPath(), "lazygit.yml"),
+         Policy: config.ConfigFilePolicySkipIfMissing},
+    }
+
+    // 从仓库根目录向上逐级搜索 .lazygit.yml
+    prevDir := gui.c.Git().RepoPaths.RepoPath()
+    dir := filepath.Dir(prevDir)
+    for dir != prevDir {
+        repoConfigFiles = utils.Prepend(repoConfigFiles, &config.ConfigFile{
+            Path:   filepath.Join(dir, ".lazygit.yml"),
+            Policy: config.ConfigFilePolicySkipIfMissing,
+        })
+        prevDir = dir
+        dir = filepath.Dir(dir)
+    }
+    return repoConfigFiles
+}
+```
+
+假设仓库路径为 `/home/user/projects/myrepo`，搜索顺序为：
+1. `/home/user/projects/myrepo/.lazygit.yml` (最先加载，最低优先级)
+2. `/home/user/projects/.lazygit.yml`
+3. `/home/user/.lazygit.yml`
+4. `/home/.lazygit.yml`
+5. `/.lazygit.yml` (最后加载，最高优先级)
+6. `/home/user/projects/myrepo/.git/lazygit.yml` (最终覆盖)
+
+所有仓库级配置的 `Policy` 均为 `SkipIfMissing`——文件不存在时静默跳过。
+
+### 1.3 配置合并机制：loadUserConfig()
+
+`loadUserConfig()` (`pkg/config/app_config.go`) 是合并的核心。它接收一个 `[]*ConfigFile` 列表和一个 `base *UserConfig`，依次反序列化每个文件到同一个 `base` 上：
+
+```
+loadUserConfig(configFiles, base=默认值, isGuiInitialized)
+  for 每个 configFile in configFiles:
+      1. 检查文件存在性 → 按 Policy 处理
+      2. os.ReadFile(path) → content
+      3. migrateUserConfig(path, content) → 向后兼容迁移
+      4. yaml.Unmarshal(content, base)  ← 关键：直接反序列化到 base 上
+      5. base.CustomCommands = append(base.CustomCommands, existingCustomCommands...)
+      6. base.Validate()
+  base.Keybinding.MergeLegacyAltKeybindings()
+  return base
+```
+
+**YAML 反序列化的覆盖语义对 ThemeConfig 的影响**：
+
+`yaml.Unmarshal(content, base)` 的行为是：**对结构体字段做深度合并，对切片字段做整体替换**。具体到 ThemeConfig：
+
+- ThemeConfig 的每个字段都是 `[]string`（切片类型）
+- 如果配置文件 A 声明了 `activeBorderColor: [green, bold]`，配置文件 B 声明了 `activeBorderColor: [red]`
+- 则最终结果为 `[red]`——**后者完全替换前者，而非追加**
+
+这意味着：
+- 若全局配置设置了 `activeBorderColor: [green, bold]`，仓库配置只需 `activeBorderColor: [red]`，最终生效 `[red]`
+- 若仓库配置只声明了 `selectedLineBgColor: [magenta]`，其他字段保持全局配置的值
+- 若某个配置文件完全省略了 `theme:` 段，则该文件不会修改任何主题字段
+
+**唯一的例外是 `CustomCommands`**：代码在反序列化前保存旧的 `base.CustomCommands`，反序列化后执行 `append`，因此自定义命令是追加而非替换。
+
+### 1.4 仓库级配置的加载时机
+
+仓库级配置不在 `NewAppConfig()` 中加载，而是在 GUI 切换仓库时按需加载：
+
+```
+Gui.onNewRepo()
+  → gui.Config.ReloadUserConfigForRepo(gui.getPerRepoConfigFiles())
+      → configFiles = append(c.globalUserConfigFiles, repoConfigFiles...)
+      → loadUserConfigWithDefaults(configFiles, true)
+          → loadUserConfig(configFiles, GetDefaultConfigForPlatform(), true)
+```
+
+注意：`ReloadUserConfigForRepo` 将全局配置文件和仓库配置文件合并为同一个列表，然后**从默认值开始重新加载全部文件**。这意味着每次切换仓库都会完整重放配置加载流程，而非在现有配置上增量修改。
+
+### 1.5 运行时热重载
+
+当终端重新获得焦点时，Lazygit 检测配置文件是否发生变化：
+
+```
+Gui.g.SetFocusHandler()
+  → Config.ReloadChangedUserConfigFiles()
+      → 对每个 userConfigFile 检查 os.Stat 的 ModTime 是否变化
+      → 若有变化: loadUserConfigWithDefaults(c.userConfigFiles, true)
+      → 更新 c.userConfig
+  → gui.onUserConfigLoaded()  // 重新应用所有配置
+```
+
+热重载使用的文件列表是 `c.userConfigFiles`，即**当前生效的全套配置文件列表**（全局 + 仓库级），因此修改任何一个层级的配置文件都会触发热重载。
+
+### 1.6 ThemeConfig 结构体
+
+定义在 `pkg/config/user_config.go`：
 
 ```go
 type ThemeConfig struct {
@@ -72,9 +192,9 @@ activeBorderColor:
 - **装饰属性**：`bold`、`reverse`、`underline`、`strikethrough`
 - **十六进制 RGB**：`#ff0000`、`#f00`
 
-### 1.3 默认主题值
+### 1.7 默认主题值
 
-在 [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/config/user_config.go#L849-L862) 中定义：
+在 `pkg/config/user_config.go` 的 `GetDefaultConfigForPlatform()` 中定义：
 
 ```go
 Theme: ThemeConfig{
@@ -93,21 +213,40 @@ Theme: ThemeConfig{
 },
 ```
 
-### 1.4 配置热重载
+### 1.8 配置覆盖完整示例
 
-配置可以在运行时修改并自动生效。触发链路：
+假设以下配置文件同时存在：
 
+**`~/.config/lazygit/config.yml`**（全局）：
+```yaml
+gui:
+  theme:
+    activeBorderColor:
+      - green
+      - bold
+    selectedLineBgColor:
+      - blue
+  authorColors:
+    "Alice": "#ff6600"
 ```
-终端获得焦点 (FocusHandler)
-  → Config.ReloadChangedUserConfigFiles()   // 检测文件修改时间
-  → onUserConfigLoaded()                     // 重新应用配置
-      → setColorScheme()                     // 重新设置颜色
-      → configureViewProperties()            // 重新配置视图属性
-      → authors.SetCustomAuthors()           // 重新设置作者颜色
-      → presentation.SetCustomBranches()     // 重新设置分支颜色
+
+**`/project/.git/lazygit.yml`**（仓库级）：
+```yaml
+gui:
+  theme:
+    activeBorderColor:
+      - magenta
 ```
 
-参考 [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/gui.go#L351-L375) 中的 FocusHandler 逻辑。
+**最终生效的 ThemeConfig**：
+
+| 字段 | 值 | 来源 |
+|---|---|---|
+| ActiveBorderColor | `["magenta"]` | 仓库级覆盖全局 |
+| InactiveBorderColor | `["default"]` | 默认值（两层配置均未声明） |
+| SelectedLineBgColor | `["blue"]` | 全局配置 |
+| DefaultFgColor | `["default"]` | 默认值 |
+| AuthorColors | `{"Alice": "#ff6600"}` | 全局配置（map 类型也是整体替换，但仓库配置未声明此字段所以保留全局值） |
 
 ---
 
@@ -115,7 +254,7 @@ Theme: ThemeConfig{
 
 ### 2.1 转换入口：UpdateTheme()
 
-定义在 [theme.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/theme.go#L51-L76)：
+定义在 `pkg/theme/theme.go`：
 
 ```go
 func UpdateTheme(themeConfig config.ThemeConfig) {
@@ -147,7 +286,7 @@ func UpdateTheme(themeConfig config.ThemeConfig) {
 
 ### 2.2 轨道一：gocui.Attribute 转换
 
-**GetGocuiStyle()** → [gocui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/gocui.go#L39-L45)
+**GetGocuiStyle()** (`pkg/theme/gocui.go`)
 
 ```
 GetGocuiStyle(keys []string)
@@ -159,7 +298,7 @@ GetGocuiStyle(keys []string)
   → 各 Attribute 按位 OR (|=) 合并
 ```
 
-gocui.Attribute 的内部结构（定义在 [attribute.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gocui/attribute.go#L10-L64)）：
+gocui.Attribute 的内部结构（`pkg/gocui/attribute.go`）：
 
 ```
 8 字节 uint64:
@@ -174,7 +313,7 @@ gocui.Attribute 的内部结构（定义在 [attribute.go](file:///d:/fz/0601-2/
     - bit 46: AttrStrikeThrough
 ```
 
-颜色映射表（[gocui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/gocui.go#L9-L22)）：
+颜色映射表（`pkg/theme/gocui.go`）：
 
 | key | gocui.Attribute |
 |---|---|
@@ -195,7 +334,7 @@ gocui.Attribute 的内部结构（定义在 [attribute.go](file:///d:/fz/0601-2/
 
 ### 2.3 轨道二：TextStyle 转换
 
-**GetTextStyle()** → [style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/style.go#L9-L44)
+**GetTextStyle()** (`pkg/theme/style.go`)
 
 ```
 GetTextStyle(keys []string, background bool)
@@ -210,7 +349,7 @@ GetTextStyle(keys []string, background bool)
   → 返回合成后的 TextStyle
 ```
 
-**`background` 参数的关键作用**：同一个 key（如 `"blue"`）在 `background=true` 时取背景色变体，在 `background=false` 时取前景色变体。这来自 ColorMap 的双向映射（[basic_styles.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/basic_styles.go#L38-L51)）：
+**`background` 参数的关键作用**：同一个 key（如 `"blue"`）在 `background=true` 时取背景色变体，在 `background=false` 时取前景色变体。这来自 ColorMap 的双向映射（`pkg/gui/style/basic_styles.go`）：
 
 ```go
 ColorMap = map[string]struct{ Foreground TextStyle; Background TextStyle }{
@@ -221,7 +360,7 @@ ColorMap = map[string]struct{ Foreground TextStyle; Background TextStyle }{
 
 ### 2.4 TextStyle 内部结构
 
-定义在 [text_style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/text_style.go#L28-L36)：
+定义在 `pkg/gui/style/text_style.go`：
 
 ```go
 type TextStyle struct {
@@ -256,7 +395,7 @@ deriveStyle()
 
 ### 2.6 Color 与 Decoration
 
-[Color](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/color.go#L5-L8) 是对 `gookit/color` 的封装：
+**Color** (`pkg/gui/style/color.go`) 是对 `gookit/color` 的封装：
 
 ```go
 type Color struct {
@@ -268,7 +407,7 @@ type Color struct {
 - `IsRGB()` 判断是否为真彩色
 - `ToRGB(isBg)` 将基本色转换为 RGB（背景色需要特殊处理 `*c.basic - 10`，这是 gookit/color 的已知问题）
 
-[Decoration](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/decoration.go#L5-L10) 是纯布尔组合：
+**Decoration** (`pkg/gui/style/decoration.go`) 是纯布尔组合：
 
 ```go
 type Decoration struct {
@@ -295,9 +434,32 @@ TextStyle.MergeStyle(other)
 
 ## 第三阶段：界面应用
 
-### 3.1 应用入口：setColorScheme()
+### 3.1 应用入口：onUserConfigLoaded()
 
-定义在 [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/gui.go#L1174-L1183)：
+每当配置被加载或重载时，`onUserConfigLoaded()` (`pkg/gui/gui.go`) 负责将最终配置应用到整个界面系统：
+
+```go
+func (gui *Gui) onUserConfigLoaded() error {
+    userConfig := gui.Config.GetUserConfig()
+    gui.Common.SetUserConfig(userConfig)
+
+    // 语言切换处理...
+
+    gui.setColorScheme()             // 1. 应用主题颜色
+    gui.configureViewProperties()    // 2. 配置视图属性
+
+    // 其他配置应用...
+    authors.SetCustomAuthors(userConfig.Gui.AuthorColors)          // 3. 作者颜色
+    icons.SetNerdFontsVersion(userConfig.Gui.NerdFontsVersion)     // 4. 图标版本
+    presentation.SetCustomBranches(userConfig.Gui.BranchColorPatterns, true)  // 5. 分支颜色
+
+    return nil
+}
+```
+
+### 3.2 setColorScheme()
+
+定义在 `pkg/gui/gui.go`：
 
 ```go
 func (gui *Gui) setColorScheme() {
@@ -313,9 +475,9 @@ func (gui *Gui) setColorScheme() {
 
 这里将 gocui.Attribute 赋值给 gocui.Gui 的四个全局颜色属性，控制所有 View 的边框和标题渲染。
 
-### 3.2 视图属性配置：configureViewProperties()
+### 3.3 视图属性配置：configureViewProperties()
 
-定义在 [views.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/views.go#L159-L179)：
+定义在 `pkg/gui/views.go`：
 
 ```go
 func (gui *Gui) configureViewProperties() {
@@ -345,7 +507,7 @@ func (gui *Gui) configureViewProperties() {
 - `SelFgColor`：选中行前景（与激活边框色相同）
 - `InactiveViewSelBgColor`：非焦点视图选中行背景
 
-### 3.3 gocui 渲染管线
+### 3.4 gocui 渲染管线
 
 当 gocui 绘制一帧时，核心流程：
 
@@ -367,16 +529,16 @@ Gui.flush()
       → Screen.Put(x, y, ch, style)  // 最终写入终端
 ```
 
-参考 [tcell_driver.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gocui/tcell_driver.go#L104-L124) 和 [view.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gocui/view.go#L1520-L1534)。
+参考 `pkg/gocui/tcell_driver.go` 和 `pkg/gocui/view.go`。
 
-### 3.4 内容文本的样式应用
+### 3.5 内容文本的样式应用
 
 与 UI 框架层的 gocui.Attribute 不同，内容文本（commit 列表、文件名、分支名等）使用 TextStyle 的 `Sprint()`/`Sprintf()` 方法，直接在字符串中嵌入 ANSI 转义序列。
 
 **presentation 层**是主要消费者，典型模式：
 
 ```go
-// commits.go
+// pkg/gui/presentation/commits.go
 hashColor := theme.DefaultTextColor
 if isCherryPicked {
     hashColor = theme.CherryPickedCommitTextStyle
@@ -388,20 +550,20 @@ result := hashColor.Sprint(hash) + " " + theme.DefaultTextColor.Sprint(name)
 
 | 文件 | 使用的主题变量 |
 |---|---|
-| [commits.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/commits.go) | DefaultTextColor, CherryPickedCommitTextStyle, DiffTerminalColor |
-| [files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/files.go) | DefaultTextColor, UnstagedChangesColor |
-| [branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/branches.go) | DefaultTextColor, DiffTerminalColor |
-| [tags.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/tags.go) | DefaultTextColor, DiffTerminalColor |
-| [stash_entries.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/stash_entries.go) | DefaultTextColor, DiffTerminalColor |
-| [remotes.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/remotes.go) | DefaultTextColor, DiffTerminalColor |
-| [reflog_commits.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/reflog_commits.go) | DefaultTextColor, CherryPickedCommitTextStyle, DiffTerminalColor |
-| [remote_branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/remote_branches.go) | DiffTerminalColor |
-| [submodules.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/submodules.go) | DefaultTextColor |
-| [worktrees.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/worktrees.go) | DefaultTextColor |
+| `presentation/commits.go` | DefaultTextColor, CherryPickedCommitTextStyle, DiffTerminalColor |
+| `presentation/files.go` | DefaultTextColor, UnstagedChangesColor |
+| `presentation/branches.go` | DefaultTextColor, DiffTerminalColor |
+| `presentation/tags.go` | DefaultTextColor, DiffTerminalColor |
+| `presentation/stash_entries.go` | DefaultTextColor, DiffTerminalColor |
+| `presentation/remotes.go` | DefaultTextColor, DiffTerminalColor |
+| `presentation/reflog_commits.go` | DefaultTextColor, CherryPickedCommitTextStyle, DiffTerminalColor |
+| `presentation/remote_branches.go` | DiffTerminalColor |
+| `presentation/submodules.go` | DefaultTextColor |
+| `presentation/worktrees.go` | DefaultTextColor |
 
-### 3.5 Options 底栏的样式应用
+### 3.6 Options 底栏的样式应用
 
-[options_map.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/options_map.go#L57-L66) 中：
+`pkg/gui/options_map.go` 中：
 
 ```go
 displayStyle := theme.OptionsFgColor  // 默认使用 optionsTextColor
@@ -417,9 +579,9 @@ formatted := info.style.Sprintf(plainText)  // TextStyle.Sprintf() 嵌入 ANSI
 - rebase/merge 进行中: `style.FgYellow`
 - patch building: `style.FgYellow`
 
-### 3.6 动态颜色：作者颜色与分支颜色
+### 3.7 动态颜色：作者颜色与分支颜色
 
-**作者颜色**（[authors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/authors/authors.go#L76-L98)）：
+**作者颜色**（`pkg/gui/presentation/authors/authors.go`）：
 
 ```
 SetCustomAuthors(customAuthorColors)
@@ -429,7 +591,7 @@ SetCustomAuthors(customAuthorColors)
   → 未配置时: trueColorStyle() 用 MD5 哈希生成 HSL 随机色
 ```
 
-**分支颜色**（[branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/branches.go#L268-L273)）：
+**分支颜色**（`pkg/gui/presentation/branches.go`）：
 
 ```
 SetCustomBranches(customBranchColors, isRegex)
@@ -438,91 +600,102 @@ SetCustomBranches(customBranchColors, isRegex)
   → 匹配时: colorMatcher.match(name) 支持正则或精确匹配
 ```
 
-### 3.7 图标颜色
+`SetCustomColors()`（`pkg/utils/color.go`）的转换逻辑：
+- 若颜色值存在于 `style.ColorMap`（如 `"red"`），使用对应的前景 TextStyle
+- 否则视为十六进制值，创建 RGB 颜色的前景 TextStyle
 
-图标系统（[icons.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/icons/icons.go)）由 `nerdFontsVersion` 配置驱动，图标本身携带颜色字符串（如 `"green"`、`"#ff0000"`），通过 [file_icons.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/icons/file_icons.go) 和 [git_icons.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/icons/git_icons.go) 中的硬编码映射表定义。用户可通过 `customIcons` 配置覆盖。
+### 3.8 图标颜色
+
+图标系统（`pkg/gui/presentation/icons/icons.go`）由 `nerdFontsVersion` 配置驱动，图标本身携带颜色字符串（如 `"green"`、`"#ff0000"`），通过 `file_icons.go` 和 `git_icons.go` 中的硬编码映射表定义。用户可通过 `customIcons` 配置覆盖。
 
 ---
 
 ## 完整调用链路图
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│  config.yml (用户配置文件)                                         │
-│    gui:                                                            │
-│      theme:                                                        │
-│        activeBorderColor: [green, bold]                            │
-│        ...                                                         │
-│      authorColors: { "John": "#ff0000" }                           │
-│      branchColorPatterns: { "feature/.*": "yellow" }              │
-└─────────────────────────────┬─────────────────────────────────────┘
-                              │ yaml.Unmarshal
-                              ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  config.ThemeConfig + config.GuiConfig                             │
-│  (所有字段均为 []string 或 map[string]string)                       │
-└─────────────────────────────┬─────────────────────────────────────┘
-                              │ onUserConfigLoaded()
-                              ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  setColorScheme()                                                  │
-│  ├── theme.UpdateTheme(themeConfig)                               │
-│  │   ├── GetGocuiStyle() → gocui.Attribute (位运算OR合并)           │
-│  │   │   输出: ActiveBorderColor, GocuiSelectedLineBgColor, ...   │
-│  │   └── GetTextStyle()  → style.TextStyle (对象组合)              │
-│  │       输出: DefaultTextColor, CherryPickedCommitTextStyle, ... │
-│  ├── gui.g.FgColor/SelFgColor/FrameColor/SelFrameColor 赋值       │
-│  └── configureViewProperties()                                    │
-│      └── 每个 View.FgColor/SelBgColor/SelFgColor/InactiveViewSelBgColor │
-│                                                                    │
-│  authors.SetCustomAuthors()     → authorStyleCache                 │
-│  presentation.SetCustomBranches() → colorMatcher.patterns          │
-└─────────────────────────────┬─────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌──────────────────────────┐   ┌──────────────────────────────────┐
-│  UI 框架层渲染            │   │  内容文本渲染                      │
-│  (gocui.Attribute)       │   │  (style.TextStyle)                │
-│                          │   │                                    │
-│  View.FgColor            │   │  theme.DefaultTextColor.Sprint()  │
-│  View.SelBgColor         │   │  theme.UnstagedChangesColor       │
-│  View.SelFgColor         │   │  theme.CherryPickedCommitTextStyle│
-│  Gui.FrameColor          │   │  theme.OptionsFgColor             │
-│  Gui.SelFrameColor       │   │  authorStyle / branchStyle        │
-│          │               │   │          │                         │
-│          ▼               │   │          ▼                         │
-│  tcellSetCell()          │   │  TextStyle.Sprint/Sprintf          │
-│  → getTcellStyle()       │   │  → deriveStyle()                  │
-│  → tcell.Style           │   │  → gookit/color.Style             │
-│  → Screen.Put()          │   │  → ANSI 转义序列                   │
-│                          │   │  → 写入 View 内部 buffer           │
-└──────────────────────────┘   └──────────────────────────────────┘
-              │                               │
-              └───────────────┬───────────────┘
-                              ▼
-                    终端屏幕输出 (tcell)
+┌─────────────────────────────────────────────────────────────────────┐
+│  配置来源 (按加载顺序)                                                │
+│                                                                      │
+│  ① GetDefaultConfigForPlatform() → 硬编码默认 ThemeConfig            │
+│  ② 全局 ~/.config/lazygit/config.yml  或  LG_CONFIG_FILE 指定文件    │
+│  ③ 仓库级 /repo-root/.lazygit.yml (逐级向上搜索)                     │
+│  ④ 仓库级 .git/lazygit.yml                                          │
+│                                                                      │
+│  合并规则: yaml.Unmarshal 逐文件覆盖 base                            │
+│    - 结构体字段: 深度合并 (子字段级别覆盖)                             │
+│    - 切片字段: 整体替换 (如 []string)                                │
+│    - map字段: 整体替换                                               │
+│    - CustomCommands: 特殊追加 (append)                               │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  config.ThemeConfig (最终合成配置)                                    │
+│  所有字段均为 []string，支持颜色+装饰的组合                            │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ onUserConfigLoaded()
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  setColorScheme()                                                    │
+│  ├── theme.UpdateTheme(themeConfig)                                 │
+│  │   ├── GetGocuiStyle() → gocui.Attribute (位运算OR合并)            │
+│  │   │   输出: ActiveBorderColor, GocuiSelectedLineBgColor, ...     │
+│  │   └── GetTextStyle()  → style.TextStyle (对象组合)               │
+│  │       输出: DefaultTextColor, CherryPickedCommitTextStyle, ...   │
+│  ├── gui.g.FgColor/SelFgColor/FrameColor/SelFrameColor 赋值         │
+│  └── configureViewProperties()                                      │
+│      └── 每个 View.FgColor/SelBgColor/SelFgColor/InactiveViewSelBgColor│
+│                                                                      │
+│  authors.SetCustomAuthors()     → authorStyleCache                   │
+│  presentation.SetCustomBranches() → colorMatcher.patterns            │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+               ┌───────────────┴───────────────┐
+               ▼                               ▼
+┌───────────────────────────┐  ┌──────────────────────────────────┐
+│  UI 框架层渲染             │  │  内容文本渲染                      │
+│  (gocui.Attribute)        │  │  (style.TextStyle)                │
+│                           │  │                                   │
+│  View.FgColor             │  │  theme.DefaultTextColor.Sprint()  │
+│  View.SelBgColor          │  │  theme.UnstagedChangesColor       │
+│  View.SelFgColor          │  │  theme.CherryPickedCommitTextStyle│
+│  Gui.FrameColor           │  │  theme.OptionsFgColor             │
+│  Gui.SelFrameColor        │  │  authorStyle / branchStyle        │
+│          │                │  │          │                        │
+│          ▼                │  │          ▼                        │
+│  tcellSetCell()           │  │  TextStyle.Sprint/Sprintf          │
+│  → getTcellStyle()        │  │  → deriveStyle()                  │
+│  → tcell.Style            │  │  → gookit/color.Style             │
+│  → Screen.Put()           │  │  → ANSI 转义序列                   │
+│                           │  │  → 写入 View 内部 buffer           │
+└───────────────────────────┘  └──────────────────────────────────┘
+               │                               │
+               └───────────────┬───────────────┘
+                               ▼
+                     终端屏幕输出 (tcell)
 ```
 
 ---
 
 ## 关键文件索引
 
-| 层次 | 文件 | 职责 |
+| 层次 | 文件路径 | 职责 |
 |---|---|---|
-| 配置定义 | [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/config/user_config.go#L215-L241) | ThemeConfig 结构体与默认值 |
-| 配置加载 | [app_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/config/app_config.go#L139-L208) | YAML 加载、迁移、校验 |
-| 主题转换 | [theme.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/theme.go#L51-L76) | UpdateTheme()，双轨分发 |
-| gocui 样式转换 | [gocui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/gocui.go#L25-L45) | GetGocuiAttribute/GetGocuiStyle |
-| TextStyle 转换 | [style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/theme/style.go#L9-L44) | GetTextStyle() |
-| TextStyle 核心 | [text_style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/text_style.go#L28-L36) | TextStyle 结构体、deriveStyle |
-| 颜色封装 | [color.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/color.go#L5-L8) | Color 结构体 (basic+RGB) |
-| 装饰封装 | [decoration.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/decoration.go#L5-L10) | Decoration 结构体 |
-| 预定义样式 | [basic_styles.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/style/basic_styles.go#L9-L52) | ColorMap、FgXxx、BgXxx |
-| Attribute 定义 | [attribute.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gocui/attribute.go#L10-L64) | gocui.Attribute 位布局 |
-| tcell 桥接 | [tcell_driver.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gocui/tcell_driver.go#L104-L124) | Attribute → tcell.Style |
-| GUI 应用 | [gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/gui.go#L1174-L1183) | setColorScheme() |
-| 视图配置 | [views.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/views.go#L159-L179) | configureViewProperties() |
-| 作者颜色 | [authors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/authors/authors.go#L76-L98) | 哈希着色 + 自定义覆盖 |
-| 分支颜色 | [branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/gui/presentation/branches.go#L268-L273) | 正则/精确匹配着色 |
-| 通用颜色工具 | [color.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-lazygit/pkg/utils/color.go#L60-L68) | SetCustomColors() |
+| 配置定义 | `pkg/config/user_config.go` | ThemeConfig 结构体与默认值 |
+| 配置加载 | `pkg/config/app_config.go` | YAML 加载、迁移、校验、多文件合并 |
+| 命令行入口 | `pkg/app/entry_point.go` | `--use-config-file` → `LG_CONFIG_FILE` |
+| 仓库配置收集 | `pkg/gui/gui.go` | `getPerRepoConfigFiles()` 逐级搜索 |
+| 主题转换 | `pkg/theme/theme.go` | UpdateTheme()，双轨分发 |
+| gocui 样式转换 | `pkg/theme/gocui.go` | GetGocuiAttribute/GetGocuiStyle |
+| TextStyle 转换 | `pkg/theme/style.go` | GetTextStyle() |
+| TextStyle 核心 | `pkg/gui/style/text_style.go` | TextStyle 结构体、deriveStyle |
+| 颜色封装 | `pkg/gui/style/color.go` | Color 结构体 (basic+RGB) |
+| 装饰封装 | `pkg/gui/style/decoration.go` | Decoration 结构体 |
+| 预定义样式 | `pkg/gui/style/basic_styles.go` | ColorMap、FgXxx、BgXxx |
+| Attribute 定义 | `pkg/gocui/attribute.go` | gocui.Attribute 位布局 |
+| tcell 桥接 | `pkg/gocui/tcell_driver.go` | Attribute → tcell.Style |
+| GUI 应用 | `pkg/gui/gui.go` | setColorScheme()、onUserConfigLoaded() |
+| 视图配置 | `pkg/gui/views.go` | configureViewProperties() |
+| 作者颜色 | `pkg/gui/presentation/authors/authors.go` | 哈希着色 + 自定义覆盖 |
+| 分支颜色 | `pkg/gui/presentation/branches.go` | 正则/精确匹配着色 |
+| 通用颜色工具 | `pkg/utils/color.go` | SetCustomColors() |
