@@ -394,38 +394,234 @@ self.c.AfterLayout(func() error {
 
 ---
 
-## 4. 阶段 C/D：gocui 绘制与屏幕输出
+## 4. contentOnly：完整布局 vs 只改内容的快速路径
 
-见 [gocui/gui.go:1143-1226](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1143-L1226)：
+在进入绘制阶段之前，先理解 `processEvent` 如何决定走哪条路径。
+
+### 4.1 contentOnly 的累积逻辑
+
+见 [gocui/gui.go:756-810](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L756-L810)：
 
 ```
-flush():
-    ├─ [如果屏幕尺寸变化了] markAllViewsAsTainted()
+processEvent():
     │
-    ├─ GuiManagers.Layout(g)  → 实际就是 Gui.layout（阶段 B 在这里执行，前面已讲）
+    ├─ contentOnly = false  （初始值）
     │
-    ├─ 遍历 g.views（按 Z-order）：
-    │    ├─ if !v.Visible: continue
-    │    ├─ if !v.tainted: continue      ← ★ 性能优化：没被污染的 View 跳过
-    │    └─ g.draw(v)
-    │         ├─ clearViewLines(v)     ← 清空 Screen 上对应矩形区域的 cells
-    │         ├─ v.draw(interruptedRuneOpacities)
-    │         │    ├─ drawFrameEdges()   ← 边框 + 滚动条（按 Focused / Highlighted 选色）
-    │         │    ├─ drawFrameCorners() ← 四角
-    │         │    └─ 逐行绘制 textArea 中的 cells（考虑 OriginX/OriginY 偏移）
-    │         └─ v.tainted = false
+    ├─ 选第一个事件（select）：
+    │   ├─ case ev := <-g.gEvents:   ← 键盘/鼠标/Resize/Error/Focus/Paste
+    │   │     contentOnly = false      ★ 任何 gEvent 永远走完整布局
+    │   │     handleEvent(ev)          ← 阶段 A 按键处理
+    │   │
+    │   └─ case ev := <-g.userEvents:  ← OnUIThread / OnUIThreadContentOnly 投递
+    │         contentOnly = ev.contentOnly  ★ 取决于调用方用的是 Update() 还是 UpdateContentOnly()
+    │         ev.f(g)                   ← 执行回调
     │
-    └─ Screen.Show()                 ← tcell 把缓存的 cells 同步到终端
+    ├─ processRemainingEvents()        ← 批量消费队列中剩余的非阻塞事件
+    │   │                               (default 分支为空就退出)
+    │   │
+    │   ├─ 对于每个后续事件：
+    │   │   ├─ 又是 gEvent → remainingContentOnly = false（一坏全坏）
+    │   │   └─ userEvent → remainingContentOnly = ev.contentOnly && remainingContentOnly
+    │   │                          （所有 userEvent 都带 contentOnly=true，整体才保持 true）
+    │   │
+    │   └─ 返回 remainingContentOnly
+    │
+    ├─ contentOnly = contentOnly && remainingContentOnly
+    │                     ★ 逻辑 AND：第一个事件 + 所有后续事件都必须是 contentOnly=true，整体才是 true
+    │
+    └─ if contentOnly { return g.flushContentOnly(g.views) }  ← 快速路径
+       else               { return g.flush() }               ← 完整路径
 ```
 
-**v.tainted 的设置时机（决定哪些 View 要重绘）：**
-- `SetView`（坐标变了）: [gocui/gui.go:309](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L309) 设置 `v.tainted = true` + `markViewsBelowAsTainted`
-- `SetContent` / `Write`（内容变了）: [gocui/view.go:200](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L200) 设置 `v.tainted = true`
-- `SetHighlight` / `SetOrigin` / `SetCursor`（样式变了）: 均设置 `v.tainted = true`
+**累积逻辑总结**：只要批量里**有一个事件**是 gEvent（键盘/鼠标）或普通 OnUIThread（`contentOnly=false`），整条路径就走完整 flush。
+
+### 4.2 哪些投递走哪条路径
+
+| API | contentOnly 值 | 典型使用场景 |
+|-----|---------------|-------------|
+| `gui.c.OnUIThread(func)` → `gui.g.Update(func)` | **false** | 数据刷新后 postRefreshUpdate |
+| `gui.c.OnUIThreadContentOnly(func)` → `gui.g.UpdateContentOnly(func)` | **true** | 滚动列表、搜索结果高亮、实时文本 |
+| 键盘 `]`、鼠标点击等（走 gEvents） | **false** | 强制走完整布局 |
 
 ---
 
-## 5. 完整时序线：按 `]` 从 localBranches → remotes
+## 5. 阶段 C/D：gocui 绘制与屏幕输出
+
+### 5.1 两条绘制路径的完整代码对照
+
+见 [gocui/gui.go:1143-1207](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1143-L1207)。
+
+#### 路径 A：完整路径 flush()（对应布局变化 / 键盘事件）
+
+```go
+func (g *Gui) flush() error {
+    maxX, maxY := Screen.Size()
+
+    // ① 屏幕尺寸变化时，清空 ALL views 的 viewLines 缓存
+    if maxX != g.maxX || maxY != g.maxY {
+        for _, v := range g.views {
+            v.clearViewLines()       // [view.go:203] tainted=true + viewLines=nil
+        }
+    }
+    g.maxX, g.maxY = maxX, maxY
+
+    // ② ★★★ 重算布局：调用所有 Manager 的 Layout（即 Gui.layout）
+    // 这一步做：GetWindowDimensions（Box 布局）+ SetView（写 View 坐标）+ setViewFromDimensions
+    //          + contextsToRerender.HandleRender + afterLayoutFuncs(FocusPoint)
+    for _, m := range g.managers {
+        if err := m.Layout(g); err != nil { return err }
+    }
+
+    // ③ ★ 不做 tainted 过滤，遍历所有 View 一律 draw
+    for _, v := range g.views {
+        if err := g.draw(v); err != nil { return err }
+    }
+
+    // ④ 输出到终端
+    Screen.Show()
+    return nil
+}
+```
+
+**关键事实 1：完整路径不做 tainted 过滤。** 不论 v.tainted 是 true 还是 false，只要在 `g.views` 列表里就调用 `g.draw(v)`。理由是：布局被重算后，即使视图内部内容没改，边框位置也可能变了，必须重画。
+
+#### 路径 B：快速路径 flushContentOnly()（对应纯内容变化）
+
+```go
+func (g *Gui) flushContentOnly(views []*View) error {
+    // ① ★ 跳过 GuiManagers.Layout（不重算布局，不调 SetView）
+    // ② ★ 先计算实际需要重画哪些 View
+    redrawList := viewsToRedrawContentOnly(views)
+
+    // ③ 只重画 redrawList 中的
+    for _, v := range redrawList {
+        if err := g.draw(v); err != nil { return err }
+    }
+
+    // ④ 输出到终端
+    Screen.Show()
+    return nil
+}
+```
+
+**关键事实 2：快速路径完全跳过 Gui.layout**，不会调用 `m.Layout(g)`，所以：
+- Window 坐标不会重算（Accordion 权重变化在这条路径不会生效）
+- afterLayoutFuncs 不会被消费（FocusPoint 不会执行）
+- contextsToRerender 的 HandleRender 不会被 layout 触发
+
+#### viewsToRedrawContentOnly 的过滤算法（哪些需要重画）
+
+见 [gocui/gui.go:1186-1207](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1186-L1207)：
+
+```
+viewsToRedrawContentOnly(views):
+    ├─ tainted 标记集合 = 所有 i 满足 views[i].tainted == true
+    │
+    ├─ 对每个 tainted view（index=i）：
+    │    └─ 对 views[i+1:]（Z-order 在它上方的所有 view）：
+    │         └─ 如果 rectsOverlap(views[i], views[j])
+    │            → views[j] 也加入重画集合（被污染区域重叠了它）
+    │
+    └─ 返回所有被标记的 views（保持原 Z-order 顺序）
+```
+
+**含义**：
+- 一个 View 被改动（tainted=true），它上面所有与它重叠的 View 也必须重画，因为 tcell Screen 是 cells 缓冲区：下层 cells 重写会弄脏上层区域
+- 实际绘制时按 Z-order 从下到上画，保证上层 View 能盖掉下层的重叠像素
+
+### 5.2 g.draw(v) 的内部细节（两条路径共享）
+
+见 [gocui/gui.go:1227-1297](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1227-L1297)。
+
+```
+g.draw(v):
+    ├─ 早期返回：suspended / !Visible / 非法尺寸（y1<y0 或 x1<x0）
+    │
+    ├─ 光标处理：根据 g.Cursor 和 currentView 显示/隐藏光标
+    │
+    ├─ ★ v.draw()    （见 [view.go:1215-1308]）
+    │    ├─ 加 writeMutex
+    │    ├─ !Visible → 返回
+    │    ├─ clearRunes()   （[view.go:1397] 用空格 + 默认色填充整个 Inner 矩形到 Screen cells）
+    │    │                   注意：这是写 tcell Screen，不是清 View 内部
+    │    │
+    │    ├─ maxX, maxY = v.InnerSize()
+    │    ├─ Wrap 时 ox=0
+    │    │
+    │    ├─ ★ refreshViewLinesIfNeeded()   （[view.go:1310-1335]）
+    │    │    if v.tainted {
+    │    │        // 把 View.lines[]（带样式的源字符串）按 Wrap 宽度切成 viewLines[]
+    │    │        // viewLines 是按屏幕实际行数切好的结构，用于画 cells
+    │    │        v.tainted = false   ← ★★★ tainted 在这里被清除！
+    │    │    }
+    │    │
+    │    ├─ Autoscroll 计算 oy
+    │    ├─ 遍历 viewLines[oy:] 逐行：
+    │    │    遍历每个字符，根据 ox 跳过不可见部分
+    │    │    调 v.setCharacter(x, y, chr, fgColor, bgColor)
+    │    │    → 最终落到 tcellSetCell(x0+x+1, y0+y+1, ...) 写 Screen cells
+    │    └─ writeMutex.Unlock
+    │
+    └─ ★ 如果 v.Frame == true：
+         （边框、标题、副标题、页脚）
+         ├─ 根据是否 g.currentView 决定用 SelFgColor/SelFrameColor 还是普通 FgColor/FrameColor
+         ├─ drawFrameEdges()   ← 4 条边框 + 滚动条
+         ├─ drawFrameCorners() ← 4 个角
+         ├─ drawTitle()        ← 标题 + Tabs（如果有）
+         ├─ drawSubtitle()     ← 副标题
+         └─ drawListFooter()   ← "1 of 42" 页脚
+```
+
+**极其重要的三个细节：**
+
+1. **`v.tainted = false` 在 `v.draw()` 内部的 `refreshViewLinesIfNeeded()` 里**（view.go:1333），不在 gocui/gui.go 的循环里。
+2. **v.clearRunes() 是写 tcell Screen 的像素**（view.go:1397-1404），是"清空 View 内部对应矩形"，不是清空 View 自己的 lines buffer。
+3. **`Screen.Show()` 是 tcell 的最终输出**，它有自己的 cell dirty tracking，只把变化了的像素输出到终端。所以即使 g.draw 里把所有 cells 重写了一遍，终端只收到差异。
+
+### 5.3 taint 机制的完整链条
+
+**tainted 的所有写入点（置 true）：**
+| 操作 | 代码位置 | 效果 |
+|------|----------|------|
+| `SetView` 坐标变化 | [gocui/gui.go:309](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L309) | `v.tainted = true` + `markViewsBelowAsTainted` |
+| `SetContent` 内容全量替换 | [gocui/view.go:200](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L200) | `v.tainted = true` |
+| `Write` 内容追加写入 | [gocui/view.go:230 附近] | `v.tainted = true` |
+| `SetHighlight` 颜色变化 | 内部 | `v.tainted = true` |
+| `SetOrigin` 滚动变化 | 内部 | `v.tainted = true` |
+| `SetCursor` 光标变化 | 内部 | `v.tainted = true` |
+| `SetTitle` / `SetFooter` | 内部 | `v.tainted = true` |
+| `clearViewLines` viewLines 清除 | [gocui/view.go:203](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L203) | `v.tainted = true` |
+
+**tainted 的唯一读取点（判断用不用）：**
+```go
+// 只在 flushContentOnly 的 viewsToRedrawContentOnly 里：
+if !v.tainted && !redrawIndexes.Includes(i) { continue }  // 跳过
+
+// 在 v.draw() 的 refreshViewLinesIfNeeded 里：
+if v.tainted { // 重算 viewLines，然后 tainted=false }
+```
+
+**在完整 flush() 里，`v.tainted` 只影响 `refreshViewLinesIfNeeded()` 内部的 viewLines 重算，不影响是否调用 g.draw（因为完整 flush 一律不跳过）。**
+
+### 5.4 两条路径的差异总览
+
+| 维度 | flush() 完整路径 | flushContentOnly() 快速路径 |
+|------|----------------|---------------------------|
+| **入口条件** | gEvent 或 contentOnly=false 的 userEvent | 所有批量事件都是 contentOnly=true 的 userEvent |
+| **屏幕尺寸变化处理** | 检查并 clearViewLines(ALL) | **不做** |
+| **是否重算布局** | 是，遍历 g.managers 调 Layout(Gui.layout) | **不做**，跳过 Gui.layout |
+| **SetView 被调用** | 是（layout 的 setViewFromDimensions） | 否 |
+| **afterLayoutFuncs 消费** | 是（layout 末尾） | 否 |
+| **contextsToRerender** | 会被 layout 计算并触发 HandleRender | 不会被触发（没走 layout） |
+| **重画 View 集合** | 所有 g.views，不看 tainted | `viewsToRedrawContentOnly`：tainted + 上方重叠 |
+| **v.draw() 内部行为** | 相同（clearRunes + refreshViewLinesIfNeeded + cells + Frame） | 相同 |
+| **v.tainted 清除时机** | v.draw → refreshViewLinesIfNeeded 里 | 相同 |
+| **Screen.Show()** | 调 1 次 | 调 1 次 |
+| **典型触发场景** | 切 Context、切 Tab、Resize、h/l 跨 Window、按方向键 j/k | 滚动触发 SetOrigin、SetContent 直接写内容、搜索高亮变化 |
+
+---
+
+## 6. 完整时序线：按 `]` 从 localBranches → remotes
 
 下面用精确的时间顺序列出每一行代码在哪个阶段执行：
 
@@ -564,7 +760,7 @@ flush():
 
 ---
 
-## 6. 三条入口的时序差异对比
+## 7. 三条入口的时序差异对比
 
 | 操作 | side panel 内容 | side panel 坐标/滚动 | main view 内容 | 何时可见 |
 |------|----------------|---------------------|----------------|----------|
@@ -577,9 +773,9 @@ flush():
 
 ---
 
-## 7. 关键设计洞察
+## 8. 关键设计洞察
 
-### 7.1 "两次 flush" 的设计取舍
+### 8.1 "两次 flush" 的设计取舍
 
 side panel 的内容直接同步写入 View（`SetContent`），因为 side panel 是简单列表，渲染成本低；
 main view 的内容通过 ViewBufferManager 的后台 goroutine 生成，因为 diff/merge/patch 可能非常大：
@@ -589,7 +785,7 @@ main view 的内容通过 ViewBufferManager 的后台 goroutine 生成，因为 
 
 副作用：用户每次切 side panel 的选中项，主视图都要多一帧才更新。这个延迟在实现上用 `CopyContent(topView, view)`（[main_panels.go:50](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gui/main_panels.go#L50)）来减少视觉闪烁——在新内容渲染完之前，先把旧 View 的内容复制到新 View 上。
 
-### 7.2 AfterLayout：把"尺寸相关操作"从"尺寸未知阶段"解耦
+### 8.2 AfterLayout：把"尺寸相关操作"从"尺寸未知阶段"解耦
 
 FocusLine 的逻辑需要知道 View 的 InnerHeight，但是它在 HandleFocus（阶段 A）中被触发，此时 Gui.layout 还没跑，View 坐标还是旧的。
 
@@ -599,21 +795,27 @@ FocusLine 的逻辑需要知道 View 的 InnerHeight，但是它在 HandleFocus�
 
 这层解耦避免了"如果 Accordion 模式导致 View 高度变化，FocusLine 算出来的 OriginY 就错了"的问题。
 
-### 7.3 taint 机制：增量绘制
+### 8.3 taint 机制：增量绘制的两层过滤
 
-每个 View 有一个 `tainted` bool 字段，任何改坐标/内容/样式的操作都会置 true。`flush()` 时只重绘被污染的 View 和它下方重叠的区域（`markViewsBelowAsTainted`），避免 60fps 下每一帧都重绘全部。
+文档现在明确了 tainted 有两层作用：
+1. **视图集合过滤（仅快速路径有效）**：`viewsToRedrawContentOnly` 根据 tainted + 矩形重叠，从所有 views 里挑出真正需要画的
+2. **内部缓存失效（两条路径都有效）**：`v.draw()` 里的 `refreshViewLinesIfNeeded` 根据 tainted 决定是否要重新切行（把 lines 按 Wrap 宽度切成 viewLines）
 
-### 7.4 contentOnly：跳过布局的快速路径
+完整路径不做第 1 层过滤（因为布局重算了，必须所有 View 都重画边框），但仍然用第 2 层（内容没变就不重新切行）。
 
-对于纯内容变化（例如滚动列表、刷新文本），用 `OnUIThreadContentOnly` 投递事件：
-- `processEvent` 的 contentOnly 累积为 true
-- 走 `flushContentOnly()`：不调用 GuiManagers.Layout（即跳过 Gui.layout），直接遍历 tainted views 调 g.draw
+### 8.4 contentOnly："一坏全坏"的累积逻辑
 
-键盘事件永远不会走这条路径，因为它可能引起 Context 变化 → Accordion 重算 → Window 尺寸变化。
+批量事件消费时使用 `contentOnly = contentOnly && remainingContentOnly`：只要有一个事件需要布局（键盘、鼠标、Resize、或普通 OnUIThread），整条路径就强制完整 flush。
+
+这个设计的保守性是合理的——跳过布局是非常激进的优化，只有调用方明确承诺"只改内容没改布局"时才启用，且不允许与任何"可能改布局"的事件混合。
+
+### 8.5 tcell Screen 的第三层脏跟踪
+
+即使 g.draw 里 `clearRunes()` 把整个 View 内部用空格填充了一遍、`setCharacter` 把所有 cells 写了一遍，`Screen.Show()` 还有自己的 cell dirty tracking：只把相对上一次 Show 真正变化过的像素输出到终端。这就是为什么在大尺寸显示器上，tty 的数据吞吐仍然可控。
 
 ---
 
-## 8. 关键文件索引
+## 9. 关键文件索引
 
 | 功能 | 文件 |
 |------|------|
@@ -637,3 +839,10 @@ FocusLine 的逻辑需要知道 View 的 InnerHeight，但是它在 HandleFocus�
 | gocui Update / UpdateContentOnly（投递 userEvent） | [gocui/gui.go:619-642](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L619-L642) |
 | JumpToSideWindow（数字键入口） | [jump_to_side_window_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gui/controllers/jump_to_side_window_controller.go) |
 | PrevBlock/NextBlock（h/l 入口） | [side_window_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gui/controllers/side_window_controller.go) |
+| **flushContentOnly（快速路径）** | [gocui/gui.go:1171-1184](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1171-L1184) |
+| **viewsToRedrawContentOnly（tainted + 重叠过滤）** | [gocui/gui.go:1186-1207](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1186-L1207) |
+| **g.draw(v) 入口（光标 + Frame 处理）** | [gocui/gui.go:1227-1297](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L1227-L1297) |
+| **v.draw() 内部（clearRunes + viewLines 切行 + cells 写入）** | [gocui/view.go:1215-1308](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L1215-L1308) |
+| **refreshViewLinesIfNeeded（tainted=false 在此处清除）** | [gocui/view.go:1310-1335](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L1310-L1335) |
+| **clearRunes（清 Screen 内对应矩形，不是清 View buffer）** | [gocui/view.go:1397-1404](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/view.go#L1397-L1404) |
+| **processRemainingEvents（contentOnly 累积逻辑）** | [gocui/gui.go:790-810](file:///d:/fz/0601-2/solo-dogfeeding/code/30-lazygit/pkg/gocui/gui.go#L790-L810) |
