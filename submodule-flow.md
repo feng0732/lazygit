@@ -306,14 +306,14 @@ func (self *SubmodulesController) update(submodule *models.SubmoduleConfig) erro
 
 经过深入代码分析，发现 **4 个关键因素** 可能导致刷新结果与预期不符：
 
-#### 原因 1：WithWaitingStatus 的错误吞没问题
+#### 原因 1：WithWaitingStatus 的错误异步传递（之前误判为完全吞掉）
 
-[PopupHandler.WithWaitingStatus](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/popup/popup_handler.go#L74-L77) 的签名存在设计问题：
+[PopupHandler.WithWaitingStatus](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/popup/popup_handler.go#L74-L77) 的签名：
 
 ```go
 func (self *PopupHandler) WithWaitingStatus(message string, f func(gocui.Task) error) error {
     self.withWaitingStatusFn(message, f)
-    return nil  // ❌ 总是返回 nil！即使内部函数返回了错误
+    return nil  // 同步路径上总是返回 nil
 }
 ```
 
@@ -327,10 +327,62 @@ func (self *AppStatusHelper) WithWaitingStatus(message string, f func(gocui.Task
 }
 ```
 
-**问题**：
-- `WithWaitingStatus` 函数**立即返回 nil**，而实际任务被放入 worker 队列
-- 内部函数（含 Git 命令执行 + Refresh）的错误被**完全吞掉**
-- 调用方无法感知 Git 命令执行是否真正成功
+**⚠️ 之前的误判纠正**：错误**没有被完全吞掉**，但**不会同步返回到按键处理流程**。
+
+**完整错误处理链（双路径）**：
+
+```
+用户按键 → 同步路径（错误丢失）
+            ↓
+         update(submodule)
+            ↓
+         WithWaitingStatus(msg, func)
+            ├─ 同步路径：立即 return nil
+            │   → 按键处理流程结束，调用方无法获知错误
+            │
+            └─ 异步路径（错误经后台传递到界面）：
+                ↓
+              OnWorker 启动新 goroutine
+                ↓
+              onWorkerAux(f, task) [gocui/gui.go:658-675]
+                ├─ err := f(task)  // 执行 Git 命令，可能返回错误
+                └─ if err != nil:
+                      ↓
+                    g.Update(func(g *Gui) error { return err })
+                      ↓
+                    投递到 userEvents 通道
+                      ↓
+              MainLoop.processEvent() [gocui/gui.go:756-786]
+                ├─ 从 userEvents 取出事件
+                ├─ err := ev.f(g)  // 得到错误
+                └─ g.handleError(err)
+                      ↓
+                    g.ErrorHandler(err)  // 已设置为 PopupHandler.ErrorHandler
+                      ↓
+                    PopupHandler.ErrorHandler(err) [popup_handler.go:83-103]
+                      ├─ 如果是 ErrKeybindingNotHandled → 显示 Toast
+                      └─ 否则 → self.Alert("Error", coloredMessage)
+                            ↓
+                          弹出错误对话框给用户
+```
+
+**关键要点**：
+1. **同步路径**：`WithWaitingStatus` 总是返回 `nil`，调用方（按键处理流程）无法同步获取错误
+2. **异步路径**：错误通过 `OnWorker` → `g.Update` → `userEvents` → `ErrorHandler` 最终以 Alert 弹窗呈现
+3. **用户能看到错误**，只是调用代码层面无法在同步流程中捕获和处理错误
+4. **时序**：用户看到错误弹窗时，按键处理已经结束，UI 线程可以继续处理其他事件
+
+**对比：WithWaitingStatusSync 是同步的**
+`WithWaitingStatusSync` 没有走 OnWorker，直接在当前 goroutine 执行，错误会同步返回：
+```go
+func (self *AppStatusHelper) WithWaitingStatusSync(message string, f func() error) error {
+    return self.statusMgr().WithWaitingStatus(message, func() {}, func(*status.WaitingStatusHandle) error {
+        return f()  // 直接返回错误
+    })
+}
+```
+
+但 submodule 操作都使用的是异步版本 `WithWaitingStatus`。
 
 #### 原因 2：Refresh 的 SYNC 模式仍是并发执行
 
@@ -669,15 +721,23 @@ type SubmoduleConfig struct {
       5a. WithWaitingStatus("Updating submodule", ...)
             ├─ 显示 Loading 状态到 AppStatus 视图
             └─ 将任务提交到 OnWorker 队列异步执行
-            └─ update() 立即 return nil（错误可能已被吞）
+            └─ update() 立即 return nil（同步路径上无错误返回）
          ↓
       5b. [Worker goroutine]
             ├─ LogAction 记录操作
             ├─ Git().Submodule.Update(path)
-            │     → 执行 `git submodule update --init -- <path>`
-            │     → ⚠️ 嵌套 submodule 此命令可能失败（见 4.4 节）
+            │     ├─ 成功：继续执行 Refresh
+            │     └─ 失败：return err → 进入异步错误处理链
+            │           ↓
+            │         onWorkerAux 捕获 err
+            │           ↓
+            │         g.Update(func() error { return err })
+            │           ↓
+            │         投递到 userEvents → MainLoop 处理
+            │           ↓
+            │         PopupHandler.ErrorHandler → 弹出错误 Alert
             │
-            └─ Refresh(Scope: [SUBMODULES])
+            └─ 成功分支：Refresh(Scope: [SUBMODULES])
                   ├─ Mode 默认 SYNC：refreshFilesAndSubmodules 在 goroutine 中执行
                   │    ├─ GetConfigs(nil) 重新解析 .gitmodules
                   │    ├─ Model.Submodules = 新数据
@@ -692,6 +752,23 @@ type SubmoduleConfig struct {
                   └─ wg.Wait() → Refresh 返回
                      ⚠️ 但 OnUIThread 中的渲染是异步投递，此时不一定已完成
 ```
+
+#### 🔍 错误处理链总结
+
+submodule 操作的错误处理是**双路径异步传递**模型：
+
+| 路径 | 传递方式 | 错误可见性 | 处理时机 |
+|------|---------|-----------|----------|
+| **同步路径**（按键 → WithWaitingStatus 返回） | 直接函数调用返回 | ❌ 不可见（总是返回 nil） | 按键处理完成时 |
+| **异步路径**（Worker → userEvents → ErrorHandler） | goroutine + channel 投递 | ✅ 用户可见（Alert 弹窗） | 按键处理完成后，下一帧 UI 循环 |
+
+**核心代码节点**：
+1. 异步起点：[gocui.Gui.onWorkerAux](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gocui/gui.go#L658-L675) 捕获错误并投递到 Update
+2. 通道中转：[gocui.Gui.updateAsyncAux](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gocui/gui.go#L634-L636) 发送到 userEvents channel
+3. 主循环处理：[gocui.Gui.processEvent](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gocui/gui.go#L756-L786) 取出事件并执行
+4. 错误分发：[gocui.Gui.handleError](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gocui/gui.go#L748-L754) 调用 ErrorHandler
+5. 界面呈现：[Gui.Run 中设置](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/gui.go#L891) `g.ErrorHandler = gui.PopupHandler.ErrorHandler`
+6. 最终呈现：[PopupHandler.ErrorHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/popup/popup_handler.go#L83-L103) 弹出 Alert 对话框
 
 #### 对比：remove() 操作的端到端流程（Scope 冗余示例）
 
