@@ -399,6 +399,246 @@ func (self *patchTransformer) transformHunks() []*Hunk {
 
 ---
 
+### 3.7 输出补丁块数量的精确计算公式
+
+输出补丁块（即新 @@ hunk）的数量可以通过以下公式精确计算，适用于所有场景：
+
+**单文件输出 hunk 数公式：**
+```
+OutputHunkCount(file) = Σ(
+    for each 原始 hunk H in file:
+        if H 包含至少 1 条选中的变更行
+           AND transform(H) 后 containsChanges() == true
+        then 1 else 0
+)
+```
+
+**全文件输出 hunk 数公式：**
+```
+TotalOutputHunkCount = Σ(OutputHunkCount(file) for each file in patch)
+```
+
+公式的两层含义：
+
+#### 第一层：hunk 边界必须被选中范围覆盖
+
+`HunkStartIdx(hunkIndex)`（[patch.go#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch.go#L65-L73)）计算每个原始 hunk 在整个补丁中的起始行号：
+
+```go
+func (self *Patch) HunkStartIdx(hunkIndex int) int {
+    result := len(self.header)
+    for i := range hunkIndex {
+        result += self.hunks[i].lineCount()  // +1 因为包含 hunk 头行
+    }
+    return result
+}
+```
+
+一个原始 hunk 是否被选中范围覆盖，取决于它的行号区间 `[HunkStartIdx(i), HunkEndIdx(i)]` 是否与 `IncludedLineIndices` 有交集。
+
+#### 第二层：containsChanges() 的空块过滤
+
+即使 hunk 被选中范围覆盖，如果 Transform 后没有任何真正的变更（所有 +/- 都被转成 context 或丢弃），`containsChanges()`（[hunk.go#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/hunk.go#L36-L38)）会返回 false，这个 hunk 会被丢弃：
+
+```go
+func (self *Hunk) containsChanges() bool {
+    return nLinesWithKind(self.bodyLines, []PatchLineKind{ADDITION, DELETION}) > 0
+}
+```
+
+**空块丢弃的典型场景：** 用户只选中了 hunk 中的 `-` 删除行，且 `Reverse=true`。此时 `-` 行属于 new file 行，未选中时直接丢弃；如果这恰好是 hunk 内唯一的变更行，Transform 后 hunk 就只剩 context 行，`containsChanges() == false`，整个 hunk 被丢弃。
+
+**输出块数的极端情况：**
+
+| 场景 | OutputHunkCount | 说明 |
+|------|----------------|------|
+| 所有 hunk 都未选中 | 0 | 空 patch，不执行 git apply |
+| 2 个原始 hunk，都覆盖但 1 个变空块 | 1 | 另一个 hunk 被丢弃 |
+| 3 个原始 hunk，全部选中且都有变更 | 3 | 与原始 hunk 数相同 |
+| 选中范围跨越 2 个原始 hunk 边界，都有变更 | 2 | 每个原始 hunk 各产出 1 个 |
+
+> **关键结论：** `OutputHunkCount ≤ 原始 hunk 数`，永远不会大于。因为一个原始 hunk 最多产出 1 个新 hunk，且可能因空块被丢弃。
+
+---
+
+### 3.8 三种行选择语义的精确区分
+
+行选择是连接用户交互和补丁生成的核心环节。Lazygit 中有三种本质不同的行选择机制，对应三种不同的使用场景：
+
+| 维度 | ① 空块丢弃 | ② 暂存面板连续范围选择 | ③ 自定义补丁累积选择 |
+|------|-----------|----------------------|---------------------|
+| **触发场景** | Transform 内部自动处理 | 暂存面板按空格/d | Patch Builder 视图按空格 |
+| **数据结构** | `containsChanges()` 布尔判断 | `ExpandRange(first, last)` → `[]int` 连续切片 | `PatchBuilder.fileInfoMap[file].includedLineIndices` → `[]int` 集合 |
+| **连续性** | 无（hunk 级判断） | **必须连续** | **支持非连续** |
+| **生命周期** | Transform 调用时临时计算 | 单次操作，用完即弃 | 跨操作持久累积，直到 Apply/Reset |
+| **集合操作** | 无 | 无（单次覆盖） | `lo.Union`（加）/ `lo.Difference`（减） |
+| **对应代码** | [hunk.go#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/hunk.go#L36-L38) | [transform.go#L51-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L51-L57) | [patch_builder.go#L147-L169](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_builder.go#L147-L169) |
+
+#### 3.8.1 ① 空块丢弃（Transform 内部机制）
+
+**行为：** 对每个原始 hunk Transform 后，检查 `containsChanges()`。如果 hunk 内没有任何 ADDITION 或 DELETION 行（全是 context），则从输出中丢弃。
+
+**这不是用户操作，是 Transform 的内部安全机制**——防止生成无意义的纯上下文补丁导致 `git apply` 出错。
+
+#### 3.8.2 ② 暂存面板连续范围选择
+
+`ExpandRange(start, end)`（[transform.go#L51-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/transform.go#L51-L57)）生成严格连续的索引切片：
+
+```go
+func ExpandRange(start int, end int) []int {
+    expanded := []int{}
+    for i := start; i <= end; i++ {
+        expanded = append(expanded, i)
+    }
+    return expanded
+}
+```
+
+**关键性质：**
+- **连续性：** 切片内的索引永远是 `[a, a+1, a+2, ..., b]`，没有间隔
+- **一次性：** 每次按空格/d 都是全新计算，不与之前的操作累积
+- **三种选择模式（LINE/RANGE/HUNK）最终都调用 ExpandRange**，只是输入的 `(firstLineIdx, lastLineIdx)` 不同
+  - LINE 模式：`(selectedLineIdx, selectedLineIdx)`
+  - RANGE 模式：`(min(rangeStart, selected), max(rangeStart, selected))`
+  - HUNK 模式：`selectionRangeForCurrentBlockOfChanges()`
+
+**用户交互的限制：** 暂存面板的交互设计决定了用户**无法直接选择非连续的行**。要实现非连续暂存，需要分多次操作：先暂存一部分 → 光标移动到另一部分 → 再暂存另一部分。但每次操作都是独立的 `git apply` 调用，不是单次 Transform。
+
+#### 3.8.3 ③ 自定义补丁累积选择
+
+`PatchBuilder` 的 `includedLineIndices` 是真正的**集合语义**，支持非连续累积：
+
+```go
+// patch_builder.go#L147-L169
+func (p *PatchBuilder) AddFileLineRange(filename string, lineIndices []int) error {
+    info.mode = PART
+    info.includedLineIndices = lo.Union(info.includedLineIndices, lineIndices)  // 并集！
+}
+
+func (p *PatchBuilder) RemoveFileLineRange(filename string, lineIndices []int) error {
+    info.mode = PART
+    info.includedLineIndices, _ = lo.Difference(info.includedLineIndices, lineIndices)  // 差集！
+}
+```
+
+**toggleSelection 的智能判断**（[patch_building_controller.go#L160-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/patch_building_controller.go#L160-L164)）：
+
+```go
+firstSelectedChangeLineIsStaged := lo.Contains(includedLineIndices, lineIndicesToToggle[0])
+if firstSelectedChangeLineIsStaged {
+    toggleFunc = PatchBuilder.RemoveFileLineRange  // 已选中 → 批量移除
+} else {
+    toggleFunc = PatchBuilder.AddFileLineRange     // 未选中 → 批量加入
+}
+```
+
+> **边界行为：** 如果选中范围跨越了已选和未选区域，整体行为以**第一条选中的变更行**的状态为准。这是为了交互一致性而牺牲的边界精确性——用户永远知道"按一下空格会发生什么"，即使范围内部状态不一致。
+
+**非连续选择的完整例子：**
+
+```
+补丁行号：0  1  2  3  4  5  6  7  8  9
+内容：    @@ -1 +1 @@
+          -old1    // 行2（变更行）
+          +new1    // 行3（变更行）
+           context // 行4
+          -old2    // 行5（变更行）
+          +new2    // 行6（变更行）
+           context // 行7
+          -old3    // 行8（变更行）
+          +new3    // 行9（变更行）
+
+用户操作：
+  1. 光标在行2-3（第一处变更），按空格 → AddLineRange([2,3])
+     includedLineIndices = [2,3]
+  2. 光标移动到行8-9（第三处变更），按空格 → AddLineRange([8,9])
+     includedLineIndices = lo.Union([2,3], [8,9]) = [2,3,8,9]  ← 非连续！
+  3. 光标在行5-6（第二处变更），按空格 → 第一条行5未选中 → AddLineRange([5,6])
+     includedLineIndices = [2,3,5,6,8,9]
+  4. 再次光标在行5-6，按空格 → 第一条行5已选中 → RemoveLineRange([5,6])
+     includedLineIndices = lo.Difference([2,3,5,6,8,9], [5,6]) = [2,3,8,9]
+
+最终 RenderPatchForFile 时：
+  Transform(IncludedLineIndices=[2,3,8,9])
+  → 第一处变更（行2-3）被保留
+  → 第二处变更（行5-6）全部未选中，-old2 转 context，+new2 丢弃
+  → 第三处变更（行8-9）被保留
+  → 输出 2 个新 hunk？不！
+    因为这三处变更在**同一个原始 @@ hunk** 内，
+    所以最终输出仍然是 1 个 @@ hunk，
+    只是中间的第二处变更被 context 行桥接了。
+```
+
+**RenderPatchForFile 的调用时机**（[patch_builder.go#L179-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/commands/patch/patch_builder.go#L179-L208)）：
+
+```go
+func (p *PatchBuilder) RenderPatchForFile(opts RenderPatchForFileOpts) string {
+    if info.mode == WHOLE && opts.Plain {
+        return info.diff  // 整文件选中，跳过 Parse+Transform 优化
+    }
+    return Parse(info.diff).
+        Transform(TransformOpts{
+            IncludedLineIndices: info.includedLineIndices,  // 可能是非连续的！
+            Reverse:            opts.Reverse,
+        }).FormatPlain()
+}
+```
+
+`WHOLE` 模式的优化：如果整个文件都被选中，直接返回原始 diff，跳过 Parse+Transform，避免不必要的计算。
+
+#### 3.8.4 三种机制的协作关系
+
+```
+用户按空格（暂存面板）
+    │
+    ▼
+State.SelectedPatchRange() → (first, last)
+    │
+    ▼
+ExpandRange(first, last) → [a, a+1, ..., b] 连续切片
+    │
+    ▼
+Transform(IncludedLineIndices=连续切片)
+    │
+    ├─ 对每个原始 hunk 独立 Transform
+    │    └─ transformHunkLines() → 行过滤 + pendingContext 重排序
+    │    └─ transformHunkHeader() → 重算 @@ 头
+    └─ containsChanges() → 空块丢弃
+    │
+    ▼
+FormatPlain() → 输出补丁
+```
+
+```
+用户按空格（Patch Builder 视图）
+    │
+    ▼
+LineIndicesOfAddedOrDeletedLinesInSelectedPatchRange() → [x, y, z]（只含变更行）
+    │
+    ▼
+lo.Contains(includedLineIndices, [0]) ?
+    │  ├─ true → RemoveFileLineRange([x, y, z])
+    │  └─ false → AddFileLineRange([x, y, z])
+    │
+    ▼
+lo.Union / lo.Difference 更新 includedLineIndices
+    │  （可能是非连续的集合）
+    │
+    ▼  （用户执行 Apply/移动/丢弃操作时）
+    ▼
+RenderPatchForFile() 被调用
+    │
+    ▼
+Parse + Transform(IncludedLineIndices=非连续集合)
+    │
+    └─ 同上，Transform 本身不关心 IncludedLineIndices 是否连续
+        它只逐行检查 lo.Contains(IncludedLineIndices, i)
+```
+
+> **重要观察：** `Transform` 算法本身完全不关心 `IncludedLineIndices` 是连续的还是非连续的。它对每一行只做一个判断：`lo.Contains(IncludedLineIndices, patchLineIdx)`。连续 vs 非连续的差异只在上层行选择机制中，不在 Transform 核心算法中。
+
+---
+
 ## 四、写回流程：从补丁字符串到索引与工作区
 
 ### 4.1 写回入口点：两个函数，四种场景
@@ -700,9 +940,12 @@ fileInfoMap[filename] → {
 | 维度 | StagingController（即时暂存） | PatchBuilder（自定义补丁） |
 |------|------------------------------|--------------------------|
 | 选择状态 | State.selectMode（LINE/RANGE/HUNK，临时） | PatchBuilder.fileInfoMap（持久，跨文件累积） |
-| 选中语义 | 本次操作的范围 | 补丁中要包含的所有行（多次 toggle 累积） |
+| 行索引生成 | `ExpandRange(first, last)` → **连续切片** | `lo.Union`/`lo.Difference` → **非连续集合** |
+| 选中语义 | 本次操作的范围（单次） | 补丁中要包含的所有行（多次 toggle 累积） |
 | 应用时机 | 按空格立即应用 | 选择"丢弃/移动到索引/新 commit"等动作时批量应用 |
 | 撤销方式 | 反向 `git apply` | 从 includedLineIndices 移除行号 |
+| Transform 调用时机 | 每次按空格/d 时调用一次 | 累积完成后，RenderPatchForFile 时调用一次 |
+| 输出 hunk 数规则 | OutputHunkCount ≤ 原始 hunk 数 | 相同规则，与连续性无关 |
 
 `PatchBuildingController.toggleSelection()`（[patch_building_controller.go#L137-L179](file:///d:/fz/0601-2/solo-dogfeeding/code/21-lazygit/pkg/gui/controllers/patch_building_controller.go#L137-L179)）的智能切换：
 
@@ -713,13 +956,15 @@ lineIndicesToToggle := state.LineIndicesOfAddedOrDeletedLinesInSelectedPatchRang
 // 检查第一条选中行的状态，决定批量 add 还是批量 remove
 firstSelectedChangeLineIsStaged := lo.Contains(includedLineIndices, lineIndicesToToggle[0])
 if firstSelectedChangeLineIsStaged {
-    toggleFunc = PatchBuilder.RemoveFileLineRange
+    toggleFunc = PatchBuilder.RemoveFileLineRange  // lo.Difference
 } else {
-    toggleFunc = PatchBuilder.AddFileLineRange
+    toggleFunc = PatchBuilder.AddFileLineRange     // lo.Union
 }
 ```
 
 > 这意味着：**如果选中范围跨越了已选和未选区域，整体行为以第一条行为准**——这是为了交互一致性而牺牲的边界精确性。
+>
+> **集合语义注意：** `AddFileLineRange` 使用 `lo.Union`（并集）而非直接赋值，所以多次选择重叠范围不会产生重复索引；`RemoveFileLineRange` 使用 `lo.Difference`（差集），可以精确移除任意子集。这是 PatchBuilder 支持非连续选择的核心机制。
 
 ---
 
