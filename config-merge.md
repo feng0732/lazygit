@@ -1,524 +1,734 @@
-# 配置加载与合并优先级详解
+# 配置加载与合并优先级详解（代码级分析）
 
-本文档详细说明 lazygit 配置系统的加载流程、默认值覆盖规则和运行时使用链路。
+本文档从代码层面深入分析 lazygit 配置系统的**配置文件选择**、**默认值覆盖**和**运行时回退**的完整链路。
 
-## 一、整体架构
+---
 
-配置系统由以下核心文件组成：
+## 一、核心代码文件与职责
 
 | 文件 | 职责 |
 |------|------|
-| [app_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go) | 应用配置管理、文件加载、合并逻辑 |
-| [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config.go) | 用户配置结构定义、默认值设置 |
+| [app_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go) | 配置入口：文件选择、加载、合并、迁移、重载 |
+| [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config.go) | 用户配置结构定义、通用默认值、按键绑定合并 |
 | [user_config_validation.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config_validation.go) | 配置验证逻辑 |
-| [config_linux.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_linux.go) | Linux 平台默认配置 |
-| [config_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_windows.go) | Windows 平台默认配置 |
-| [config_default_platform.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_default_platform.go) | 其他平台默认配置 |
-| [editor_presets.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go) | 编辑器预设配置 |
+| [config_linux.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_linux.go) | Linux 平台 OS 默认配置 |
+| [config_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_windows.go) | Windows 平台 OS 默认配置 |
+| [config_default_platform.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_default_platform.go) | macOS/其他平台 OS 默认配置 |
+| [editor_presets.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go) | 编辑器预设动态解析 |
+| [os.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go) | 运行时 OS 命令：文件打开、链接打开、剪贴板 |
+| [file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/git_commands/file.go) | 运行时编辑器命令调用 |
+| [entry_point.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/app/entry_point.go) | 应用启动入口，调用 NewAppConfig |
 
 ---
 
-## 二、配置加载优先级（从低到高）
+## 二、配置文件选择逻辑（代码级）
 
-配置加载遵循 **"后加载覆盖先加载"** 的原则，优先级从低到高依次为：
+### 2.1 应用启动入口
 
-```
-优先级 1 (最低) → 优先级 7 (最高)
-
-   平台默认配置（运行时动态使用）
-        ↓
-   通用默认配置
-        ↓
-   全局用户配置文件 (config.yml)
-        ↓
-   环境变量指定的配置文件 (LG_CONFIG_FILE)
-        ↓
-   仓库级配置文件
-        ↓
-   运行时动态修改
-        ↓
-   运行时平台回退（运行时动态使用）
-```
-
-> **重要区别**：平台默认配置和编辑器预设是**运行时动态回退**的，不是在配置加载时合并的。
-
----
-
-## 三、详细加载流程
-
-### 3.1 应用启动入口
-
-配置加载从 [entry_point.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/app/entry_point.go#L139-L142) 开始：
+配置加载从应用启动入口开始：[entry_point.go#L139-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/app/entry_point.go#L139-L142)
 
 ```go
-// 第1步：创建 AppConfig
 appConfig, err := config.NewAppConfig(
-    "lazygit", 
-    buildInfo.Version, 
-    buildInfo.Commit, 
-    buildInfo.Date, 
-    buildInfo.BuildSource, 
-    cliArgs.Debug, 
+    "lazygit",
+    buildInfo.Version,
+    buildInfo.Commit,
+    buildInfo.Date,
+    buildInfo.BuildSource,
+    cliArgs.Debug,
     tempDir,
 )
 ```
 
-### 3.2 NewAppConfig 加载流程
+### 2.2 NewAppConfig 中的配置文件选择
 
-[app_config.go#L72-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L72-L126) 是配置加载的核心函数：
+[app_config.go#L72-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L72-L126) 是配置文件选择的核心逻辑：
+
+```go
+func NewAppConfig(...) (*AppConfig, error) {
+    // 步骤1：确定配置目录
+    configDir, err := findOrCreateConfigDir()
+
+    // 步骤2：通过环境变量 LG_CONFIG_FILE 判断使用哪种配置文件
+    var configFiles []*ConfigFile
+    customConfigFiles := os.Getenv("LG_CONFIG_FILE")
+    if customConfigFiles != "" {
+        // 分支A：使用环境变量指定的配置文件
+        userConfigPaths := strings.Split(customConfigFiles, ",")
+        configFiles = lo.Map(userConfigPaths, func(path string, _ int) *ConfigFile {
+            return &ConfigFile{Path: path, Policy: ConfigFilePolicyErrorIfMissing}
+        })
+    } else {
+        // 分支B：使用默认配置文件路径
+        path := filepath.Join(configDir, ConfigFilename)
+        configFile := &ConfigFile{Path: path, Policy: ConfigFilePolicyCreateIfMissing}
+        configFiles = []*ConfigFile{configFile}
+    }
+
+    // 步骤3：加载配置
+    userConfig, err := loadUserConfigWithDefaults(configFiles, false)
+    // ...
+}
+```
+
+**决策树：**
 
 ```
-NewAppConfig()
+启动 NewAppConfig()
     │
-    ├─→ 第1步：查找/创建配置目录
-    │    findOrCreateConfigDir()
+    ├─→ 读取环境变量 LG_CONFIG_FILE
     │
-    ├─→ 第2步：确定配置文件路径
-    │    │
-    │    ├─→ 如果 LG_CONFIG_FILE 环境变量存在 → 使用该路径
-    │    │                                → Policy: ErrorIfMissing
-    │    │
-    │    └─→ 否则 → 使用默认路径 ~/.config/lazygit/config.yml
-    │                                     → Policy: CreateIfMissing
+    ├─→ LG_CONFIG_FILE 非空？
+    │   ├─→ 是 → 按逗号分割路径，每个文件 Policy=ErrorIfMissing
+    │   │         （文件不存在则报错）
+    │   │
+    │   └─→ 否 → 调用 findOrCreateConfigDir() 确定目录
+    │             拼接 config.yml，Policy=CreateIfMissing
+    │             （文件不存在则创建空文件）
     │
-    ├─→ 第3步：加载用户配置（含默认值）
-    │    loadUserConfigWithDefaults()
-    │
-    └─→ 第4步：加载应用状态
-         loadAppState()
+    └─→ 调用 loadUserConfigWithDefaults(configFiles)
 ```
 
-### 3.3 配置文件路径查找
+### 2.3 配置目录查找：findOrCreateConfigDir
 
-[findConfigFile](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L589-L608) 函数按以下顺序查找配置文件：
+[app_config.go#L128-L137](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L128-L137)
 
+```go
+func ConfigDir() string {
+    _, filePath := findConfigFile(ConfigFilename)
+    return filepath.Dir(filePath)
+}
+
+func findOrCreateConfigDir() (string, error) {
+    folder := ConfigDir()
+    return folder, os.MkdirAll(folder, 0o755)
+}
 ```
-1. CONFIG_DIR 环境变量指定的目录
-    ↓
-2. 旧版路径：XDG_CONFIG_HOME/jesseduffield/lazygit/
-    ↓
-3. 新版路径：XDG_CONFIG_HOME/lazygit/
-    ↓
-4. 默认路径：XDG_CONFIG_HOME/lazygit/
+
+### 2.4 配置文件路径查找：findConfigFile
+
+[app_config.go#L588-L608](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L588-L608)
+
+```go
+func findConfigFile(filename string) (exists bool, path string) {
+    // 优先级1：CONFIG_DIR 环境变量
+    if envConfigDir := os.Getenv("CONFIG_DIR"); envConfigDir != "" {
+        return true, filepath.Join(envConfigDir, filename)
+    }
+
+    // 优先级2：旧版路径（向后兼容）
+    // 搜索 XDG_CONFIG_HOME/jesseduffield/lazygit/ 和 XDG_CONFIG_DIRS
+    legacyConfigPath, err := xdg.SearchConfigFile(
+        filepath.Join("jesseduffield", "lazygit", filename))
+    if err == nil {
+        return true, legacyConfigPath
+    }
+
+    // 优先级3：新版路径
+    // 搜索 XDG_CONFIG_HOME/lazygit/ 和 XDG_CONFIG_DIRS
+    configFilepath, err := xdg.SearchConfigFile(
+        filepath.Join("lazygit", filename))
+    if err == nil {
+        return true, configFilepath
+    }
+
+    // 优先级4：默认路径（不检查是否存在）
+    return false, filepath.Join(xdg.ConfigHome, "lazygit", filename)
+}
+```
+
+**配置文件路径查找优先级（从高到低）：**
+
+| 优先级 | 查找路径 | 环境变量/说明 |
+|--------|----------|---------------|
+| 1 | `$CONFIG_DIR/config.yml` | `CONFIG_DIR` 环境变量指定的目录 |
+| 2 | `$XDG_CONFIG_HOME/jesseduffield/lazygit/config.yml` | 旧版路径，向后兼容 |
+| 3 | `$XDG_CONFIG_HOME/lazygit/config.yml` | 新版标准路径 |
+| 4 | 同上（默认路径，不检查存在性） | 以上都找不到时返回此路径用于创建 |
+
+### 2.5 环境变量汇总
+
+| 环境变量 | 用途 | 代码位置 |
+|----------|------|----------|
+| `LG_CONFIG_FILE` | 自定义配置文件路径（逗号分隔多个），存在时跳过默认路径 | [app_config.go#L87-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L87-L93) |
+| `CONFIG_DIR` | 指定配置目录，存在时跳过 XDG 路径查找 | [app_config.go#L591-L593](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L591-L593) |
+| `LAZYGIT_LOG_PATH` | 指定日志文件路径 | [app_config.go#L732-L738](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L732-L738) |
+
+### 2.6 ConfigFilePolicy 文件策略
+
+[app_config.go#L56-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L56-L62)
+
+```go
+const (
+    ConfigFilePolicyCreateIfMissing ConfigFilePolicy = iota  // 0：不存在则创建空文件
+    ConfigFilePolicyErrorIfMissing                          // 1：不存在则报错返回
+    ConfigFilePolicySkipIfMissing                          // 2：不存在则跳过
+)
 ```
 
 ---
 
-## 四、默认值设置流程
+## 三、配置加载与合并（代码级）
 
-### 4.1 优先级 1：平台默认配置（运行时回退）
+### 3.1 loadUserConfigWithDefaults 入口
 
-**重要**：平台默认配置**不是**在配置加载时合并的，而是在**运行时实际使用时**才会检查并回退。
+[app_config.go#L139-L141](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L139-L141)
 
-不同平台有不同的默认配置，由 `GetPlatformDefaultConfig()` 返回：
+```go
+func loadUserConfigWithDefaults(configFiles []*ConfigFile, isGuiInitialized bool) (*UserConfig, error) {
+    return loadUserConfig(configFiles, GetDefaultConfigForPlatform(runtime.GOOS), isGuiInitialized)
+}
+```
 
-| 平台 | 文件 | 主要默认值 |
-|------|------|------------|
-| Windows | [config_windows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_windows.go) | `open: start "" {{filename}}` |
-| Linux | [config_linux.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_linux.go) | `open: xdg-open {{filename}} >/dev/null` |
-| macOS/其他 | [config_default_platform.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_default_platform.go) | `open: open -- {{filename}}` |
+**关键点**：先调用 `GetDefaultConfigForPlatform()` 获得通用默认值作为 `base`，再传入 `loadUserConfig`。
 
-**运行时使用逻辑**（以打开文件为例）[os.go#L83-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L83-L93)：
+### 3.2 loadUserConfig 合并核心算法
+
+[app_config.go#L143-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L143-L208)
+
+```go
+func loadUserConfig(configFiles []*ConfigFile, base *UserConfig, isGuiInitialized bool) (*UserConfig, error) {
+    // 按顺序遍历每个配置文件（后加载的优先级更高）
+    for _, configFile := range configFiles {
+        path := configFile.Path
+
+        // 步骤1：处理文件不存在的情况
+        statInfo, err := os.Stat(path)
+        if err != nil {
+            if os.IsNotExist(err) {
+                switch configFile.Policy {
+                case ConfigFilePolicyErrorIfMissing:
+                    return nil, err                          // 报错
+                case ConfigFilePolicySkipIfMissing:
+                    continue                                  // 跳过
+                case ConfigFilePolicyCreateIfMissing:
+                    os.Create(path)                           // 创建空文件
+                }
+            }
+        }
+
+        // 步骤2：读取文件内容
+        content, err := os.ReadFile(path)
+
+        // 步骤3：配置迁移（旧格式 → 新格式）
+        content, err = migrateUserConfig(path, content, isGuiInitialized)
+
+        // 步骤4：保存当前 base 中的 CustomCommands
+        existingCustomCommands := base.CustomCommands
+
+        // 步骤5：YAML 反序列化 → 覆盖 base 中对应字段
+        // 注意：yaml.Unmarshal 会覆盖已定义的字段，未定义的字段保持不变
+        if err := yaml.Unmarshal(content, base); err != nil {
+            return nil, fmt.Errorf(...)
+        }
+
+        // 步骤6：CustomCommands 特殊处理 —— 追加而非覆盖
+        // 先保存旧的，Unmarshal 会用新的覆盖，然后把旧的追加到后面
+        base.CustomCommands = append(base.CustomCommands, existingCustomCommands...)
+
+        // 步骤7：配置验证
+        if err := base.Validate(); err != nil {
+            return nil, fmt.Errorf(...)
+        }
+    }
+
+    // 步骤8：合并遗留的 Alt 按键绑定
+    base.Keybinding.MergeLegacyAltKeybindings()
+
+    return base, nil
+}
+```
+
+**合并算法图解：**
+
+```
+base (通用默认值)
+   │
+   ├─→ configFile_1.yml
+   │     ├─→ yaml.Unmarshal(content_1, base)
+   │     │     覆盖 base 中 content_1 定义的字段
+   │     │
+   │     └─→ CustomCommands 追加：base.CustomCommands + existingCustomCommands
+   │
+   ├─→ configFile_2.yml
+   │     ├─→ yaml.Unmarshal(content_2, base)
+   │     │     覆盖 base 中 content_2 定义的字段
+   │     │
+   │     └─→ CustomCommands 追加：...
+   │
+   ...  (更多配置文件)
+   │
+   └─→ MergeLegacyAltKeybindings()
+         合并遗留按键绑定
+```
+
+### 3.3 通用默认值：GetDefaultConfigForPlatform
+
+[user_config.go#L827-L949](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config.go#L827-L949)
+
+```go
+func GetDefaultConfigForPlatform(platform string) *UserConfig {
+    return &UserConfig{
+        Gui: GuiConfig{
+            ScrollHeight:             2,
+            ScrollPastBottom:         true,
+            // ... GUI 默认值
+        },
+        Git: GitConfig{
+            AutoFetch:   true,
+            AutoRefresh: true,
+            // ... Git 默认值
+        },
+        Keybinding: KeybindingConfig{
+            Universal: KeybindingUniversalConfig{
+                Quit: Keybinding{"q"},
+                // ... 按键绑定默认值
+            },
+            // ...
+        },
+        // ... 其他配置
+        OS: OSConfig{},  // ⚠️ 重要：OS 字段初始化为空结构体
+                         // 平台相关的 OS 默认值在运行时动态回退
+    }
+}
+```
+
+### 3.4 CustomCommands 追加规则详解
+
+[app_config.go#L193-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L193-L199)
+
+```go
+existingCustomCommands := base.CustomCommands  // 保存之前的
+yaml.Unmarshal(content, base)                  // 新配置覆盖 base（包括 CustomCommands）
+base.CustomCommands = append(base.CustomCommands, existingCustomCommands...)
+```
+
+**举例：**
+- 全局配置定义了命令 A、B
+- 仓库配置定义了命令 C、D
+- 结果顺序：C, D, A, B（仓库配置在前，全局配置在后）
+
+**设计意图**：后加载的配置文件（优先级更高）的命令排在前面。
+
+---
+
+## 四、运行时回退（空值回退）完整链路
+
+> **核心概念**：配置系统有两种优先级机制——**加载时覆盖**和**运行时回退**。OS 相关配置（打开文件、编辑器、剪贴板）是在运行时根据空值动态回退的，不是在加载时合并的。
+
+### 4.1 回退机制总览
+
+| 配置项 | 用户配置字段 | 回退触发条件 | 回退逻辑位置 |
+|--------|-------------|-------------|-------------|
+| 打开文件 | `os.open` | 字段为空字符串 | [os.go#L83-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L83-L93) |
+| 打开链接 | `os.openLink` | 字段为空字符串 | [os.go#L95-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L95-L106) |
+| 编辑文件 | `os.edit` / `os.editPreset` | 字段为空字符串 | [editor_presets.go#L8-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L8-L16) |
+| 剪贴板写入 | `os.copyToClipboardCmd` | 字段为空字符串 | [os.go#L269-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L269-L288) |
+| 剪贴板读取 | `os.readFromClipboardCmd` | `copyToClipboardCmd` 为空 | [os.go#L290-L305](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L290-L305) |
+
+### 4.2 打开文件/链接回退链路
+
+#### 代码实现：[os.go#L83-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L83-L106)
 
 ```go
 func (c *OSCommand) OpenFile(filename string) error {
-    commandTemplate := c.UserConfig().OS.Open  // 先从用户配置获取
+    // 步骤1：从用户配置获取
+    commandTemplate := c.UserConfig().OS.Open
+    // 步骤2：如果为空，运行时回退到平台默认值
     if commandTemplate == "" {
-        // 用户未配置时，运行时回退到平台默认值
         commandTemplate = config.GetPlatformDefaultConfig().Open
+    }
+    // 步骤3：替换占位符并执行
+    command := utils.ResolvePlaceholderString(commandTemplate, templateValues)
+    return c.Cmd.NewShell(command, ...).Run()
+}
+
+func (c *OSCommand) OpenLink(link string) error {
+    commandTemplate := c.UserConfig().OS.OpenLink
+    if commandTemplate == "" {
+        commandTemplate = config.GetPlatformDefaultConfig().OpenLink
     }
     // ...
 }
 ```
 
-**注意**：
-1. Linux 还会检测 WSL 环境，使用不同的命令
-2. 在 `GetDefaultConfigForPlatform()` 中，`OS` 字段被初始化为空 `OSConfig{}`
+#### 平台默认值实现
 
-### 4.2 优先级 2：通用默认配置
-
-[GetDefaultConfigForPlatform](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config.go#L827-L1148) 函数返回完整的默认配置，包括：
-
-- **GUI 配置**：滚动高度、主题颜色、语言设置等
-- **Git 配置**：提交设置、合并设置、日志格式等
-- **按键绑定**：所有默认快捷键
-- **刷新配置**：刷新间隔、获取间隔
-- **更新配置**：更新方法、检查周期
-
-示例默认值：
+**Windows**：[config_windows.go#L4-L8](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_windows.go#L4-L8)
 ```go
-Gui: GuiConfig{
-    ScrollHeight:      2,
-    ScrollPastBottom:  true,
-    ScrollOffMargin:   2,
-    TabWidth:          4,
-    MouseEvents:       true,
-    Language:          "auto",
-    Theme: ThemeConfig{
-        ActiveBorderColor: []string{"green", "bold"},
-        // ... 更多颜色配置
-    },
-    // ... 更多 GUI 配置
-},
-Git: GitConfig{
-    AutoFetch:   true,
-    AutoRefresh: true,
-    MainBranches: []string{"master", "main"},
-    // ... 更多 Git 配置
-},
-Keybinding: KeybindingConfig{
-    Universal: KeybindingUniversalConfig{
-        Quit: Keybinding{"q"},
-        // ... 所有默认快捷键
-    },
-    // ... 更多按键绑定
-}
-```
-
----
-
-## 五、配置合并核心逻辑
-
-### 5.1 loadUserConfig 合并算法
-
-[loadUserConfig](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L143-L208) 是配置合并的核心函数，其工作原理：
-
-```go
-func loadUserConfig(configFiles []*ConfigFile, base *UserConfig, isGuiInitialized bool) (*UserConfig, error) {
-    for _, configFile := range configFiles {
-        // 1. 读取文件
-        content, err := os.ReadFile(path)
-        
-        // 2. 配置迁移（向后兼容）
-        content, err = migrateUserConfig(path, content, isGuiInitialized)
-        
-        // 3. 关键：保存现有 CustomCommands
-        existingCustomCommands := base.CustomCommands
-        
-        // 4. YAML 反序列化到 base（覆盖已有字段）
-        yaml.Unmarshal(content, base)
-        
-        // 5. 特殊处理：CustomCommands 追加而非覆盖
-        base.CustomCommands = append(base.CustomCommands, existingCustomCommands...)
-        
-        // 6. 验证配置
-        base.Validate()
+func GetPlatformDefaultConfig() OSConfig {
+    return OSConfig{
+        Open:     `start "" {{filename}}`,
+        OpenLink: `start "" {{link}}`,
     }
-    
-    // 7. 合并遗留 Alt 按键绑定
-    base.Keybinding.MergeLegacyAltKeybindings()
-    
-    return base
 }
 ```
 
-**关键点解读**：
-
-1. **`base` 参数是已经包含默认值的配置对象
-2. **`yaml.Unmarshal(content, base)` 会覆盖 base 中与 YAML 文件定义的字段**，未定义的字段保持默认值
-3. **CustomCommands 是个例外：它会**追加**而不是覆盖
-
-### 5.2 特殊合并规则
-
-#### 5.2.1 CustomCommands 追加规则
-
-[app_config.go#L193-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L193-L199)
-
+**Linux**：[config_linux.go#L21-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_linux.go#L21-L33)
 ```go
-existingCustomCommands := base.CustomCommands
-yaml.Unmarshal(content, base)
-base.CustomCommands = append(base.CustomCommands, existingCustomCommands...)
-```
-
-**为什么这样设计？
-
-- 先保存 base（默认值或前一个配置文件的 CustomCommands
-- Unmarshal 会用当前文件的 CustomCommands 覆盖 base.CustomCommands
-- 然后把之前的 CustomCommands 追加到后面
-- **结果**：后面的配置文件的 CustomCommands 在前，之前的在后
-
-#### 5.2.2 遗留 Alt 按键合并
-
-[MergeLegacyAltKeybindings](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config.go#L803-L819)
-
-```go
-func (c *KeybindingConfig) MergeLegacyAltKeybindings() {
-    mergeLegacyAlt(&c.Universal.Quit, c.Universal.QuitAlt1)
-    mergeLegacyAlt(&c.Universal.PrevItem, c.Universal.PrevItemAlt)
-    // ... 更多合并
+func GetPlatformDefaultConfig() OSConfig {
+    if isWSL() && !isContainer() {
+        return OSConfig{
+            Open:     `powershell.exe start explorer.exe "$(wslpath -w {{filename}})" >/dev/null`,
+            OpenLink: `powershell.exe start '{{link}}' >/dev/null`,
+        }
+    }
+    return OSConfig{
+        Open:     `xdg-open {{filename}} >/dev/null`,
+        OpenLink: `xdg-open {{link}} >/dev/null`,
+    }
 }
 ```
 
-**目的**：将废弃的 `*Alt*` 字段合并到主字段，保持向后兼容。
+**macOS/其他**：[config_default_platform.go#L6-L10](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/config_default_platform.go#L6-L10)
+```go
+func GetPlatformDefaultConfig() OSConfig {
+    return OSConfig{
+        Open:     "open -- {{filename}}",
+        OpenLink: "open {{link}}",
+    }
+}
+```
+
+**打开文件回退优先级：**
+
+```
+优先级1：用户配置 os.open
+    ↓ （为空时）
+优先级2：GetPlatformDefaultConfig().Open
+         ├─ Windows: start "" {{filename}}
+         ├─ Linux(WSL): powershell.exe start explorer.exe ...
+         ├─ Linux: xdg-open {{filename}} >/dev/null
+         └─ macOS: open -- {{filename}}
+```
+
+### 4.3 编辑器回退链路
+
+#### 调用入口：[file.go#L32-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/git_commands/file.go#L32-L77)
+
+```go
+func (self *FileCommands) GetEditCmdStr(filenames []string) (string, bool) {
+    // 传入：shell类型、用户OS配置、默认编辑器猜测函数
+    template, suspend := config.GetEditTemplate(
+        self.os.Platform.Shell,
+        &self.UserConfig().OS,
+        self.guessDefaultEditor,
+    )
+    // ...
+}
+```
+
+#### 默认编辑器自动检测：[file.go#L79-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/git_commands/file.go#L79-L100)
+
+```go
+func (self *FileCommands) guessDefaultEditor() string {
+    // 按优先级检测编辑器环境变量
+    editor := self.config.GetCoreEditor()  // git config core.editor
+    if editor == "" {
+        editor = self.os.Getenv("GIT_EDITOR")
+    }
+    if editor == "" {
+        editor = self.os.Getenv("VISUAL")
+    }
+    if editor == "" {
+        editor = self.os.Getenv("EDITOR")
+    }
+    // 取第一个空格前的部分作为编辑器名称
+    if editor != "" {
+        editor = strings.Split(editor, " ")[0]
+    }
+    return editor
+}
+```
+
+#### GetEditTemplate 回退逻辑：[editor_presets.go#L8-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L8-L16)
+
+```go
+func GetEditTemplate(shell string, osConfig *OSConfig, guessDefaultEditor func() string) (string, bool) {
+    preset := getPreset(shell, osConfig, guessDefaultEditor)
+    template := osConfig.Edit              // 步骤1：用户配置 os.edit
+    if template == "" {
+        template = preset.editTemplate     // 步骤2：用户未配置，使用预设模板
+    }
+    return template, getEditInTerminal(osConfig, preset)
+}
+```
+
+#### getPreset 预设选择：[editor_presets.go#L56-L181](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L56-L181)
+
+```go
+func getPreset(shell string, osConfig *OSConfig, guessDefaultEditor func() string) *editPreset {
+    // 预设映射表：vim, nvim, vscode, sublime, emacs, nano, helix, etc.
+    presets := map[string]*editPreset{...}
+
+    // 步骤1：用户显式指定的 os.editPreset
+    presetName := osConfig.EditPreset
+
+    // 步骤2：用户未指定 → 自动检测默认编辑器
+    if presetName == "" {
+        defaultEditor := guessDefaultEditor()
+        if presets[defaultEditor] != nil {
+            presetName = defaultEditor
+        } else if p := editorToPreset[defaultEditor]; p != "" {
+            presetName = p
+        }
+    }
+
+    // 步骤3：都没有 → 最终回退到 vim
+    if presetName == "" || presets[presetName] == nil {
+        presetName = "vim"
+    }
+
+    return presets[presetName]
+}
+```
+
+#### SuspendOnEdit 回退：[editor_presets.go#L193-L198](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L193-L198)
+
+```go
+func getEditInTerminal(osConfig *OSConfig, preset *editPreset) bool {
+    // 用户显式设置 → 使用用户值
+    if osConfig.SuspendOnEdit != nil {
+        return *osConfig.SuspendOnEdit
+    }
+    // 否则使用预设的 suspend() 函数
+    return preset.suspend()
+}
+```
+
+**编辑器回退完整优先级：**
+
+```
+编辑命令模板：
+  优先级1：用户配置 os.edit
+      ↓ （为空时）
+  优先级2：os.editPreset 对应的预设模板
+      ↓ （未设置时）
+  优先级3：自动检测编辑器
+      │    ├─ git config core.editor
+      │    ├─ $GIT_EDITOR
+      │    ├─ $VISUAL
+      │    └─ $EDITOR
+      ↓ （都没找到）
+  优先级4：vim 预设模板（最终回退）
+
+是否挂起终端：
+  优先级1：用户配置 os.editInTerminal (SuspendOnEdit)
+      ↓ （为 nil 时）
+  优先级2：预设的 suspend() 函数返回值
+```
+
+### 4.4 剪贴板回退链路
+
+#### 代码实现：[os.go#L269-L305](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L269-L305)
+
+```go
+func (c *OSCommand) CopyToClipboard(str string) error {
+    // 用户配置了自定义命令 → 使用用户命令
+    if c.UserConfig().OS.CopyToClipboardCmd != "" {
+        cmdStr := utils.ResolvePlaceholderString(
+            c.UserConfig().OS.CopyToClipboardCmd,
+            map[string]string{"text": c.Cmd.Quote(str)},
+        )
+        return c.Cmd.NewShell(cmdStr, ...).Run()
+    }
+    // 否则 → 回退到第三方库 atotto/clipboard
+    return clipboard.WriteAll(str)
+}
+
+func (c *OSCommand) PasteFromClipboard() (string, error) {
+    var s string
+    var err error
+    // 注意：这里检查的是 CopyToClipboardCmd，不是 ReadFromClipboardCmd
+    if c.UserConfig().OS.CopyToClipboardCmd != "" {
+        cmdStr := c.UserConfig().OS.ReadFromClipboardCmd
+        s, err = c.Cmd.NewShell(cmdStr, ...).RunWithOutput()
+    } else {
+        s, err = clipboard.ReadAll()  // 回退到库
+    }
+    // ...
+}
+```
+
+**剪贴板回退优先级：**
+
+```
+写入剪贴板：
+  优先级1：用户配置 os.copyToClipboardCmd
+      ↓ （为空时）
+  优先级2：github.com/atotto/clipboard 库
+
+读取剪贴板：
+  优先级1：os.copyToClipboardCmd 非空时，使用 os.readFromClipboardCmd
+      ↓ （copyToClipboardCmd 为空时）
+  优先级2：github.com/atotto/clipboard 库
+```
 
 ---
 
-## 六、配置迁移（向后兼容）
+## 五、仓库级配置加载
 
-### 6.1 migrateUserConfig
+### 5.1 ReloadUserConfigForRepo
 
-[migrateUserConfig](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L220-L254) 函数处理配置格式的迁移，确保旧版本配置能在新版本中正常工作。
-
-### 6.2 当前迁移规则：
-
-| 旧配置路径 | 新配置键名 | 说明 |
-|-----------|------------|------|
-| `gui.skipUnstageLineWarning` | `skipDiscardChangeWarning` | 重命名 |
-| `keybinding.universal.executeCustomCommand` | `executeShellCommand` | 重命名 |
-| `gui.windowSize` | `screenMode` | 重命名 |
-| `keybinding.files.openMergeTool` | `openMergeOptions` | 重命名 |
-| `null` 按键绑定 | `<disabled>` | 规范化 |
-| `git.commitPrefix` | 数组格式 | 类型转换 |
-| `git.allBranchesLogCmd` | `git.allBranchesLogCmds` | 单值转数组 |
-| `git.paging` | `git.pagers` | 对象转数组 |
-| `customCommand.subprocess` | `customCommand.output` | 字段重构 |
-
----
-
-## 七、多配置文件加载
-
-### 7.1 全局配置 + 仓库级配置
-
-[ReloadUserConfigForRepo](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L548-L558)
+[app_config.go#L548-L558](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L548-L558)
 
 ```go
 func (c *AppConfig) ReloadUserConfigForRepo(repoConfigFiles []*ConfigFile) error {
-    // 全局配置 + 仓库配置
+    // 拼接：全局配置文件 + 仓库级配置文件
+    // 仓库级追加在后面 → 优先级更高
     configFiles := append(c.globalUserConfigFiles, repoConfigFiles...)
     userConfig, err := loadUserConfigWithDefaults(configFiles, true)
-    
+
     c.userConfig = userConfig
     c.userConfigFiles = configFiles
     return nil
 }
 ```
 
-**优先级**：仓库级配置文件会**追加**在全局配置文件**之后**，因此仓库级配置优先级更高。
-
-### 7.2 配置文件策略
-
-[ConfigFilePolicy](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L56-L62)
-
-```go
-const (
-    ConfigFilePolicyCreateIfMissing ConfigFilePolicy = iota  // 不存在则创建
-    ConfigFilePolicyErrorIfMissing                          // 不存在则报错
-    ConfigFilePolicySkipIfMissing                          // 不存在则跳过
-)
-```
+**优先级**：仓库级配置 > 全局配置（因为追加在后面，后加载覆盖先加载）
 
 ---
 
-## 八、运行时使用链路
+## 六、运行时配置重载
 
-### 8.1 配置访问方式
+### 6.1 ReloadChangedUserConfigFiles
 
-配置通过 `AppConfigurer` 接口访问：
-
-```go
-type AppConfigurer interface {
-    GetDebug() bool
-    GetUserConfig() *UserConfig
-    GetUserConfigPaths() []string
-    GetUserConfigDir() string
-    ReloadUserConfigForRepo(repoConfigFiles []*ConfigFile) error
-    ReloadChangedUserConfigFiles() (error, bool)
-    GetTempDir() string
-    GetAppState() *AppState
-    SaveAppState() error
-}
-```
-
-### 8.2 运行时重载
-
-[ReloadChangedUserConfigFiles](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L560-L582)
+[app_config.go#L560-L582](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L560-L582)
 
 ```go
 func (c *AppConfig) ReloadChangedUserConfigFiles() (error, bool) {
-    // 检查文件是否变化
+    // 检查每个配置文件是否变化（存在性或修改时间）
     fileHasChanged := func(f *ConfigFile) bool {
         info, err := os.Stat(f.Path)
-        // 检查存在性和修改时间
+        exists := err == nil
         return exists != f.exists || (exists && info.ModTime() != f.modDate)
     }
-    
-    // 如果有文件变化，重新加载
+
     if lo.NoneBy(c.userConfigFiles, fileHasChanged) {
-        return nil, false
+        return nil, false  // 无变化
     }
-    
+
+    // 有变化 → 重新加载所有配置文件
     userConfig, err := loadUserConfigWithDefaults(c.userConfigFiles, true)
     c.userConfig = userConfig
     return nil, true
 }
 ```
 
-**用途**：运行时检测配置文件变化并自动重新加载。
+---
 
-### 8.3 编辑器预设动态解析（运行时回退）
+## 七、完整优先级总结
 
-编辑器配置和平台默认配置一样，不是在加载时合并的，而是在**运行时动态解析和回退**：
+### 7.1 配置加载时优先级（从低到高）
 
-[editor_presets.go#L8-L16](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L8-L16)
-
-```go
-func GetEditTemplate(shell string, osConfig *OSConfig, guessDefaultEditor func() string) (string, bool) {
-    preset := getPreset(shell, osConfig, guessDefaultEditor)
-    template := osConfig.Edit
-    if template == "" {
-        template = preset.editTemplate  // 用户未配置时使用预设
-    }
-    return template, getEditInTerminal(osConfig, preset)
-}
+```
+优先级1 (最低)
+    ↓
+通用默认配置 (GetDefaultConfigForPlatform)
+    │  - GUI、Git、Keybinding 等所有非 OS 字段
+    │  - OS 字段初始化为空结构体 OSConfig{}
+    ↓
+优先级2
+    ↓
+全局用户配置文件 (~/.config/lazygit/config.yml)
+    │  - yaml.Unmarshal 覆盖通用默认值
+    ↓
+优先级3
+    ↓
+环境变量 LG_CONFIG_FILE 指定的配置文件
+    │  - 多个文件用逗号分隔，按顺序加载
+    │  - Policy=ErrorIfMissing
+    ↓
+优先级4
+    ↓
+仓库级配置文件
+    │  - 通过 ReloadUserConfigForRepo 追加加载
+    │  - Policy=通常为 SkipIfMissing
+    ↓
+优先级5 (最高)
+    ↓
+运行时直接赋值修改 (测试中常用)
 ```
 
-**优先级（运行时）**：
-1. 用户在 `os.edit` 配置
-2. 用户指定的 `os.editPreset` 预设
-3. 自动检测的默认编辑器预设
-4. 最终回退到 `vim` 预设
+### 7.2 运行时回退优先级（从低到高，仅空值时触发）
 
-### 8.4 运行时回退机制总结
-
-有三类配置是在运行时动态回退的，不是在加载时合并的：
-
-| 配置类型 | 触发条件 | 回退逻辑位置 |
-|----------|----------|--------------|
-| 平台默认配置（打开文件、链接） | `os.open` 或 `os.openLink` 为空 | [os.go#L83-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L83-L106) |
-| 编辑器命令模板 | `os.edit` 等为空 | [editor_presets.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go) |
-| 编辑器是否挂起 | `os.editInTerminal` 未设置 | [editor_presets.go#L193-L198](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go#L193-L198) |
-
----
-
-## 九、配置验证
-
-加载完成后，[Validate](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/user_config_validation.go#L16-L62) 函数会验证配置的正确性：
-
-```go
-func (config *UserConfig) Validate() error {
-    validateEnum("gui.statusPanelView", config.Gui.StatusPanelView, []string{"dashboard", "allBranchesLog"})
-    validatePagers(config.Git.Pagers)
-    validateKeybindings(config.Keybinding)
-    validateCustomCommands(config.CustomCommands)
-    validateSpinner(config.Gui.Spinner)
-    return nil
-}
+**打开文件/链接：**
+```
+优先级1：用户配置 os.open / os.openLink
+    ↓ （为空）
+优先级2：GetPlatformDefaultConfig() (Windows/Linux/macOS)
 ```
 
-验证内容包括：
-- 枚举值合法性
-- 分页器配置互斥性
-- 按键绑定有效性
-- 自定义命令格式
-- Spinner 动画帧一致性
+**编辑器：**
+```
+优先级1：用户配置 os.edit / os.editAtLine / ...
+    ↓ （为空）
+优先级2：用户配置 os.editPreset 对应的预设模板
+    ↓ （未设置）
+优先级3：自动检测：git core.editor → $GIT_EDITOR → $VISUAL → $EDITOR
+    ↓ （都未设置）
+优先级4：vim 预设（最终回退）
+```
+
+**剪贴板：**
+```
+优先级1：用户配置 os.copyToClipboardCmd / os.readFromClipboardCmd
+    ↓ （为空）
+优先级2：atotto/clipboard 第三方库
+```
+
+### 7.3 两种优先级机制对比
+
+| 特性 | 加载时覆盖 | 运行时回退 |
+|------|-----------|-----------|
+| 触发时机 | 应用启动 / 配置重载时 | 实际使用配置时 |
+| 实现方式 | `yaml.Unmarshal()` 覆盖结构体字段 | 检查字段是否为空，为空则动态替换 |
+| 是否持久 | 加载完成后固定（直到下次重载） | 每次使用时动态计算 |
+| 影响范围 | 所有配置字段 | 仅 OS 相关字段（open/edit/clipboard） |
+| 代码位置 | [loadUserConfig](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L143-L208) | [os.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go) / [editor_presets.go](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/editor_presets.go) |
 
 ---
 
-## 十、完整优先级总结表
+## 八、关键设计决策与原因
 
-### 10.1 配置加载时优先级（从低到高）
+### 8.1 为什么 OS 配置运行时回退而非加载时合并？
 
-| 层级 | 来源 | 覆盖方式 | 特殊规则 |
-|------|------|----------|----------|
-| 1 (最低) | 通用默认配置 | `GetDefaultConfigForPlatform()` | 完整默认值，OS 字段初始化为空 |
-| 2 | 全局用户配置 | `yaml.Unmarshal()` | 覆盖默认值 |
-| 3 | 环境变量配置文件 | `yaml.Unmarshal()` | 覆盖全局配置 |
-| 4 | 仓库级配置 | `yaml.Unmarshal()` | 覆盖全局配置 |
-| 5 (最高) | 运行时修改 | 直接赋值 | 动态生效 |
+**原因**：
+1. **动态环境检测**：Linux 需要检测 WSL、容器环境，这些在加载时可能不准确或需要运行时上下文
+2. **跨平台兼容**：同一份配置文件在不同平台运行，平台差异由运行时处理
+3. **编辑器检测**：编辑器预设需要根据当前 shell 类型（bash/fish/nu）和系统环境变量动态选择模板
+4. **第三方库依赖**：剪贴板使用第三方库，只有在用户未配置时才使用库
 
-### 10.2 运行时回退优先级（从低到高，仅当配置为空时触发）
+### 8.2 为什么 CustomCommands 追加而非覆盖？
 
-| 配置类型 | 优先级 | 回退来源 |
-|----------|--------|----------|
-| **打开文件命令** | 1 (最低) | 用户配置 `os.open` |
-| | 2 (最高) | 平台默认配置 `GetPlatformDefaultConfig().Open` |
-| **打开链接命令** | 1 (最低) | 用户配置 `os.openLink` |
-| | 2 (最高) | 平台默认配置 `GetPlatformDefaultConfig().OpenLink` |
-| **编辑器命令** | 1 (最低) | 用户配置 `os.edit` |
-| | 2 | 用户指定的 `os.editPreset` 预设 |
-| | 3 | 自动检测的默认编辑器预设 |
-| | 4 (最高) | 回退到 `vim` 预设 |
+**原因**：支持"全局通用命令 + 仓库特定命令"的使用场景，两者共存不丢失。
 
-### 10.3 两种优先级机制的区别
+### 8.3 为什么使用 yaml.Unmarshal 进行覆盖？
 
-| 特性 | 配置加载时覆盖 | 运行时回退 |
-|------|----------------|------------|
-| 时机 | 应用启动/重载配置时 | 实际使用配置时 |
-| 方式 | `yaml.Unmarshal()` 覆盖字段 | 检查空值并动态替换 |
-| 可感知 | 配置加载完成后即固定 | 每次使用时动态计算 |
-| 影响范围 | 所有配置字段 | 仅 OS 相关配置字段 |
-| 代码位置 | [app_config.go#L143-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L143-L208) | [os.go#L83-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/commands/oscommands/os.go#L83-L106) |
+**原因**：
+- 简单高效：利用 yaml 库自动处理零值和部分配置
+- 未定义的字段自动保持默认值
+- 符合 YAML 用户的预期（部分定义，其余默认）
+
+**缺点**：切片类型默认会被完全覆盖，所以 CustomCommands 需要特殊处理。
 
 ---
 
-## 十一、关键设计决策
+## 九、常见问题（代码级解答）
 
-### 11.1 为什么使用 yaml.Unmarshal 进行合并？
+**Q: LG_CONFIG_FILE 和 CONFIG_DIR 有什么区别？**
+A: `LG_CONFIG_FILE` 直接指定**配置文件**路径（可多个），存在时完全跳过默认路径查找；`CONFIG_DIR` 指定**配置目录**，在该目录下查找 config.yml。`LG_CONFIG_FILE` 优先级更高。
 
-**优点**：
-- 简单高效，利用 yaml 库自动处理零值
-- 未定义的字段保持默认值
-- 支持部分配置
+**Q: 为什么 GetDefaultConfigForPlatform() 中 OS 是空结构体？**
+A: 这是设计有意为之。OS 配置（open/editor/clipboard）在运行时根据实际环境动态回退，加载时不设置默认值。
 
-**缺点**：
-- 切片类型会被完全覆盖（CustomCommands 除外）
-- 需要特殊处理追加逻辑
+**Q: 配置文件加载顺序影响优先级吗？**
+A: 影响。后面加载的配置文件优先级更高，会覆盖前面加载的同名配置（CustomCommands 除外，是追加）。
 
-### 11.2 为什么 CustomCommands 要追加？
+**Q: 如何强制让 lazygit 只使用我的命令，不回退？**
+A: 在配置文件中显式设置对应字段（即使是空字符串也不会触发回退，但空字符串可能导致命令执行失败）。
 
-**设计意图**：
-- 允许用户在全局配置定义通用命令
-- 仓库级配置可以添加仓库特定命令
-- 两者都可用，不互相覆盖
+**Q: PasteFromClipboard 为什么检查的是 CopyToClipboardCmd 而不是 ReadFromClipboardCmd？**
+A: 这是一个实现细节。代码假设如果用户配置了自定义剪贴板写入命令，那么也需要自定义读取命令；否则就统一使用第三方库。
 
-### 11.3 为什么 OS 相关配置要运行时回退，而不是加载时合并？
-
-**设计意图**：
-1. **灵活性**：支持根据当前环境动态调整（如检测 WSL、容器环境）
-2. **跨平台兼容性**：同一份配置文件可以在不同平台使用，平台差异由运行时处理
-3. **编辑器检测**：编辑器预设需要根据当前 shell 类型和系统默认编辑器动态选择
-4. **性能优化**：只在实际使用时才计算，避免不必要的初始化开销
-
-### 11.4 为什么编辑器预设运行时解析？
-
-**设计意图**：
-- 支持根据当前 shell 类型动态选择命令模板
-- 支持自动检测系统默认编辑器
-- 更灵活的环境适配
-
----
-
-## 十二、常见问题
-
-**Q: 我在全局配置和仓库配置都定义了 gui.theme，哪个生效？**
-A: 仓库配置的优先级更高，会覆盖全局配置。
-
-**Q: 我在全局配置定义了 customCommands，仓库配置也定义了，会怎样？**
-A: 两者都会生效，仓库配置的命令在前，全局配置的命令在后。
-
-**Q: 为什么我修改了配置文件，lazygit 会自动重新加载吗？**
-A: 会的，`ReloadChangedUserConfigFiles()` 会检测文件变化并自动重新加载。
-
-**Q: 平台默认配置和通用默认配置有什么区别？**
-A: 平台默认配置只包含 OS 相关的配置（如打开文件命令），且是在运行时动态回退的；通用默认配置包含所有其他默认值，在配置加载时设置。
-
-**Q: 如何指定多个配置文件？**
-A: 通过 `LG_CONFIG_FILE` 环境变量，用逗号分隔多个路径。
-
-**Q: 我在配置文件中设置了 `os.open`，为什么在另一台电脑上不生效？**
-A: 可能是因为该电脑使用不同操作系统，而你的配置文件中 `os.open` 是空的，这时候会自动回退到该平台的默认值。
-
-**Q: 为什么 GetDefaultConfigForPlatform 中的 OS 字段是空的？**
-A: 这是设计有意为之的。OS 相关配置（打开文件、编辑器等）是在运行时根据实际环境动态回退的，而不是在加载时固化。
-
-**Q: 配置加载时合并和运行时回退有什么本质区别？**
-A: 加载时合并是 `yaml.Unmarshal()` 直接覆盖结构体字段，一旦加载完成就固定了；运行时回退是每次使用时检查字段是否为空，为空则动态替换为默认值。
-
-**Q: 如果我想强制使用某个平台的打开文件命令，怎么办？**
-A: 在配置文件中显式设置 `os.open` 和 `os.openLink`，这样就不会触发运行时回退逻辑。
-
-**Q: 为什么 CustomCommands 要特殊处理为追加而不是覆盖？**
-A: 这是为了支持全局通用命令和仓库特定命令共存。如果是覆盖的话，仓库级配置会丢失全局配置的自定义命令。
-
-**Q: 如何禁用运行时回退，只使用我配置的值？**
-A: 只要在配置文件中显式设置了对应字段（即使设置为空字符串），就不会触发回退逻辑。但要注意有些功能可能需要非空值才能正常工作。
+**Q: 多个配置文件中的 CustomCommands 顺序是怎样的？**
+A: 后加载文件的命令在前，先加载文件的命令在后。例如：全局[A,B] + 仓库[C,D] → 结果顺序是 [C,D,A,B]。
