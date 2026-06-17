@@ -432,20 +432,20 @@ Layer 5: 实际执行层   cmdObjRunner（RunWithOutputAux / runAndStream）
 func (self *HandlerCreator) finalHandler(...) error {
     // 1. 最后一次模板解析 —— 得到真正要执行的命令字符串
     cmdStr, err := resolveTemplate(customCommand.Command)
-    
+
     // 2. 构建命令对象（委托给 Layer 3）
     cmdObj := self.c.OS().Cmd.NewShell(cmdStr, ...)
-    
+
     // 3. 战略分支：根据 output 决定走哪条 GUI 包装路径
     if customCommand.Output == "terminal" {
         // 分支 A：需要真实终端交互 —— 走 RunSubprocessAndRefresh（Layer 2）
         return self.c.RunSubprocessAndRefresh(cmdObj)
     }
-    
+
     // 分支 B：不需要真实终端 —— 走 WithWaitingStatus（Layer 2）
     return self.c.WithWaitingStatus(loadingText, func(gocui.Task) error {
         // 在这个闭包里继续做战术决策...
-        
+
         // 4. 战术决策：根据 output 配置 CmdObj（Layer 4）
         if customCommand.Output == "log" || customCommand.Output == "logWithPty" {
             cmdObj.StreamOutput()  // Layer 4：设置流式输出
@@ -453,10 +453,10 @@ func (self *HandlerCreator) finalHandler(...) error {
         if customCommand.Output == "logWithPty" {
             cmdObj.UsePty()        // Layer 4：设置使用 PTY
         }
-        
+
         // 5. 触发实际执行（委托给 Layer 5）
         output, err := cmdObj.RunWithOutput()
-        
+
         // 6. 执行后处理：刷新、错误钩子、弹窗
         self.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
         if err != nil { /* 冲突检查 */ }
@@ -490,7 +490,7 @@ func (gui *Gui) runSubprocessWithSuspenseAndRefresh(subprocess *oscommands.CmdOb
     // 1. 暂停 lazygit GUI，让命令在真实终端运行
     _, err := gui.runSubprocessWithSuspense(subprocess)
     if err != nil { return err }
-    
+
     // 2. 命令结束后恢复 GUI，然后刷新
     gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
     return nil
@@ -530,7 +530,7 @@ func (self *StatusManager) WithWaitingStatus(message string, renderFunc func(), 
     handle := &WaitingStatusHandle{...}
     handle.Show()          // 显示加载状态（底部状态栏）
     defer handle.Hide()    // 结束后隐藏（无论成功失败）
-    
+
     return f(handle)       // 执行真正的命令
 }
 ```
@@ -574,13 +574,13 @@ func (self *CmdObjBuilder) NewShell(commandStr string, shellFunctionsFile string
     if len(shellFunctionsFile) > 0 {
         commandStr = fmt.Sprintf("%ssource %s\n%s", self.platform.PrefixForShellFunctionsFile, shellFunctionsFile, commandStr)
     }
-    
+
     // 2. 对命令字符串做平台相关的引号转义
     quotedCommand := self.quotedCommandString(commandStr)
-    
+
     // 3. 组装成 shell 调用：如 `sh -c "git checkout main"`
     cmdArgs := str.ToArgv(fmt.Sprintf("%s %s %s", self.platform.Shell, self.platform.ShellArg, quotedCommand))
-    
+
     // 4. 委托给 New 创建 CmdObj
     return self.New(cmdArgs)
 }
@@ -610,7 +610,7 @@ func (self *CmdObjBuilder) NewShell(commandStr string, shellFunctionsFile string
 type CmdObj struct {
     cmd *exec.Cmd              // Go 标准库的命令对象
     runner ICmdObjRunner       // 实际执行者（委托模式）
-    
+
     // 配置标志位，通过链式方法设置
     streamOutput bool          // StreamOutput() 设置
     usePty bool                // UsePty() 设置
@@ -669,17 +669,17 @@ func (self *cmdObjRunner) RunWithOutput(cmdObj *CmdObj) (string, error) {
         cmdObj.Mutex().Lock()
         defer cmdObj.Mutex().Unlock()
     }
-    
+
     // 2. 分支 1：需要凭证处理（用户名/密码/2FA）
     if cmdObj.GetCredentialStrategy() != NONE {
         return "", self.runWithCredentialHandling(cmdObj)
     }
-    
+
     // 3. 分支 2：需要流式输出（log / logWithPty）
     if cmdObj.ShouldStreamOutput() {
         return "", self.runAndStream(cmdObj)
     }
-    
+
     // 4. 分支 3：同步执行获取输出（popup / none）
     return self.RunWithOutputAux(cmdObj)
 }
@@ -692,11 +692,11 @@ func (self *cmdObjRunner) RunWithOutput(cmdObj *CmdObj) (string, error) {
 func (self *cmdObjRunner) RunWithOutputAux(cmdObj *CmdObj) (string, error) {
     self.log.WithField("command", cmdObj.ToString()).Debug("RunCommand")
     if cmdObj.ShouldLog() { self.logCmdObj(cmdObj) }
-    
+
     t := time.Now()
     // 直接调用 Go 标准库：CombinedOutput() 会阻塞到命令完成
     output, err := sanitisedCommandOutput(cmdObj.GetCmd().CombinedOutput())
-    
+
     self.log.Infof("%s (%s)", cmdObj.ToString(), time.Since(t))
     return output, err
 }
@@ -714,7 +714,7 @@ func (self *cmdObjRunner) runAndStreamAux(cmdObj *CmdObj, onRun func(*cmdHandler
     } else {
         cmdWriter = self.guiIO.newCmdWriterFn()  // 直接写到命令日志面板
     }
-    
+
     // 2. 决定用 PTY 还是普通 pipe
     var handler *cmdHandler
     if cmdObj.ShouldUsePty() {
@@ -722,13 +722,13 @@ func (self *cmdObjRunner) runAndStreamAux(cmdObj *CmdObj, onRun func(*cmdHandler
     } else {
         handler, err = self.getCmdHandlerNonPty(cmd) // 普通 pipe
     }
-    
+
     // 3. 启动输出传输协程
     onRun(handler, cmdWriter)  // 通常是启动一个 goroutine 做 io.Copy
-    
+
     // 4. 等待命令完成
     err = cmd.Wait()
-    
+
     // 5. 出错处理
     if err != nil {
         if cmdObj.suppressOutputUnlessError {
@@ -748,7 +748,7 @@ func (self *cmdObjRunner) runAndStreamAux(cmdObj *CmdObj, onRun func(*cmdHandler
 func (self *cmdObjRunner) runAndDetectCredentialRequest(...) error {
     // 强制英文输出，方便检测凭证提示
     cmdObj.AddEnvVars("LANG=C", "LC_ALL=C", "LC_MESSAGES=C")
-    
+
     return self.runAndStreamAux(cmdObj, func(handler *cmdHandler, cmdWriter io.Writer) {
         tr := io.TeeReader(handler.stdoutPipe, cmdWriter)
         go utils.Safe(func() {
