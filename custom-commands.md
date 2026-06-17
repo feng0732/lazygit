@@ -2,25 +2,25 @@
 
 ## 整体架构概览
 
-自定义命令的代码集中在 [custom_commands](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands) 包中，由以下核心文件组成：
+自定义命令的代码集中在 [custom_commands](pkg/gui/services/custom_commands) 包中，由以下核心文件组成：
 
 | 文件 | 职责 |
 |------|------|
-| [client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go) | 入口：遍历配置，生成键绑定或命令菜单 |
-| [keybinding_creator.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/keybinding_creator.go) | 将自定义命令映射为特定视图的键绑定 |
-| [handler_creator.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go) | 核心：创建按键处理函数，编排 prompt 递归链与最终命令执行 |
-| [resolver.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/resolver.go) | 模板解析：将 Go 模板字符串解析为实际值 |
-| [session_state_loader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/session_state_loader.go) | 加载当前会话状态（选中项等）供模板使用 |
-| [menu_generator.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/menu_generator.go) | 从命令输出解析出菜单条目（menuFromCommand 类型） |
-| [models.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/models.go) | Shim 模型层：隔离内部模型与用户模板 API |
+| [client.go](pkg/gui/services/custom_commands/client.go) | 入口：遍历配置，生成键绑定或命令菜单 |
+| [keybinding_creator.go](pkg/gui/services/custom_commands/keybinding_creator.go) | 将自定义命令映射为特定视图的键绑定 |
+| [handler_creator.go](pkg/gui/services/custom_commands/handler_creator.go) | 核心：创建按键处理函数，编排 prompt 递归链与最终命令执行 |
+| [resolver.go](pkg/gui/services/custom_commands/resolver.go) | 模板解析：将 Go 模板字符串解析为实际值 |
+| [session_state_loader.go](pkg/gui/services/custom_commands/session_state_loader.go) | 加载当前会话状态（选中项等）供模板使用 |
+| [menu_generator.go](pkg/gui/services/custom_commands/menu_generator.go) | 从命令输出解析出菜单条目（menuFromCommand 类型） |
+| [models.go](pkg/gui/services/custom_commands/models.go) | Shim 模型层：隔离内部模型与用户模板 API |
 
-配置结构定义在 [user_config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L696-L785)，实际命令执行在 [custom.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/commands/git_commands/custom.go)。
+配置结构定义在 [user_config.go](pkg/config/user_config.go#L696-L785)，实际命令执行在 [custom.go](pkg/commands/git_commands/custom.go)。
 
 ---
 
 ## 一、配置结构
 
-用户在 `config.yml` 中通过 `customCommands` 数组定义自定义命令。每个条目对应一个 `CustomCommand` 结构体（[user_config.go#L696-L719](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L696-L719)）：
+用户在 `config.yml` 中通过 `customCommands` 数组定义自定义命令。每个条目对应一个 `CustomCommand` 结构体（[user_config.go#L696-L719](pkg/config/user_config.go#L696-L719)）：
 
 ```yaml
 customCommands:
@@ -45,10 +45,10 @@ customCommands:
 
 关键子结构：
 
-- **`CustomCommandPrompt`**（[user_config.go#L729-L767](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L729-L767)）：定义交互提示，`type` 决定提示类型，`key` 用于在模板中通过 `{{.Form.xxx}}` 引用用户输入值，`condition` 可控制提示是否跳过。
-- **`CustomCommandMenuOption`**（[user_config.go#L776-L785](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L776-L785)）：menu 类型提示的选项，包含 `name`、`description`、`value`、`key`。
-- **`CustomCommandSuggestions`**（[user_config.go#L769-L774](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L769-L774)）：input 类型提示的自动补全，`preset` 和 `command` 互斥。
-- **`CustomCommandAfterHook`**（[user_config.go#L692-L694](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/config/user_config.go#L692-L694)）：命令执行后的钩子，目前仅支持 `checkForConflicts`。
+- **`CustomCommandPrompt`**（[user_config.go#L729-L767](pkg/config/user_config.go#L729-L767)）：定义交互提示，`type` 决定提示类型，`key` 用于在模板中通过 `{{.Form.xxx}}` 引用用户输入值，`condition` 可控制提示是否跳过。
+- **`CustomCommandMenuOption`**（[user_config.go#L776-L785](pkg/config/user_config.go#L776-L785)）：menu 类型提示的选项，包含 `name`、`description`、`value`、`key`。
+- **`CustomCommandSuggestions`**（[user_config.go#L769-L774](pkg/config/user_config.go#L769-L774)）：input 类型提示的自动补全，`preset` 和 `command` 互斥。
+- **`CustomCommandAfterHook`**（[user_config.go#L692-L694](pkg/config/user_config.go#L692-L694)）：命令执行后的钩子，目前仅支持 `checkForConflicts`。
 
 ---
 
@@ -56,7 +56,7 @@ customCommands:
 
 ### 2.1 Client.GetCustomCommandKeybindings
 
-入口函数是 [Client.GetCustomCommandKeybindings](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go#L39-L64)，在 [keybindings.go#L344](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/keybindings.go#L344) 中被调用，生成的自定义键绑定会**放在默认键绑定前面**（[keybindings.go#L349](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/keybindings.go#L349)），从而获得更高的匹配优先级。
+入口函数是 [Client.GetCustomCommandKeybindings](pkg/gui/services/custom_commands/client.go#L39-L64)，在 [keybindings.go#L344](pkg/gui/keybindings.go#L344) 中被调用，生成的自定义键绑定会**放在默认键绑定前面**（[keybindings.go#L349](pkg/gui/keybindings.go#L349)），从而获得更高的匹配优先级。
 
 它遍历 `UserConfig().CustomCommands`，对每个命令做分支判断：
 
@@ -65,13 +65,13 @@ customCommands:
 
 ### 2.2 KeybindingCreator.call 与上下文映射
 
-[keybindingCreator.call](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/keybinding_creator.go#L25-L43) 负责将 handler 绑定到正确的视图上。
+[keybindingCreator.call](pkg/gui/services/custom_commands/keybinding_creator.go#L25-L43) 负责将 handler 绑定到正确的视图上。
 
-上下文解析逻辑在 [getViewNamesAndContexts](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/keybinding_creator.go#L45-L66)：
+上下文解析逻辑在 [getViewNamesAndContexts](pkg/gui/services/custom_commands/keybinding_creator.go#L45-L66)：
 
 - `context` 为 `"global"` 时，返回 `[""]`（空字符串表示全局绑定）
 - 否则，将 `context` 字符串按逗号拆分为多个 context key
-- 每个 context key 通过 [contextForContextKey](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/keybinding_creator.go#L68-L76) 查找对应的 Context，再取其 `GetViewName()`
+- 每个 context key 通过 [contextForContextKey](pkg/gui/services/custom_commands/keybinding_creator.go#L68-L76) 查找对应的 Context，再取其 `GetViewName()`
 - 一个 context key 对应一个 view name；多个 context 会生成多个键绑定
 
 注意：**命令菜单（commandMenu）的顶级键绑定永远是全局的**（`ViewName: ""`），上下文过滤在子命令展开时才进行（参见下文 §3.2）。
@@ -82,7 +82,7 @@ customCommands:
 
 ### 3.1 showCustomCommandsMenu 递归展开
 
-[showCustomCommandsMenu](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go#L66-L110) 是 commandMenu 类型命令的渲染入口。它递归处理嵌套的 `commandMenu`，构建 `menuItems` 数组：
+[showCustomCommandsMenu](pkg/gui/services/custom_commands/client.go#L66-L110) 是 commandMenu 类型命令的渲染入口。它递归处理嵌套的 `commandMenu`，构建 `menuItems` 数组：
 
 ```
 自定义命令按键
@@ -115,7 +115,7 @@ GetCustomCommandKeybindings() 发现有 commandMenu
 
 ### 3.2 上下文过滤：只显示当前可用的子命令
 
-叶子子命令的上下文过滤发生在 `showCustomCommandsMenu` 内部（[client.go#L80-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go#L80-L91)）：
+叶子子命令的上下文过滤发生在 `showCustomCommandsMenu` 内部（[client.go#L80-L91](pkg/gui/services/custom_commands/client.go#L80-L91)）：
 
 ```go
 if subCommand.Context != "" && subCommand.Context != "global" {
@@ -140,7 +140,7 @@ if subCommand.Context != "" && subCommand.Context != "global" {
 
 ### 3.3 空菜单兜底：NoApplicableCommandsInThisContext
 
-如果所有叶子子命令都被上下文过滤掉了（`menuItems` 为空），会触发兜底逻辑（[client.go#L101-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go#L101-L106)）：
+如果所有叶子子命令都被上下文过滤掉了（`menuItems` 为空），会触发兜底逻辑（[client.go#L101-L106](pkg/gui/services/custom_commands/client.go#L101-L106)）：
 
 ```go
 if len(menuItems) == 0 {
@@ -151,7 +151,7 @@ if len(menuItems) == 0 {
 }
 ```
 
-这个兜底项是一个不可执行的占位菜单项，`OnPress` 什么也不做。菜单标题由 [getCustomCommandsMenuDescription](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/client.go#L112-L118) 决定——有 `description` 用 description，否则用 `tr.CustomCommands`（翻译后的"自定义命令"）。
+这个兜底项是一个不可执行的占位菜单项，`OnPress` 什么也不做。菜单标题由 [getCustomCommandsMenuDescription](pkg/gui/services/custom_commands/client.go#L112-L118) 决定——有 `description` 用 description，否则用 `tr.CustomCommands`（翻译后的"自定义命令"）。
 
 菜单通过 `self.c.Menu(types.CreateMenuOptions{..., HideCancel: true})` 弹出，`HideCancel: true` 表示不显示取消选项。
 
@@ -167,7 +167,7 @@ if len(menuItems) == 0 {
 
 ### 4.1 核心机制：从后向前构建闭包链
 
-[HandlerCreator.call](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L47-L131) 是整个自定义命令运行机制的核心。它通过**从后向前**遍历 prompts，用闭包一层一层包装，最终形成一条从第一个 prompt 到 finalHandler 的调用链。
+[HandlerCreator.call](pkg/gui/services/custom_commands/handler_creator.go#L47-L131) 是整个自定义命令运行机制的核心。它通过**从后向前**遍历 prompts，用闭包一层一层包装，最终形成一条从第一个 prompt 到 finalHandler 的调用链。
 
 ```
 用户按下叶子命令
@@ -206,7 +206,7 @@ if len(menuItems) == 0 {
 
 ### 4.2 wrappedF：响应的记录与传递
 
-`wrappedF` 是每个 prompt 与下一步之间的衔接点（[handler_creator.go#L65-L69](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L65-L69)）：
+`wrappedF` 是每个 prompt 与下一步之间的衔接点（[handler_creator.go#L65-L69](pkg/gui/services/custom_commands/handler_creator.go#L65-L69)）：
 
 ```go
 wrappedF := func(response string) error {
@@ -223,7 +223,7 @@ wrappedF := func(response string) error {
 
 ### 4.3 resolveTemplate 的动态构建
 
-每一轮循环都会调用 [getResolveTemplateFn](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L273-L286) 重新生成一个 `resolveTemplate` 函数。这个函数捕获了当前的 `form`、`promptResponses`、`sessionState`。
+每一轮循环都会调用 [getResolveTemplateFn](pkg/gui/services/custom_commands/handler_creator.go#L273-L286) 重新生成一个 `resolveTemplate` 函数。这个函数捕获了当前的 `form`、`promptResponses`、`sessionState`。
 
 关键点：**`form` 是一个 map，是引用类型**。虽然 `resolveTemplate` 在循环中创建时 `form` 还是空的或部分填充的，但由于闭包捕获的是 map 的引用，当实际执行模板解析时（即用户按下键、prompt 弹出前），`form` 中已经包含了前面所有 prompt 的响应。
 
@@ -233,16 +233,16 @@ wrappedF := func(response string) error {
 
 | 类型 | 衔接函数 | 是否使用 wrappedF | 说明 |
 |------|---------|-----------------|------|
-| `input` | [inputPrompt](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L144-L162) | 是 | 输入框确认后调用 `wrappedF(str)` |
-| `menu` | [menuPrompt](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L228-L240) | 是 | 选菜单项后调用 `wrappedF(option.Value)` |
-| `menuFromCommand` | [menuPromptFromCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L242-L265) | 是 | 先跑命令生成菜单，选中后调用 `wrappedF(candidate.value)` |
-| `confirm` | [confirmPrompt](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L218-L226) | **否，直接用 g** | 确认后调用 `g()`，不产生响应值 |
+| `input` | [inputPrompt](pkg/gui/services/custom_commands/handler_creator.go#L144-L162) | 是 | 输入框确认后调用 `wrappedF(str)` |
+| `menu` | [menuPrompt](pkg/gui/services/custom_commands/handler_creator.go#L228-L240) | 是 | 选菜单项后调用 `wrappedF(option.Value)` |
+| `menuFromCommand` | [menuPromptFromCommand](pkg/gui/services/custom_commands/handler_creator.go#L242-L265) | 是 | 先跑命令生成菜单，选中后调用 `wrappedF(candidate.value)` |
+| `confirm` | [confirmPrompt](pkg/gui/services/custom_commands/handler_creator.go#L218-L226) | **否，直接用 g** | 确认后调用 `g()`，不产生响应值 |
 
 注意 `confirm` 类型的特殊之处：它直接把 `g` 传给 `confirmPrompt` 作为 `handleConfirm`，而不是 `wrappedF`。因为确认框不收集用户输入，只是一个门控。
 
 ### 4.5 condition：有条件的 prompt
 
-如果 prompt 设置了 `condition`，会在 prompt 闭包外再包一层条件判断（[handler_creator.go#L110-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L110-L126)）：
+如果 prompt 设置了 `condition`，会在 prompt 闭包外再包一层条件判断（[handler_creator.go#L110-L126](pkg/gui/services/custom_commands/handler_creator.go#L110-L126)）：
 
 ```go
 if prompt.Condition != "" {
@@ -262,7 +262,7 @@ if prompt.Condition != "" {
 }
 ```
 
-[resolveCondition](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L133-L142) 的规则：
+[resolveCondition](pkg/gui/services/custom_commands/handler_creator.go#L133-L142) 的规则：
 - 空字符串 → false
 - `"false"` → false
 - 其他非空值 → true
@@ -276,13 +276,13 @@ if prompt.Condition != "" {
 `menuFromCommand` 类型比较特殊，它需要先执行命令才能知道菜单选项：
 
 1. `menuPromptFromCommand` 被调用
-2. 运行 `prompt.Command` 拿到输出（[handler_creator.go#L244](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L244)）
-3. 通过 [menuGenerator.call](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/menu_generator.go#L30-L50) 解析输出为菜单条目
+2. 运行 `prompt.Command` 拿到输出（[handler_creator.go#L244](pkg/gui/services/custom_commands/handler_creator.go#L244)）
+3. 通过 [menuGenerator.call](pkg/gui/services/custom_commands/menu_generator.go#L30-L50) 解析输出为菜单条目
 4. 解析过程：按行分割 → 每行用 filter 正则匹配 → 用 valueFormat/labelFormat 模板格式化
 5. 构造 MenuItem，OnPress 调用 `wrappedF(candidate.value)`
 6. 弹出菜单
 
-[MenuGenerator](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/menu_generator.go) 的解析细节：
+[MenuGenerator](pkg/gui/services/custom_commands/menu_generator.go) 的解析细节：
 
 - `filter` 为空且 `valueFormat` 为空且 `labelFormat` 为空时，每行原样作为 label 和 value
 - 否则编译 filter 正则，用命名捕获组提取数据
@@ -296,7 +296,7 @@ if prompt.Condition != "" {
 
 ### 5.1 模板数据对象
 
-模板解析的核心函数是 [getResolveTemplateFn](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L273-L286)，它构造了模板数据对象 `CustomCommandObjects`：
+模板解析的核心函数是 [getResolveTemplateFn](pkg/gui/services/custom_commands/handler_creator.go#L273-L286)，它构造了模板数据对象 `CustomCommandObjects`：
 
 ```go
 type CustomCommandObjects struct {
@@ -322,11 +322,11 @@ type CustomCommandObjects struct {
 此外还有两个模板函数：
 
 - **`quote`**：对字符串进行 shell 引号包裹（`self.c.OS().Quote`）
-- **`runCommand`**：在模板解析时同步执行命令并返回单行输出（[TemplateFunctionRunCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/commands/git_commands/custom.go#L28-L39)），如果输出含多行则报错
+- **`runCommand`**：在模板解析时同步执行命令并返回单行输出（[TemplateFunctionRunCommand](pkg/commands/git_commands/custom.go#L28-L39)），如果输出含多行则报错
 
 ### 5.2 Resolver.resolvePrompt 可复用性
 
-[Resolver.resolvePrompt](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/resolver.go#L17-L70) 是一个独立的纯函数式模块，接收 `resolveTemplate` 函数作为参数，因此**不依赖具体的模板数据源**。
+[Resolver.resolvePrompt](pkg/gui/services/custom_commands/resolver.go#L17-L70) 是一个独立的纯函数式模块，接收 `resolveTemplate` 函数作为参数，因此**不依赖具体的模板数据源**。
 
 它解析 prompt 中所有含模板的字段：
 - `Title`、`InitialValue`、`Suggestions.Preset`、`Suggestions.Command`
@@ -345,17 +345,17 @@ type CustomCommandObjects struct {
 
 ### 5.3 SessionState 加载
 
-[SessionStateLoader.call](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/session_state_loader.go#L215-L259) 在用户按下键绑定时被调用，快照当前 GUI 状态：
+[SessionStateLoader.call](pkg/gui/services/custom_commands/session_state_loader.go#L215-L259) 在用户按下键绑定时被调用，快照当前 GUI 状态：
 
 - 从各 Context 获取选中项（`GetSelected()`），通过 shim 函数转换为稳定 API 模型
 - `SelectedCommit` 的解析有优先级逻辑：如果当前上下文是 reflog 或 subCommits，则使用对应的 commit，否则使用 localCommits
 - `SelectedPath` 根据当前上下文决定来源：如果当前在 commitFiles 上下文则取 commit file 路径，否则取 files 的路径
 
-**Shim 层设计意图**（[models.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/models.go#L8-L14)）：为内部模型类创建 shim，使自定义命令的 API 更稳定。例如 `Commit.Sha` 被废弃改为 `Commit.Hash`，shim 中同时保留了两者。
+**Shim 层设计意图**（[models.go](pkg/gui/services/custom_commands/models.go#L8-L14)）：为内部模型类创建 shim，使自定义命令的 API 更稳定。例如 `Commit.Sha` 被废弃改为 `Commit.Hash`，shim 中同时保留了两者。
 
 ### 5.4 模板引擎
 
-底层调用 [utils.ResolveTemplate](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/utils/template.go#L9-L21)——标准 Go `text/template`，开启 `missingkey=error`。这意味着模板中引用了不存在的字段会报错，而不是默默输出空值。
+底层调用 [utils.ResolveTemplate](pkg/utils/template.go#L9-L21)——标准 Go `text/template`，开启 `missingkey=error`。这意味着模板中引用了不存在的字段会报错，而不是默默输出空值。
 
 ---
 
@@ -363,7 +363,7 @@ type CustomCommandObjects struct {
 
 ### 6.1 finalHandler 入口
 
-[finalHandler](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L288-L344) 在所有 prompt 链执行完毕后被调用。它是整个执行流程的终点。
+[finalHandler](pkg/gui/services/custom_commands/handler_creator.go#L288-L344) 在所有 prompt 链执行完毕后被调用。它是整个执行流程的终点。
 
 注意：`finalHandler` 的参数 `sessionState`、`promptResponses`、`form` 都是**在 `handlerCreator.call` 里定义、被闭包捕获**的变量。当 finalHandler 执行时，form 已经被所有前面的 prompt 填满了。
 
@@ -390,11 +390,11 @@ cmdStr, err := resolveTemplate(customCommand.Command)
 | `popup` | 同步执行获取输出，然后 `Alert` 弹窗展示 | ASYNC 异步刷新 |
 | `none`（默认） | `WithWaitingStatus` 中执行，输出丢弃 | ASYNC 异步刷新 |
 
-`WithWaitingStatus` 会在状态栏显示加载文字——优先使用 `customCommand.LoadingText`，否则用翻译的 `RunningCustomCommandStatus`（[handler_creator.go#L301-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L301-L304)）。
+`WithWaitingStatus` 会在状态栏显示加载文字——优先使用 `customCommand.LoadingText`，否则用翻译的 `RunningCustomCommandStatus`（[handler_creator.go#L301-L304](pkg/gui/services/custom_commands/handler_creator.go#L301-L304)）。
 
 ### 6.4 popup 输出的标题处理
 
-对于 `popup` 模式，标题也支持模板（[handler_creator.go#L332-L338](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L332-L338)）：
+对于 `popup` 模式，标题也支持模板（[handler_creator.go#L332-L338](pkg/gui/services/custom_commands/handler_creator.go#L332-L338)）：
 
 - 如果 `customCommand.OutputTitle` 非空，用 `resolveTemplate` 解析它作为标题
 - 否则用 `cmdStr`（解析后的完整命令字符串）作为标题
@@ -495,7 +495,7 @@ handlerCreator.call() 返回的函数被调用
 
 ### 8.1 Resolver：纯函数式设计，高度可复用
 
-[Resolver](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/resolver.go) 采用依赖注入设计：
+[Resolver](pkg/gui/services/custom_commands/resolver.go) 采用依赖注入设计：
 
 - 不持有任何业务状态，仅依赖传入的 `resolveTemplate func(string) (string, error)`
 - 职责单一：只负责遍历 prompt 的各个字段并应用模板解析
@@ -504,17 +504,17 @@ handlerCreator.call() 返回的函数被调用
 
 ### 8.2 MenuGenerator：独立的命令输出解析器
 
-[MenuGenerator](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/menu_generator.go) 也是一个独立组件：
+[MenuGenerator](pkg/gui/services/custom_commands/menu_generator.go) 也是一个独立组件：
 
 - 输入：命令输出字符串、filter 正则、valueFormat、labelFormat
 - 输出：`[]*commandMenuItem`
-- 不依赖 GUI 状态，可以脱离 lazygit 单独测试（有独立的单元测试 [menu_generator_test.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/menu_generator_test.go)）
+- 不依赖 GUI 状态，可以脱离 lazygit 单独测试（有独立的单元测试 [menu_generator_test.go](pkg/gui/services/custom_commands/menu_generator_test.go)）
 - `TrimmerTemplate` 包装了 Go template，自动 trim，是一个可复用的小工具
 - `parseLine` 的正则命名组提取逻辑也可以单独复用
 
 ### 8.3 SessionStateLoader + models Shim：稳定 API 层
 
-[SessionStateLoader](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/session_state_loader.go) + [models.go](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/models.go) 构成了一个"防崩溃层"：
+[SessionStateLoader](pkg/gui/services/custom_commands/session_state_loader.go) + [models.go](pkg/gui/services/custom_commands/models.go) 构成了一个"防崩溃层"：
 
 - 内部模型可以随意改名、加字段
 - Shim 层对外保持稳定 API
@@ -522,7 +522,7 @@ handlerCreator.call() 返回的函数被调用
 
 ### 8.4 HandlerCreator.call：编排模式，但耦合度高
 
-[HandlerCreator.call](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/handler_creator.go#L47-L131) 的闭包递归包装是核心设计，但也导致了较高的耦合：
+[HandlerCreator.call](pkg/gui/services/custom_commands/handler_creator.go#L47-L131) 的闭包递归包装是核心设计，但也导致了较高的耦合：
 
 - 依赖 Resolver、MenuGenerator、SessionStateLoader、SuggestionsHelper、MergeAndRebaseHelper
 - prompt 类型判断用 switch-case，新增类型需要修改这里（不符合开闭原则）
@@ -530,11 +530,11 @@ handlerCreator.call() 返回的函数被调用
 
 ### 8.5 utils.ResolveTemplate：通用模板工具
 
-[utils.ResolveTemplate](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/utils/template.go#L9-L21) 是整个项目通用的模板工具，不局限于自定义命令。它封装了 Go `text/template` 的常见用法（带 Funcs、带 missingkey=error、buffer 输出）。
+[utils.ResolveTemplate](pkg/utils/template.go#L9-L21) 是整个项目通用的模板工具，不局限于自定义命令。它封装了 Go `text/template` 的常见用法（带 Funcs、带 missingkey=error、buffer 输出）。
 
 ### 8.6 KeybindingCreator：context→view 的映射器
 
-[KeybindingCreator](file:///d:/fz/0601-2/solo-dogfeeding/code/28-lazygit/pkg/gui/services/custom_commands/keybinding_creator.go) 的 `getViewNamesAndContexts` 和 `contextForContextKey` 提供了 context key 到 view name 的映射能力，在 `Client.showCustomCommandsMenu` 中也被复用（用于上下文过滤）。
+[KeybindingCreator](pkg/gui/services/custom_commands/keybinding_creator.go) 的 `getViewNamesAndContexts` 和 `contextForContextKey` 提供了 context key 到 view name 的映射能力，在 `Client.showCustomCommandsMenu` 中也被复用（用于上下文过滤）。
 
 ---
 
