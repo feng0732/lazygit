@@ -392,7 +392,393 @@ cmdStr, err := resolveTemplate(customCommand.Command)
 
 `WithWaitingStatus` 会在状态栏显示加载文字——优先使用 `customCommand.LoadingText`，否则用翻译的 `RunningCustomCommandStatus`（[handler_creator.go#L301-L304](pkg/gui/services/custom_commands/handler_creator.go#L301-L304)）。
 
-### 6.4 popup 输出的标题处理
+---
+
+### 6.4 职责边界五层架构（顺着代码调用顺序）
+
+从 `finalHandler` 开始，顺着代码调用顺序往里看，执行部分实际上分为清晰的五层，每一层职责单一，边界明确：
+
+```
+Layer 1: 业务编排层   HandlerCreator.finalHandler
+          ▲
+          │  决定走哪条路（terminal / WithWaitingStatus）
+          ▼
+Layer 2: GUI 辅助包装层   RunSubprocessAndRefresh / WithWaitingStatus
+          ▲
+          │  处理 GUI 交互（暂停/恢复、加载状态、任务暂停/继续）
+          ▼
+Layer 3: 命令构建层   CmdObjBuilder.NewShell
+          ▲
+          │  把用户命令字符串包装成平台相关的 shell 命令
+          ▼
+Layer 4: 命令配置层   CmdObj（StreamOutput / UsePty / RunWithOutput）
+          ▲
+          │  持有执行配置，委托给 runner
+          ▼
+Layer 5: 实际执行层   cmdObjRunner（RunWithOutputAux / runAndStream）
+          ▲
+          │  真正调用系统 API 执行命令，处理输出、错误、凭证
+          ▼
+        操作系统
+```
+
+---
+
+### 6.5 Layer 1 业务编排层：finalHandler 的战略决策
+
+[finalHandler](pkg/gui/services/custom_commands/handler_creator.go#L288-L344) **不做任何实际执行**，只做战略决策：
+
+```go
+func (self *HandlerCreator) finalHandler(...) error {
+    // 1. 最后一次模板解析 —— 得到真正要执行的命令字符串
+    cmdStr, err := resolveTemplate(customCommand.Command)
+    
+    // 2. 构建命令对象（委托给 Layer 3）
+    cmdObj := self.c.OS().Cmd.NewShell(cmdStr, ...)
+    
+    // 3. 战略分支：根据 output 决定走哪条 GUI 包装路径
+    if customCommand.Output == "terminal" {
+        // 分支 A：需要真实终端交互 —— 走 RunSubprocessAndRefresh（Layer 2）
+        return self.c.RunSubprocessAndRefresh(cmdObj)
+    }
+    
+    // 分支 B：不需要真实终端 —— 走 WithWaitingStatus（Layer 2）
+    return self.c.WithWaitingStatus(loadingText, func(gocui.Task) error {
+        // 在这个闭包里继续做战术决策...
+        
+        // 4. 战术决策：根据 output 配置 CmdObj（Layer 4）
+        if customCommand.Output == "log" || customCommand.Output == "logWithPty" {
+            cmdObj.StreamOutput()  // Layer 4：设置流式输出
+        }
+        if customCommand.Output == "logWithPty" {
+            cmdObj.UsePty()        // Layer 4：设置使用 PTY
+        }
+        
+        // 5. 触发实际执行（委托给 Layer 5）
+        output, err := cmdObj.RunWithOutput()
+        
+        // 6. 执行后处理：刷新、错误钩子、弹窗
+        self.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
+        if err != nil { /* 冲突检查 */ }
+        if customCommand.Output == "popup" { /* Alert 弹窗 */ }
+    })
+}
+```
+
+**职责边界要点：**
+- ✅ 决定用哪种 GUI 包装
+- ✅ 决定用哪种执行配置（StreamOutput/UsePty）
+- ✅ 决定执行后做什么（刷新/冲突检查/弹窗）
+- ❌ 不关心 GUI 包装具体怎么实现
+- ❌ 不关心命令怎么构建成 shell 命令
+- ❌ 不关心命令实际怎么运行
+
+---
+
+### 6.6 Layer 2 GUI 辅助包装层：RunSubprocessAndRefresh vs WithWaitingStatus
+
+这一层完全是 **GUI 交互的包装**，不碰命令本身的执行逻辑。两个函数分工明确：
+
+#### 6.6.1 RunSubprocessAndRefresh：暂停 GUI 让命令接管终端
+
+调用链：
+`guiCommon.RunSubprocessAndRefresh` → `gui.runSubprocessWithSuspenseAndRefresh` → `gui.runSubprocessWithSuspense`
+
+[runSubprocessWithSuspenseAndRefresh](pkg/gui/gui.go#L986-L995) 的职责：
+```go
+func (gui *Gui) runSubprocessWithSuspenseAndRefresh(subprocess *oscommands.CmdObj) error {
+    // 1. 暂停 lazygit GUI，让命令在真实终端运行
+    _, err := gui.runSubprocessWithSuspense(subprocess)
+    if err != nil { return err }
+    
+    // 2. 命令结束后恢复 GUI，然后刷新
+    gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})
+    return nil
+}
+```
+
+**职责边界：**
+- ✅ 处理 GUI 的暂停/恢复（`gui.g.Suspend()`）
+- ✅ 命令结束后触发刷新
+- ❌ 不关心命令怎么执行
+- ❌ 不处理加载状态（终端交互不需要）
+
+#### 6.6.2 WithWaitingStatus：后台执行 + 加载状态
+
+调用链：
+`AppStatusHelper.WithWaitingStatus` → `AppStatusHelper.WithWaitingStatusImpl` → `StatusManager.WithWaitingStatus`
+
+[WithWaitingStatus](pkg/gui/controllers/helpers/app_status_helper.go#L62-L72) 的职责：
+```go
+func (self *AppStatusHelper) WithWaitingStatus(message string, f func(gocui.Task) error) {
+    self.c.OnWorker(func(task gocui.Task) error {
+        return self.WithWaitingStatusImpl(message, f, task)
+    })
+}
+
+func (self *AppStatusHelper) WithWaitingStatusImpl(...) error {
+    return self.statusMgr().WithWaitingStatus(message, self.renderAppStatus, func(waitingStatusHandle *status.WaitingStatusHandle) error {
+        // 包装 task，让任务暂停时隐藏加载状态，继续时显示
+        return f(appStatusHelperTask{task, waitingStatusHandle})
+    })
+}
+```
+
+[StatusManager.WithWaitingStatus](pkg/gui/status/status_manager.go#L51-L57) 的职责：
+```go
+func (self *StatusManager) WithWaitingStatus(message string, renderFunc func(), f func(*WaitingStatusHandle) error) error {
+    handle := &WaitingStatusHandle{...}
+    handle.Show()          // 显示加载状态（底部状态栏）
+    defer handle.Hide()    // 结束后隐藏（无论成功失败）
+    
+    return f(handle)       // 执行真正的命令
+}
+```
+
+**职责边界：**
+- ✅ 在 worker goroutine 中执行（不阻塞 UI）
+- ✅ 显示/隐藏加载状态文字
+- ✅ 处理任务暂停/继续时的加载状态切换（`appStatusHelperTask` 包装）
+- ✅ 保证 defer 隐藏加载状态（异常安全）
+- ❌ 不关心命令怎么执行
+- ❌ 不决定刷新逻辑（那是 Layer 1 的事）
+
+**关键设计：`appStatusHelperTask` 装饰器**（[app_status_helper.go#L43-L59](pkg/gui/controllers/helpers/app_status_helper.go#L43-L59)）：
+```go
+type appStatusHelperTask struct {
+    gocui.Task
+    waitingStatusHandle *status.WaitingStatusHandle
+}
+
+func (self appStatusHelperTask) Pause() {
+    self.waitingStatusHandle.Hide()  // 暂停任务时隐藏加载动画
+    self.Task.Pause()
+}
+
+func (self appStatusHelperTask) Continue() {
+    self.Task.Continue()
+    self.waitingStatusHandle.Show()  // 继续任务时显示加载动画
+}
+```
+这个装饰器用于凭证输入场景：当命令需要输入密码时，任务会暂停，加载动画也会跟着隐藏，用户输入完成后继续，加载动画恢复。
+
+---
+
+### 6.7 Layer 3 命令构建层：NewShell 把用户命令变成可执行的 shell 命令
+
+[CmdObjBuilder.NewShell](pkg/commands/oscommands/cmd_obj_builder.go#L47-L55) 负责把用户的命令字符串（如 `"git checkout {{.Form.Branch}}"` 解析后的结果）包装成一个真正可以执行的 shell 命令。
+
+```go
+func (self *CmdObjBuilder) NewShell(commandStr string, shellFunctionsFile string) *CmdObj {
+    // 1. 如果有 shell 函数文件，先 source 它
+    if len(shellFunctionsFile) > 0 {
+        commandStr = fmt.Sprintf("%ssource %s\n%s", self.platform.PrefixForShellFunctionsFile, shellFunctionsFile, commandStr)
+    }
+    
+    // 2. 对命令字符串做平台相关的引号转义
+    quotedCommand := self.quotedCommandString(commandStr)
+    
+    // 3. 组装成 shell 调用：如 `sh -c "git checkout main"`
+    cmdArgs := str.ToArgv(fmt.Sprintf("%s %s %s", self.platform.Shell, self.platform.ShellArg, quotedCommand))
+    
+    // 4. 委托给 New 创建 CmdObj
+    return self.New(cmdArgs)
+}
+```
+
+**`quotedCommandString` 的平台差异**（[cmd_obj_builder.go#L57-L71](pkg/commands/oscommands/cmd_obj_builder.go#L57-L71)）：
+- Windows：不用引号包裹，但对特殊字符（`^&|<>%`）做转义（前面加 `^`）
+- Unix：用双引号包裹，对 `\ "$` 做转义
+
+**`Quote` 方法**（[cmd_obj_builder.go#L82-L100](pkg/commands/oscommands/cmd_obj_builder.go#L82-L100)）同时作为模板函数暴露给用户，在模板中通过 `{{quote .SelectedFile.Name}}` 使用。
+
+**职责边界：**
+- ✅ 处理 shell 函数文件的 source
+- ✅ 处理平台相关的命令行转义和引号
+- ✅ 组装成 `[shell, shellArg, command]` 的参数数组
+- ❌ 不决定用哪个 shell（那是 Platform 配置的）
+- ❌ 不执行命令
+- ❌ 不处理输出
+
+---
+
+### 6.8 Layer 4 命令配置层：CmdObj 只存配置，不做执行
+
+[CmdObj](pkg/commands/oscommands/cmd_obj.go) 是一个**配置对象 + 委托者**，它本身不执行任何命令，只是持有配置并把执行委托给 `runner`。
+
+```go
+type CmdObj struct {
+    cmd *exec.Cmd              // Go 标准库的命令对象
+    runner ICmdObjRunner       // 实际执行者（委托模式）
+    
+    // 配置标志位，通过链式方法设置
+    streamOutput bool          // StreamOutput() 设置
+    usePty bool                // UsePty() 设置
+    dontLog bool               // DontLog() 设置
+    suppressOutputUnlessError bool
+    ignoreEmptyError bool
+    credentialStrategy CredentialStrategy
+    // ...
+}
+```
+
+**链式配置方法**（都返回 `*CmdObj` 以支持链式调用）：
+- `StreamOutput()`：`streamOutput = true` —— 输出流到命令日志面板
+- `UsePty()`：`usePty = true` —— 使用伪终端（保留彩色输出，需要配合 StreamOutput）
+- `DontLog()`：`dontLog = true` —— 不在 UI 上记录这条命令
+- `SuppressOutputUnlessError()`：出错时才显示输出
+- `IgnoreEmptyError()`：空输出的错误视为成功
+- `SetStdin()` / `AddEnvVars()` / `SetWd()`：设置标准输入、环境变量、工作目录
+- `PromptOnCredentialRequest()` / `FailOnCredentialRequest()`：设置凭证处理策略
+
+**执行方法**（都委托给 `runner`）：
+- `Run()` → `runner.Run(self)`
+- `RunWithOutput()` → `runner.RunWithOutput(self)`
+- `RunWithOutputs()` → `runner.RunWithOutputs(self)`
+- `RunAndProcessLines()` → `runner.RunAndProcessLines(self, onLine)`
+
+**职责边界：**
+- ✅ 持有命令执行的所有配置
+- ✅ 提供链式 API 设置配置
+- ✅ 把执行委托给 runner
+- ❌ 不实际执行命令（那是 runner 的事）
+- ❌ 不处理输出流式传输的细节（那是 runner 的事）
+- ❌ 不处理凭证检测的细节（那是 runner 的事）
+
+---
+
+### 6.9 Layer 5 实际执行层：cmdObjRunner 真正和操作系统打交道
+
+[cmdObjRunner](pkg/commands/oscommands/cmd_obj_runner.go) 是真正调用系统 API 的地方。它实现了 `ICmdObjRunner` 接口：
+
+```go
+type ICmdObjRunner interface {
+    Run(cmdObj *CmdObj) error
+    RunWithOutput(cmdObj *CmdObj) (string, error)
+    RunWithOutputs(cmdObj *CmdObj) (string, string, error)
+    RunAndProcessLines(cmdObj *CmdObj, onLine func(line string) (bool, error)) error
+}
+```
+
+根据 CmdObj 的配置，`RunWithOutput` 会走不同的执行路径：
+
+```go
+func (self *cmdObjRunner) RunWithOutput(cmdObj *CmdObj) (string, error) {
+    // 1. 互斥锁：防止某些命令同时执行
+    if cmdObj.Mutex() != nil {
+        cmdObj.Mutex().Lock()
+        defer cmdObj.Mutex().Unlock()
+    }
+    
+    // 2. 分支 1：需要凭证处理（用户名/密码/2FA）
+    if cmdObj.GetCredentialStrategy() != NONE {
+        return "", self.runWithCredentialHandling(cmdObj)
+    }
+    
+    // 3. 分支 2：需要流式输出（log / logWithPty）
+    if cmdObj.ShouldStreamOutput() {
+        return "", self.runAndStream(cmdObj)
+    }
+    
+    // 4. 分支 3：同步执行获取输出（popup / none）
+    return self.RunWithOutputAux(cmdObj)
+}
+```
+
+#### 6.9.1 分支 1：RunWithOutputAux —— 同步执行捕获输出
+
+[RunWithOutputAux](pkg/commands/oscommands/cmd_obj_runner.go#L100-L116) 是最简单的执行路径：
+```go
+func (self *cmdObjRunner) RunWithOutputAux(cmdObj *CmdObj) (string, error) {
+    self.log.WithField("command", cmdObj.ToString()).Debug("RunCommand")
+    if cmdObj.ShouldLog() { self.logCmdObj(cmdObj) }
+    
+    t := time.Now()
+    // 直接调用 Go 标准库：CombinedOutput() 会阻塞到命令完成
+    output, err := sanitisedCommandOutput(cmdObj.GetCmd().CombinedOutput())
+    
+    self.log.Infof("%s (%s)", cmdObj.ToString(), time.Since(t))
+    return output, err
+}
+```
+
+#### 6.9.2 分支 2：runAndStream —— 流式输出到命令日志面板
+
+[runAndStream](pkg/commands/oscommands/cmd_obj_runner.go#L218-L224) → `runAndStreamAux` 处理流式输出：
+```go
+func (self *cmdObjRunner) runAndStreamAux(cmdObj *CmdObj, onRun func(*cmdHandler, io.Writer)) error {
+    // 1. 决定输出目标：命令日志面板 or 缓冲（出错时才显示）
+    var cmdWriter io.Writer
+    if cmdObj.ShouldSuppressOutputUnlessError() {
+        cmdWriter = &combinedOutput  // 先缓冲
+    } else {
+        cmdWriter = self.guiIO.newCmdWriterFn()  // 直接写到命令日志面板
+    }
+    
+    // 2. 决定用 PTY 还是普通 pipe
+    var handler *cmdHandler
+    if cmdObj.ShouldUsePty() {
+        handler, err = self.getCmdHandlerPty(cmd)    // PTY：伪终端，保留颜色
+    } else {
+        handler, err = self.getCmdHandlerNonPty(cmd) // 普通 pipe
+    }
+    
+    // 3. 启动输出传输协程
+    onRun(handler, cmdWriter)  // 通常是启动一个 goroutine 做 io.Copy
+    
+    // 4. 等待命令完成
+    err = cmd.Wait()
+    
+    // 5. 出错处理
+    if err != nil {
+        if cmdObj.suppressOutputUnlessError {
+            // 出错了，把之前缓冲的输出写到命令日志面板
+            _, _ = self.guiIO.newCmdWriterFn().Write(combinedOutput.Bytes())
+        }
+        // 构造错误信息...
+    }
+    return nil
+}
+```
+
+#### 6.9.3 分支 3：runWithCredentialHandling —— 检测并处理凭证请求
+
+[runWithCredentialHandling](pkg/commands/oscommands/cmd_obj_runner.go#L314-L321) → `runAndDetectCredentialRequest` 处理密码/2FA 等输入场景：
+```go
+func (self *cmdObjRunner) runAndDetectCredentialRequest(...) error {
+    // 强制英文输出，方便检测凭证提示
+    cmdObj.AddEnvVars("LANG=C", "LC_ALL=C", "LC_MESSAGES=C")
+    
+    return self.runAndStreamAux(cmdObj, func(handler *cmdHandler, cmdWriter io.Writer) {
+        tr := io.TeeReader(handler.stdoutPipe, cmdWriter)
+        go utils.Safe(func() {
+            // 在后台 goroutine 中扫描输出，检测 "Password:" / "Username:" 等提示
+            self.processOutput(tr, handler.stdinPipe, promptUserForCredential, handler.close, cmdObj)
+        })
+    })
+}
+```
+
+[processOutput](pkg/commands/oscommands/cmd_obj_runner.go#L354-L399) 实时扫描输出，检测到凭证提示时：
+1. 暂停任务（`task.Pause()`）—— 同时暂停加载动画
+2. 弹出凭证输入框
+3. 用户输入后继续任务（`task.Continue()`）—— 同时恢复加载动画
+4. 把输入写入命令的 stdin
+
+**职责边界：**
+- ✅ 真正调用系统 API 执行命令（`cmd.Run()` / `cmd.Start()` / `cmd.Wait()`）
+- ✅ 处理输出捕获和流式传输
+- ✅ 处理互斥锁
+- ✅ 处理凭证检测和输入
+- ✅ 处理日志记录和时间统计
+- ✅ 处理错误转换（把 exit code 转为 error，把 stderr 放到 error 信息里）
+- ❌ 不决定用哪种执行策略（那是 Layer 1 的事）
+- ❌ 不处理 GUI 状态（那是 Layer 2 的事）
+- ❌ 不处理命令字符串的构建（那是 Layer 3 的事）
+
+---
+
+### 6.10 popup 输出的标题处理
 
 对于 `popup` 模式，标题也支持模板（[handler_creator.go#L332-L338](pkg/gui/services/custom_commands/handler_creator.go#L332-L338)）：
 
@@ -400,7 +786,7 @@ cmdStr, err := resolveTemplate(customCommand.Command)
 - 否则用 `cmdStr`（解析后的完整命令字符串）作为标题
 - 空输出时显示翻译的 "Empty output" 而不是空白弹窗
 
-### 6.5 执行后钩子
+### 6.11 执行后钩子
 
 如果命令执行出错且 `after.checkForConflicts` 为 true，则调用 `mergeAndRebaseHelper.CheckForConflicts(err)` 检查是否存在合并冲突。
 
@@ -473,20 +859,89 @@ handlerCreator.call() 返回的函数被调用
                      │
                      ▼
                 finalHandler()
-                  ├─ resolveTemplate(command) → 得到 cmdStr
-                  ├─ cmdObj = NewShell(cmdStr)
                   │
-                  ├─ output == "terminal"
-                  │    → RunSubprocessAndRefresh(cmdObj)
+                  ├─ ── Layer 1: 业务编排层 ──
+                  │    ├─ resolveTemplate(command) → 得到 cmdStr
+                  │    ├─ cmdObj = NewShell(cmdStr)  ← 委托 Layer 3 构建
+                  │    │
+                  │    ├─ output == "terminal" ?
+                  │    │    └─ 是 → RunSubprocessAndRefresh(cmdObj)  ← 委托 Layer 2
+                  │    │
+                  │    └─ 否 → WithWaitingStatus(loadingText, func(task) {  ← 委托 Layer 2
+                  │             │
+                  │             ├─ Layer 1 战术决策：
+                  │             │    ├─ output == log/logWithPty → cmdObj.StreamOutput()
+                  │             │    ├─ output == logWithPty    → cmdObj.UsePty()
+                  │             │    └─ cmdObj.RunWithOutput()  ← 委托 Layer 4
+                  │             │
+                  │             ├─ 执行后处理（Layer 1 职责）：
+                  │             │    ├─ Refresh(ASYNC)
+                  │             │    ├─ 出错 && checkForConflicts → CheckForConflicts(err)
+                  │             │    └─ output == popup → Alert(title, output)
+                  │             └─ }
                   │
-                  └─ 其他输出
-                       → WithWaitingStatus(loadingText, func(task) {
-                            ├─ log / logWithPty → StreamOutput() [+ UsePty()]
-                            ├─ cmdObj.RunWithOutput()
-                            ├─ Refresh(ASYNC)
-                            ├─ 出错 && checkForConflicts → CheckForConflicts(err)
-                            └─ output == "popup" → Alert(title, output)
-                          })
+                  │           ── Layer 2: GUI 辅助包装层 ──
+                  │           「RunSubprocessAndRefresh」或「WithWaitingStatus」
+                  │               ├─ RunSubprocessAndRefresh:
+                  │               │    ├─ gui.suspend()  暂停 GUI
+                  │               │    ├─ gui.runSubprocessWithSuspense(cmdObj)  ← 命令接管终端
+                  │               │    ├─ gui.resume()   恢复 GUI
+                  │               │    └─ Refresh(ASYNC)
+                  │               │
+                  │               └─ WithWaitingStatus:
+                  │                    ├─ OnWorker  切到 worker goroutine
+                  │                    ├─ handle.Show()  显示加载状态
+                  │                    ├─ defer handle.Hide()  保证隐藏
+                  │                    └─ f(appStatusHelperTask{task, handle})  ← 调用 Layer 1 闭包
+                  │                        ↑ 包装 task：Pause 时隐藏加载，Continue 时显示
+                  │
+                  │           ── Layer 3: 命令构建层 ──
+                  │           「CmdObjBuilder.NewShell(cmdStr, shellFunctionsFile)」
+                  │               ├─ shellFunctionsFile 非空 → source 它
+                  │               ├─ quotedCommandString(cmdStr)  平台相关引号转义
+                  │               │    ├─ Windows: 转义 ^&|<>%，不用引号
+                  │               │    └─ Unix: 用双引号，转义 \ "$`
+                  │               ├─ 组装成 [shell, shellArg, quotedCommand]
+                  │               └─ return New(cmdArgs)  ← 创建 *exec.Cmd，包装成 CmdObj
+                  │
+                  │           ── Layer 4: 命令配置层 ──
+                  │           「CmdObj.StreamOutput() → .UsePty() → .RunWithOutput()」
+                  │               ├─ StreamOutput() → streamOutput = true
+                  │               ├─ UsePty()       → usePty = true
+                  │               └─ RunWithOutput()
+                  │                    ├─ 互斥锁处理
+                  │                    ├─ 检查 credentialStrategy  ← 分支决定
+                  │                    ├─ 检查 ShouldStreamOutput  ← 分支决定
+                  │                    └─ 委托 runner.RunWithOutput(self)  ← 调用 Layer 5
+                  │
+                  └───────── Layer 5: 实际执行层 ──────────
+                              「cmdObjRunner.RunWithOutput(cmdObj)」
+                                  │
+                                  ├─ 有 credentialStrategy != NONE ?
+                                  │    └─ 是 → runWithCredentialHandling(cmdObj)
+                                  │              ├─ 设置 LANG=C 等环境变量（英文输出方便检测）
+                                  │              ├─ runAndStreamAux(..., processOutput)
+                                  │              └─ processOutput 后台扫描：
+                                  │                   ├─ 检测 "Password:" / "Username:" 等
+                                  │                   ├─ task.Pause()  ← 同时暂停加载动画
+                                  │                   ├─ 弹出输入框获取用户输入
+                                  │                   ├─ task.Continue()  ← 同时恢复加载动画
+                                  │                   └─ 写入 stdin
+                                  │
+                                  ├─ ShouldStreamOutput() ?
+                                  │    └─ 是 → runAndStream(cmdObj)
+                                  │              ├─ runAndStreamAux(..., io.Copy)
+                                  │              │    ├─ 输出目标：cmdWriter（命令日志面板）or buffer
+                                  │              │    ├─ ShouldUsePty() ? → getCmdHandlerPty / getCmdHandlerNonPty
+                                  │              │    ├─ goroutine: io.Copy(cmdWriter, stdoutPipe)
+                                  │              │    └─ cmd.Wait()  等待命令完成
+                                  │              └─ 出错 && suppressOutputUnlessError → 把缓冲输出写入面板
+                                  │
+                                  └─ 否 → RunWithOutputAux(cmdObj)
+                                            ├─ log 命令
+                                            ├─ cmd.CombinedOutput()  ← Go 标准库，阻塞执行
+                                            ├─ sanitisedCommandOutput  错误转换（stderr → error message）
+                                            └─ return output, err
 ```
 
 ---
@@ -555,3 +1010,15 @@ handlerCreator.call() 返回的函数被调用
 7. **condition 的模板求值**：条件表达式本质上是一个模板，解析后非空且非 `"false"` 即为真，这允许用 Go 模板的比较函数（如 `eq`）做条件判断。条件为假时也会填空值占位，防止 `missingkey=error`。
 
 8. **confirm 不记录响应**：confirm 类型直接调用 `g()` 而非 `wrappedF()`，因为它不产生值，仅作为确认门控。
+
+9. **五层职责边界**：执行部分从外到内分为清晰的五层——业务编排层（finalHandler 做战略决策）→ GUI 辅助包装层（RunSubprocessAndRefresh/WithWaitingStatus 处理 GUI 交互）→ 命令构建层（NewShell 处理平台差异和 shell 包装）→ 命令配置层（CmdObj 持配置做委托）→ 实际执行层（cmdObjRunner 真正调用系统 API）。每一层职责单一，只关心自己的事。
+
+10. **委托模式解耦配置与执行**：CmdObj 本身不执行命令，只持有配置并把执行委托给 runner。这使得执行策略可以灵活切换（测试时用 fake runner，生产时用真实 runner）。
+
+11. **装饰器模式增强 Task**：`appStatusHelperTask` 用装饰器模式包装 `gocui.Task`，在不改变 Task 接口的前提下增加了"暂停时隐藏加载状态、继续时显示加载状态"的行为。
+
+12. **RunSubprocessAndRefresh 与 WithWaitingStatus 互斥**：两者都是 GUI 包装层，但职责完全不重叠——RunSubprocessAndRefresh 处理需要真实终端交互的场景（暂停 GUI），WithWaitingStatus 处理后台执行场景（显示加载状态），绝不会同时调用。
+
+13. **配置与执行的两次分支决策**：第一次在 Layer 1（finalHandler）决定走哪条 GUI 包装路径和执行配置，第二次在 Layer 5（cmdObjRunner.RunWithOutput）根据 CmdObj 的配置标志位决定实际执行路径（同步/流式/凭证处理）。两次决策的关注点不同，互不干扰。
+
+14. **Runner 的内部分支设计**：`RunWithOutput` 方法内部根据 CmdObj 的配置标志位做三级分支——先处理互斥锁，再判断是否需要凭证处理，再判断是否需要流式输出，最后走同步执行。这种设计让调用方（Layer 1）只需调一个方法，无需关心内部实现。
