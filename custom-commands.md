@@ -602,14 +602,14 @@ func (self *CmdObjBuilder) NewShell(commandStr string, shellFunctionsFile string
 
 ---
 
-### 6.8 Layer 4 命令配置层：CmdObj 只存配置，不做执行
+### 6.8 Layer 4 命令对象层：CmdObj 是三位一体的桥梁
 
-[CmdObj](pkg/commands/oscommands/cmd_obj.go) 是一个**配置对象 + 委托者**，它本身不执行任何命令，只是持有配置并把执行委托给 `runner`。
+[CmdObj](pkg/commands/oscommands/cmd_obj.go) 不仅仅是"配置对象"，它是**命令对象 + 配置容器 + 执行委托者**三位一体的桥梁，连接 Layer 3（命令构建）、Layer 1（业务编排）和 Layer 5（实际执行）。
 
 ```go
 type CmdObj struct {
-    cmd *exec.Cmd              // Go 标准库的命令对象
-    runner ICmdObjRunner       // 实际执行者（委托模式）
+    cmd *exec.Cmd              // Go 标准库的命令对象（Layer 3 创建，真正执行的载体）
+    runner ICmdObjRunner       // 实际执行者（委托模式，Layer 5）
 
     // 配置标志位，通过链式方法设置
     streamOutput bool          // StreamOutput() 设置
@@ -618,32 +618,50 @@ type CmdObj struct {
     suppressOutputUnlessError bool
     ignoreEmptyError bool
     credentialStrategy CredentialStrategy
+    task               gocui.Task  // Layer 2 task 的引用（凭证处理时用）
     // ...
 }
 ```
 
-**链式配置方法**（都返回 `*CmdObj` 以支持链式调用）：
-- `StreamOutput()`：`streamOutput = true` —— 输出流到命令日志面板
-- `UsePty()`：`usePty = true` —— 使用伪终端（保留彩色输出，需要配合 StreamOutput）
-- `DontLog()`：`dontLog = true` —— 不在 UI 上记录这条命令
-- `SuppressOutputUnlessError()`：出错时才显示输出
-- `IgnoreEmptyError()`：空输出的错误视为成功
-- `SetStdin()` / `AddEnvVars()` / `SetWd()`：设置标准输入、环境变量、工作目录
-- `PromptOnCredentialRequest()` / `FailOnCredentialRequest()`：设置凭证处理策略
+**配置方法的调用时机和层级归属**（重要！）：
 
-**执行方法**（都委托给 `runner`）：
+| 方法 | 在哪里被调用 | 归属层级 | 作用 |
+|------|-------------|---------|------|
+| `StreamOutput()` | finalHandler 闭包内（output == log/logWithPty 时） | Layer 1 调用，Layer 4 存储 | 设置 `streamOutput = true` |
+| `UsePty()` | finalHandler 闭包内（output == logWithPty 时） | Layer 1 调用，Layer 4 存储 | 设置 `usePty = true` |
+| `PromptOnCredentialRequest(task)` | 非自定义命令场景（如 git push） | 业务代码调用，Layer 4 存储 | 设置 `credentialStrategy = PROMPT`、`usePty = true`、`task = task` |
+| `FailOnCredentialRequest()` | 非自定义命令场景（如后台 git fetch） | 业务代码调用，Layer 4 存储 | 设置 `credentialStrategy = FAIL`、`usePty = true` |
+| `DontLog()` | 各处只读命令 | 业务代码调用，Layer 4 存储 | 设置 `dontLog = true` |
+| `SetStdin()` / `AddEnvVars()` / `SetWd()` | 各处 | 业务代码调用，Layer 4 存储 | 修改 `*exec.Cmd` 的属性 |
+
+**配置方法的特点**：都返回 `*CmdObj` 以支持链式调用，如 `cmdObj.StreamOutput().UsePty()`。
+
+**执行方法**（都委托给 `runner`，Layer 1 调用 → Layer 4 转发 → Layer 5 执行）：
 - `Run()` → `runner.Run(self)`
 - `RunWithOutput()` → `runner.RunWithOutput(self)`
 - `RunWithOutputs()` → `runner.RunWithOutputs(self)`
 - `RunAndProcessLines()` → `runner.RunAndProcessLines(self, onLine)`
 
-**职责边界：**
-- ✅ 持有命令执行的所有配置
-- ✅ 提供链式 API 设置配置
-- ✅ 把执行委托给 runner
-- ❌ 不实际执行命令（那是 runner 的事）
-- ❌ 不处理输出流式传输的细节（那是 runner 的事）
-- ❌ 不处理凭证检测的细节（那是 runner 的事）
+**查询方法**（供 Layer 5 查询配置）：
+- `ShouldStreamOutput()` → 返回 `streamOutput`
+- `ShouldUsePty()` → 返回 `usePty`
+- `ShouldLog()` → 返回 `!dontLog`
+- `GetCredentialStrategy()` → 返回 `credentialStrategy`
+- `GetTask()` → 返回 `task`（凭证处理时 Layer 5 获取 Layer 2 task 引用）
+- `GetCmd()` → 返回内部的 `*exec.Cmd`（Layer 5 实际执行用）
+
+**职责边界（精准版）：**
+- ✅ 持有 Layer 3 创建的 `*exec.Cmd` 对象
+- ✅ 持有 Layer 5 runner 的引用
+- ✅ 持有所有执行配置标志位
+- ✅ 持有跨层级数据传递（如 Layer 2 的 task 引用）
+- ✅ 提供配置 API 给 Layer 1/业务代码调用
+- ✅ 提供查询 API 给 Layer 5 读取配置
+- ✅ 提供执行 API 给 Layer 1 调用，并委托给 Layer 5
+- ❌ 不实际执行命令（不直接调用 `cmd.Run()`，那是 Layer 5 的事）
+- ❌ 不处理输出流式传输的细节（那是 Layer 5 的事）
+- ❌ 不处理凭证检测的细节（那是 Layer 5 的事）
+- ❌ 不决定用哪种配置（那是 Layer 1/业务代码的事）
 
 ---
 
@@ -660,32 +678,39 @@ type ICmdObjRunner interface {
 }
 ```
 
-根据 CmdObj 的配置，`RunWithOutput` 会走不同的执行路径：
+**重要前提**：在自定义命令场景下，`finalHandler` 中**从未调用** `cmdObj.PromptOnCredentialRequest()` 或 `cmdObj.FailOnCredentialRequest()`，因此 `cmdObj.GetCredentialStrategy()` 永远是 `NONE`，凭证处理分支在自定义命令中不会被触发。
+
+根据 CmdObj 的配置，`RunWithOutput` 会走不同的执行路径（**代码中的分支顺序如下**）：
 
 ```go
 func (self *cmdObjRunner) RunWithOutput(cmdObj *CmdObj) (string, error) {
-    // 1. 互斥锁：防止某些命令同时执行
+    // 前置：互斥锁处理（非分支）
     if cmdObj.Mutex() != nil {
         cmdObj.Mutex().Lock()
         defer cmdObj.Mutex().Unlock()
     }
 
-    // 2. 分支 1：需要凭证处理（用户名/密码/2FA）
+    // 分支 1（代码顺序）：凭证处理 —— 自定义命令中永远不走
     if cmdObj.GetCredentialStrategy() != NONE {
         return "", self.runWithCredentialHandling(cmdObj)
     }
 
-    // 3. 分支 2：需要流式输出（log / logWithPty）
+    // 分支 2（代码顺序）：流式输出（log / logWithPty）
     if cmdObj.ShouldStreamOutput() {
         return "", self.runAndStream(cmdObj)
     }
 
-    // 4. 分支 3：同步执行获取输出（popup / none）
+    // 分支 3（代码顺序）：同步执行获取输出（popup / none）
     return self.RunWithOutputAux(cmdObj)
 }
 ```
 
-#### 6.9.1 分支 1：RunWithOutputAux —— 同步执行捕获输出
+**返回值说明**：
+- 分支 1 和分支 2 返回 `""`（空字符串）——代码注释明确说明："for now we're not capturing output"
+- 只有分支 3 返回真正的输出字符串
+- 在 `finalHandler` 中，`output` 变量仅在 `output == "popup"` 时被使用，而 popup 模式恰好走分支 3，因此没问题
+
+#### 6.9.1 分支 3（代码顺序）：RunWithOutputAux —— 同步执行捕获输出
 
 [RunWithOutputAux](pkg/commands/oscommands/cmd_obj_runner.go#L100-L116) 是最简单的执行路径：
 ```go
@@ -702,7 +727,9 @@ func (self *cmdObjRunner) RunWithOutputAux(cmdObj *CmdObj) (string, error) {
 }
 ```
 
-#### 6.9.2 分支 2：runAndStream —— 流式输出到命令日志面板
+**自定义命令场景**：当 `output` 为 `popup` 或 `none` 时走这条路径。
+
+#### 6.9.2 分支 2（代码顺序）：runAndStream —— 流式输出到命令日志面板
 
 [runAndStream](pkg/commands/oscommands/cmd_obj_runner.go#L218-L224) → `runAndStreamAux` 处理流式输出：
 ```go
@@ -741,39 +768,64 @@ func (self *cmdObjRunner) runAndStreamAux(cmdObj *CmdObj, onRun func(*cmdHandler
 }
 ```
 
-#### 6.9.3 分支 3：runWithCredentialHandling —— 检测并处理凭证请求
+**自定义命令场景**：当 `output` 为 `log` 或 `logWithPty` 时走这条路径。
 
-[runWithCredentialHandling](pkg/commands/oscommands/cmd_obj_runner.go#L314-L321) → `runAndDetectCredentialRequest` 处理密码/2FA 等输入场景：
-```go
-func (self *cmdObjRunner) runAndDetectCredentialRequest(...) error {
-    // 强制英文输出，方便检测凭证提示
-    cmdObj.AddEnvVars("LANG=C", "LC_ALL=C", "LC_MESSAGES=C")
+#### 6.9.3 分支 1（代码顺序）：runWithCredentialHandling —— 检测并处理凭证请求
 
-    return self.runAndStreamAux(cmdObj, func(handler *cmdHandler, cmdWriter io.Writer) {
-        tr := io.TeeReader(handler.stdoutPipe, cmdWriter)
-        go utils.Safe(func() {
-            // 在后台 goroutine 中扫描输出，检测 "Password:" / "Username:" 等提示
-            self.processOutput(tr, handler.stdinPipe, promptUserForCredential, handler.close, cmdObj)
-        })
-    })
-}
+**重要说明**：这个分支在自定义命令场景下**永远不会被触发**，因为 `finalHandler` 中从未设置凭证策略。但为了完整理解代码，这里仍然分析其层级归属。
+
+**凭证处理的完整调用链和层级归属**：
+
+```
+非自定义命令场景（如 git push/pull 内部调用）
+  │
+  ├─ Layer 1（业务代码）:
+  │    cmdObj.PromptOnCredentialRequest(task)
+  │      ↓ 这是 Layer 4 的方法
+  │
+  ├─ Layer 4（CmdObj）: [PromptOnCredentialRequest](pkg/commands/oscommands/cmd_obj.go#L204-L210)
+  │    func (self *CmdObj) PromptOnCredentialRequest(task gocui.Task) *CmdObj {
+  │        self.credentialStrategy = PROMPT   // 设置凭证策略标志位
+  │        self.usePty = true                  // 自动开启 PTY
+  │        self.task = task                    // 保存 Layer 2 的 task 引用！
+  │        return self
+  │    }
+  │
+  ├─ Layer 4（CmdObj）: cmdObj.RunWithOutput() → self.runner.RunWithOutput(self)
+  │
+  └─ Layer 5（cmdObjRunner）:
+       [runWithCredentialHandling](pkg/commands/oscommands/cmd_obj_runner.go#L314-L321)
+         → [runAndDetectCredentialRequest](pkg/commands/oscommands/cmd_obj_runner.go#L338-L352)
+           → [processOutput](pkg/commands/oscommands/cmd_obj_runner.go#L354-L399)
+                │
+                ├─ task := cmdObj.GetTask()  ← 从 Layer 4 获取 Layer 2 的 task 引用
+                │
+                ├─ 检测到 "Password:" 等提示:
+                │    ├─ task.Pause()           ← 调用 Layer 2 task 的方法
+                │    │                          （同时触发 appStatusHelperTask.Pause()
+                │    │                           隐藏加载动画）
+                │    ├─ 弹出凭证输入框（通过 guiIO.promptForCredentialFn）
+                │    ├─ task.Continue()        ← 恢复 Layer 2 task
+                │    └─ 写入 stdin
 ```
 
-[processOutput](pkg/commands/oscommands/cmd_obj_runner.go#L354-L399) 实时扫描输出，检测到凭证提示时：
-1. 暂停任务（`task.Pause()`）—— 同时暂停加载动画
-2. 弹出凭证输入框
-3. 用户输入后继续任务（`task.Continue()`）—— 同时恢复加载动画
-4. 把输入写入命令的 stdin
+**凭证处理的跨层级协作**：
+- **Layer 1** 调用 `PromptOnCredentialRequest(task)` 触发整个凭证处理流程
+- **Layer 4** 是"数据载体"——持有 `credentialStrategy` 标志位和 `task` 引用
+- **Layer 5** 是"检测执行者"——扫描输出检测凭证提示
+- **Layer 2** 是"被通知者"——通过 `task.Pause()/Continue()` 暂停/继续任务和加载动画
+- **GUI 层（guiIO）** 是"交互执行者"——弹出输入框获取用户输入
 
-**职责边界：**
+**职责边界（Layer 5）：**
 - ✅ 真正调用系统 API 执行命令（`cmd.Run()` / `cmd.Start()` / `cmd.Wait()`）
 - ✅ 处理输出捕获和流式传输
 - ✅ 处理互斥锁
-- ✅ 处理凭证检测和输入
+- ✅ 处理凭证检测（正则匹配 "Password:" 等提示）
 - ✅ 处理日志记录和时间统计
 - ✅ 处理错误转换（把 exit code 转为 error，把 stderr 放到 error 信息里）
 - ❌ 不决定用哪种执行策略（那是 Layer 1 的事）
-- ❌ 不处理 GUI 状态（那是 Layer 2 的事）
+- ❌ 不决定是否需要凭证处理（那是 Layer 1 调用 `PromptOnCredentialRequest` 时决定的）
+- ❌ 不处理 GUI 状态切换（那是 Layer 2 task 的事）
 - ❌ 不处理命令字符串的构建（那是 Layer 3 的事）
 
 ---
@@ -904,44 +956,47 @@ handlerCreator.call() 返回的函数被调用
                   │               ├─ 组装成 [shell, shellArg, quotedCommand]
                   │               └─ return New(cmdArgs)  ← 创建 *exec.Cmd，包装成 CmdObj
                   │
-                  │           ── Layer 4: 命令配置层 ──
+                  │           ── Layer 4: 命令对象层 ──
                   │           「CmdObj.StreamOutput() → .UsePty() → .RunWithOutput()」
-                  │               ├─ StreamOutput() → streamOutput = true
-                  │               ├─ UsePty()       → usePty = true
-                  │               └─ RunWithOutput()
-                  │                    ├─ 互斥锁处理
-                  │                    ├─ 检查 credentialStrategy  ← 分支决定
-                  │                    ├─ 检查 ShouldStreamOutput  ← 分支决定
-                  │                    └─ 委托 runner.RunWithOutput(self)  ← 调用 Layer 5
+                  │               ├─ Layer 1 调用 StreamOutput() → Layer 4 存储 streamOutput = true
+                  │               ├─ Layer 1 调用 UsePty()       → Layer 4 存储 usePty = true
+                  │               └─ Layer 1 调用 RunWithOutput()
+                  │                    └─ Layer 4 转发给 runner.RunWithOutput(self)  ← 调用 Layer 5
                   │
                   └───────── Layer 5: 实际执行层 ──────────
                               「cmdObjRunner.RunWithOutput(cmdObj)」
                                   │
-                                  ├─ 有 credentialStrategy != NONE ?
-                                  │    └─ 是 → runWithCredentialHandling(cmdObj)
+                                  ├─ 前置：互斥锁检查（非分支）
+                                  │    └─ Mutex() != nil → Lock() / defer Unlock()
+                                  │
+                                  ├─ 分支 1（代码顺序）：credentialStrategy != NONE ?
+                                  │    │  自定义命令中永远为 false（从未设置）
+                                  │    └─ 是 → runWithCredentialHandling(cmdObj)  ← 返回 ""
                                   │              ├─ 设置 LANG=C 等环境变量（英文输出方便检测）
                                   │              ├─ runAndStreamAux(..., processOutput)
                                   │              └─ processOutput 后台扫描：
                                   │                   ├─ 检测 "Password:" / "Username:" 等
-                                  │                   ├─ task.Pause()  ← 同时暂停加载动画
-                                  │                   ├─ 弹出输入框获取用户输入
-                                  │                   ├─ task.Continue()  ← 同时恢复加载动画
+                                  │                   ├─ task.Pause()  ← Layer 5 调用 Layer 2 task
+                                  │                   ├─ 弹出输入框获取用户输入（guiIO）
+                                  │                   ├─ task.Continue()  ← 恢复 Layer 2 task
                                   │                   └─ 写入 stdin
                                   │
-                                  ├─ ShouldStreamOutput() ?
-                                  │    └─ 是 → runAndStream(cmdObj)
+                                  ├─ 分支 2（代码顺序）：ShouldStreamOutput() ?
+                                  │    │  自定义命令中：output == log/logWithPty 时为 true
+                                  │    └─ 是 → runAndStream(cmdObj)  ← 返回 ""
                                   │              ├─ runAndStreamAux(..., io.Copy)
                                   │              │    ├─ 输出目标：cmdWriter（命令日志面板）or buffer
                                   │              │    ├─ ShouldUsePty() ? → getCmdHandlerPty / getCmdHandlerNonPty
                                   │              │    ├─ goroutine: io.Copy(cmdWriter, stdoutPipe)
-                                  │              │    └─ cmd.Wait()  等待命令完成
+                                  │              │    └─ cmd.Wait()  ← Go 标准库，等待命令完成
                                   │              └─ 出错 && suppressOutputUnlessError → 把缓冲输出写入面板
                                   │
-                                  └─ 否 → RunWithOutputAux(cmdObj)
+                                  └─ 分支 3（代码顺序）：默认 → RunWithOutputAux(cmdObj)
+                                            │  自定义命令中：output == popup/none 时走这里
                                             ├─ log 命令
                                             ├─ cmd.CombinedOutput()  ← Go 标准库，阻塞执行
                                             ├─ sanitisedCommandOutput  错误转换（stderr → error message）
-                                            └─ return output, err
+                                            └─ return output, err  ← 唯一返回真正输出的分支
 ```
 
 ---
@@ -1011,14 +1066,28 @@ handlerCreator.call() 返回的函数被调用
 
 8. **confirm 不记录响应**：confirm 类型直接调用 `g()` 而非 `wrappedF()`，因为它不产生值，仅作为确认门控。
 
-9. **五层职责边界**：执行部分从外到内分为清晰的五层——业务编排层（finalHandler 做战略决策）→ GUI 辅助包装层（RunSubprocessAndRefresh/WithWaitingStatus 处理 GUI 交互）→ 命令构建层（NewShell 处理平台差异和 shell 包装）→ 命令配置层（CmdObj 持配置做委托）→ 实际执行层（cmdObjRunner 真正调用系统 API）。每一层职责单一，只关心自己的事。
+9. **五层职责边界**：执行部分从外到内分为清晰的五层——业务编排层（finalHandler 做战略决策）→ GUI 辅助包装层（RunSubprocessAndRefresh/WithWaitingStatus 处理 GUI 交互）→ 命令构建层（NewShell 处理平台差异和 shell 包装）→ 命令对象层（CmdObj 是三位一体的桥梁）→ 实际执行层（cmdObjRunner 真正调用系统 API）。每一层职责单一，只关心自己的事。
 
-10. **委托模式解耦配置与执行**：CmdObj 本身不执行命令，只持有配置并把执行委托给 runner。这使得执行策略可以灵活切换（测试时用 fake runner，生产时用真实 runner）。
+10. **CmdObj 是三位一体的桥梁**：CmdObj 不仅仅是配置对象，它同时持有 `*exec.Cmd`（Layer 3 创建的真正执行载体）、`runner` 引用（Layer 5 的实际执行者）、所有配置标志位、以及跨层级传递的数据（如 Layer 2 的 task 引用）。它是连接 Layer 1/3/5 的核心枢纽。
 
-11. **装饰器模式增强 Task**：`appStatusHelperTask` 用装饰器模式包装 `gocui.Task`，在不改变 Task 接口的前提下增加了"暂停时隐藏加载状态、继续时显示加载状态"的行为。
+11. **委托模式解耦配置与执行**：CmdObj 本身不执行命令，只持有配置并把执行委托给 runner。这使得执行策略可以灵活切换（测试时用 fake runner，生产时用真实 runner）。
 
-12. **RunSubprocessAndRefresh 与 WithWaitingStatus 互斥**：两者都是 GUI 包装层，但职责完全不重叠——RunSubprocessAndRefresh 处理需要真实终端交互的场景（暂停 GUI），WithWaitingStatus 处理后台执行场景（显示加载状态），绝不会同时调用。
+12. **装饰器模式增强 Task**：`appStatusHelperTask` 用装饰器模式包装 `gocui.Task`，在不改变 Task 接口的前提下增加了"暂停时隐藏加载状态、继续时显示加载状态"的行为。
 
-13. **配置与执行的两次分支决策**：第一次在 Layer 1（finalHandler）决定走哪条 GUI 包装路径和执行配置，第二次在 Layer 5（cmdObjRunner.RunWithOutput）根据 CmdObj 的配置标志位决定实际执行路径（同步/流式/凭证处理）。两次决策的关注点不同，互不干扰。
+13. **RunSubprocessAndRefresh 与 WithWaitingStatus 互斥**：两者都是 GUI 包装层，但职责完全不重叠——RunSubprocessAndRefresh 处理需要真实终端交互的场景（暂停 GUI），WithWaitingStatus 处理后台执行场景（显示加载状态），绝不会同时调用。
 
-14. **Runner 的内部分支设计**：`RunWithOutput` 方法内部根据 CmdObj 的配置标志位做三级分支——先处理互斥锁，再判断是否需要凭证处理，再判断是否需要流式输出，最后走同步执行。这种设计让调用方（Layer 1）只需调一个方法，无需关心内部实现。
+14. **配置与执行的两次分支决策**：第一次在 Layer 1（finalHandler）决定走哪条 GUI 包装路径和执行配置，第二次在 Layer 5（cmdObjRunner.RunWithOutput）根据 CmdObj 的配置标志位决定实际执行路径。两次决策的关注点不同，互不干扰。
+
+15. **Runner 的内部分支设计（代码顺序为准）**：`RunWithOutput` 方法内部结构是：
+    - 前置：互斥锁处理（非分支）
+    - 分支 1：凭证处理（自定义命令中永远不走）
+    - 分支 2：流式输出（log/logWithPty）
+    - 分支 3：同步执行（popup/none）
+
+    这种设计让调用方（Layer 1）只需调一个方法，无需关心内部实现。
+
+16. **返回值不对称设计**：`RunWithOutput` 的三个分支返回值不对称——分支 1 和 2 返回空字符串 `""`，只有分支 3 返回真正的命令输出。这是有意设计的，因为流式输出和凭证处理场景下输出已经实时展示了，不需要再捕获返回值。
+
+17. **自定义命令中凭证处理分支不可达**：由于 `finalHandler` 中从未调用 `PromptOnCredentialRequest()` 或 `FailOnCredentialRequest()`，`GetCredentialStrategy()` 永远是 `NONE`，因此凭证处理分支在自定义命令场景下永远不会被触发。
+
+18. **凭证处理的跨层级协作**：凭证处理需要四个层级协作——Layer 1（或业务代码）调用 `PromptOnCredentialRequest(task)` 触发、Layer 4 存储 `task` 引用和标志位、Layer 5 扫描输出检测凭证提示并调用 `task.Pause()/Continue()`、Layer 2 的 `appStatusHelperTask` 响应暂停/继续切换加载动画。
