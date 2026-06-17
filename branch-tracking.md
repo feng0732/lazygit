@@ -65,7 +65,7 @@
 3. 把 HEAD 分支移到列表首位
 4. **从 git config 补充 UpstreamRemote 和 UpstreamBranch**
 5. 从旧分支列表继承 BehindBaseBranch（减少闪烁）
-6. 可选：异步计算 BehindBaseBranch（相对基准分支落后数）
+6. 可选：**调度**异步计算 BehindBaseBranch（相对基准分支落后数）
 
 ### 3.2 获取原始分支数据：git for-each-ref
 
@@ -139,11 +139,27 @@ git config --local --get-regexp ^branch\.
 
 **原因**：`git for-each-ref` 的 `%(upstream:short)` 只在本地缓存了远端引用时才有值，而 git config 始终保存追踪配置，两者互为补充。
 
-### 3.5 BehindBaseBranch 的异步计算
+### 3.5 BehindBaseBranch 的异步调度与计算
 
-[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L148-L330)
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L139-L330)
 
-根据 Git 版本有两条路径：
+在 `BranchLoader.Load` 的第 139-143 行：
+
+```go
+if loadBehindCounts && self.UserConfig().Gui.ShowDivergenceFromBaseBranch != "none" {
+    onWorker(func() error {
+        return self.GetBehindBaseBranchValuesForAllBranches(branches, mainBranches, renderFunc)
+    })
+}
+```
+
+**关键机制**：
+- `loadBehindCounts=true` 表示**调度**异步计算任务，不是同步计算
+- 实际计算通过 `onWorker` 抛到后台 worker goroutine
+- 同步返回的分支列表继承旧的 BehindBaseBranch 值（避免闪烁）
+- 计算完成后通过 `renderFunc()` 切到 UI 线程触发 `HandleRender()` 和 `refreshStatus()`
+
+根据 Git 版本有两条计算路径：
 
 | 路径 | Git 版本要求 | 方式 |
 |------|-------------|------|
@@ -208,26 +224,101 @@ if self.c.UserConfig().Git.LocalBranchSortOrder == "recency" {
 } else {
     // 不依赖 reflog，可以并行
     refresh("branches", func() {
-        self.refreshBranches(..., true)  // loadBehindCounts = true
+        self.refreshBranches(..., true)  // loadBehindCounts = true，硬编码
     })
     refresh("reflog", func() { ... })    // reflog 独立加载
 }
 ```
 
-**影响**：`recency` 模式下，分支加载必须等待 reflog 完成；其他模式下两者可以并行，加快首屏加载速度。
+**影响**：`recency` 模式下，分支加载必须走 `refreshReflogAndBranches` 串行链路；`date` / `alphabetical` 模式下分支与 reflog 可以并行加载。
 
-### 4.4 启动阶段的两阶段加载
+### 4.4 启动阶段：recency 模式的两次刷新机制
 
 [refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L283-L304)
 
-为解决 recency 排序下 reflog 加载瓶颈，系统设计了两阶段启动：
+为解决 recency 排序下 reflog 加载瓶颈，系统设计了 **INITIAL/COMPLETE 两阶段** + **两次 refreshBranches 调用**机制。
 
-| 阶段 | 行为 | BehindBaseBranch |
-|------|------|-----------------|
-| `INITIAL` | 异步加载 reflog，加载后刷新分支 | `loadBehindCounts = false`（跳过） |
-| `COMPLETE` | 同步加载 reflog | `loadBehindCounts = true`（计算） |
+#### 4.4.1 startupStage 的初始值
 
-这意味着首次启动时不会计算 BehindBaseBranch，等 reflog 加载完毕进入 COMPLETE 阶段后才会在后续刷新中计算。
+[common.go](pkg/gui/types/common.go#L406-L407) 定义：
+```go
+INITIAL StartupStage = iota  // 默认值 0
+COMPLETE                     // 值 1
+```
+
+`GuiRepoState` 初始化时 `StartupStage` 默认为 `INITIAL`（Go struct 零值机制）。
+
+#### 4.4.2 recency 模式启动时序（初始状态 startupStage = INITIAL）
+
+**`refreshReflogAndBranches` 内部执行顺序**：
+
+```
+第 299 行: loadBehindCounts := startupStage == COMPLETE
+           → 当前是 INITIAL → loadBehindCounts = false
+
+第 301 行: 调用 refreshReflogCommitsConsideringStartup()
+           → 匹配 INITIAL case
+           → 把以下工作抛到 worker goroutine，函数立即返回:
+               1. refreshReflogCommits()           // 加载 reflog
+               2. refreshBranches(false, true, true)  // loadBehindCounts = true
+               3. SetStartupStage(COMPLETE)
+
+第 303 行: 调用 refreshBranches(..., loadBehindCounts=false)
+           → 同步执行，BehindBaseBranch 不调度计算
+```
+
+**关键时序**（按执行顺序）：
+
+| 步骤 | 执行位置 | 操作 | loadBehindCounts | startupStage 状态 |
+|------|---------|------|-----------------|------------------|
+| 1 | UI 线程 | `refreshReflogAndBranches` 计算 `loadBehindCounts=false` | — | INITIAL |
+| 2 | UI 线程 | `refreshReflogCommitsConsideringStartup` 调度异步任务，**立即返回** | — | INITIAL |
+| 3 | UI 线程 | 第一次 `refreshBranches(false)` 执行，**立即返回分支列表** | false | INITIAL |
+| 4 | 后台 worker | `refreshReflogCommits()` 加载 reflog | — | INITIAL |
+| 5 | 后台 worker | **第二次 `refreshBranches(true)` 执行**，调度 BehindBaseBranch 计算 | true | **还是 INITIAL** |
+| 6 | 后台 worker | `SetStartupStage(COMPLETE)` | — | → COMPLETE |
+
+**重要结论**：
+1. **recency 模式启动时会调用两次 refreshBranches**
+   - 第一次（同步，UI 线程）：`loadBehindCounts=false` → 快速展示分支列表（无 BehindBaseBranch 计算）
+   - 第二次（异步，worker 中）：`loadBehindCounts=true` → reflog 加载完后再次刷新，调度 BehindBaseBranch 计算
+2. 第二次 `refreshBranches(true)` 发生在 `SetStartupStage(COMPLETE)` **之前**，不是等进入 COMPLETE 阶段后的"后续刷新"
+3. 两次调用间隔是 reflog 加载的耗时（通常几十到几百毫秒）
+
+#### 4.4.3 COMPLETE 阶段后的行为
+
+当 startupStage = COMPLETE 后，后续刷新 `refreshReflogAndBranches` 的行为：
+
+```
+第 299 行: loadBehindCounts := startupStage == COMPLETE → true
+
+第 301 行: refreshReflogCommitsConsideringStartup()
+           → 匹配 COMPLETE case
+           → 同步执行 refreshReflogCommits()
+
+第 303 行: refreshBranches(..., true)  → loadBehindCounts=true
+```
+
+此时是完整的同步流程：先同步加载 reflog，再同步刷新分支（调度 BehindBaseBranch 异步计算）。
+
+#### 4.4.4 date/alphabetical 模式的行为
+
+**没有两阶段机制**。启动第一次刷新就直接调用：
+
+```go
+self.refreshBranches(includeWorktreesWithBranches, options.KeepBranchSelectionIndex, true)
+```
+
+`loadBehindCounts` **硬编码为 true**，无需等待 reflog，BehindBaseBranch 计算在第一次刷新时就会被调度。
+
+#### 4.4.5 loadBehindCounts 参数传递全景
+
+| 排序模式 | 启动阶段 | 调用者 | loadBehindCounts 值 |
+|---------|---------|-------|--------------------|
+| recency | 初始 INITIAL | 第 303 行 sync call | false（第 299 行计算） |
+| recency | 初始 INITIAL | 第 288 行 async call | true（硬编码） |
+| recency | 后续 COMPLETE | 第 303 行 sync call | true（第 299 行计算） |
+| date/alphabetical | 任何阶段 | 第 148 行 sync call | true（硬编码） |
 
 ## 五、推送计数对分支状态展示的影响
 
@@ -341,22 +432,27 @@ func (self *SyncController) push(currentBranch *models.Branch) error {
 ```
 触发刷新 (Refresh)
   │
-  ├─ recency 模式 ─────────────────────────────────────────────────┐
-  │   refreshReflogAndBranches()                                   │
-  │     ├─ refreshReflogCommitsConsideringStartup()                │
-  │     │   ├─ INITIAL: 异步加载 reflog → 完成后 refreshBranches   │
-  │     │   └─ COMPLETE: 同步加载 reflog                           │
-  │     └─ refreshBranches(loadBehindCounts 取决于 startup stage)  │
-  │                                                                │
-  └─ date/alphabetical 模式 ───────────────────────────────────────┤
-      refreshBranches(loadBehindCounts=true) 与 refreshReflog 并行 │
-                                                                   │
-  ┌────────────────────────────────────────────────────────────────┘
+  ├─ recency 模式 ────────────────────────────────────────────────────┐
+  │   refreshReflogAndBranches()                                       │
+  │     ├─ 第 299 行: loadBehindCounts := startupStage == COMPLETE     │
+  │     ├─ 第 301 行: refreshReflogCommitsConsideringStartup()         │
+  │     │   ├─ INITIAL: OnWorker 调度异步任务，立即返回                 │
+  │     │   │   ├─ 后台: refreshReflogCommits()                        │
+  │     │   │   ├─ 后台: refreshBranches(false, true, true)  ◀── 第二次刷新，true
+  │     │   │   └─ 后台: SetStartupStage(COMPLETE)                     │
+  │     │   └─ COMPLETE: 同步 refreshReflogCommits()                   │
+  │     │                                                              │
+  │     └─ 第 303 行: refreshBranches(..., loadBehindCounts)  ◀── 第一次刷新，false(INITIAL)/true(COMPLETE)
+  │                                                                    │
+  └─ date/alphabetical 模式 ───────────────────────────────────────────┤
+      refreshBranches(..., true)  ← 硬编码 true，与 refreshReflog 并行 │
+                                                                      │
+  ┌────────────────────────────────────────────────────────────────────┘
   │
   ▼
 refreshBranches()
   │
-  ├─ BranchLoader.Load()
+  ├─ BranchLoader.Load(reflogCommits, mainBranches, oldBranches, loadBehindCounts, onWorker, renderFunc)
   │    │
   │    ├─ obtainBranches()
   │    │    ├─ getRawBranches()
@@ -377,11 +473,17 @@ refreshBranches()
   │    │
   │    ├─ 继承旧 BehindBaseBranch 值（减少闪烁）
   │    │
-  │    └─ [异步] GetBehindBaseBranchValuesForAllBranches()
-  │         ├─ git ≥ 2.41: for-each-ref %(ahead-behind:<base>)
-  │         └─ git < 2.41: per-branch merge-base + rev-list
+  │    └─ loadBehindCounts && showDivergence != "none"?
+  │         └─ 是 → onWorker(GetBehindBaseBranchValuesForAllBranches)
+  │                  ├─ git ≥ 2.41: for-each-ref %(ahead-behind:<base>)
+  │                  └─ git < 2.41: per-branch merge-base + rev-list
+  │                    → 全部完成后 renderFunc() → UI 线程重绘
   │
-  └─ renderFunc() → UI 线程 HandleRender + refreshStatus
+  ├─ Model.Branches = branches
+  ├─ refreshView(Branches)  ← 第一次渲染（BehindBaseBranch 用继承值）
+  │
+  └─ [BehindBaseBranch 计算完成后] renderFunc()
+       → OnUIThread: HandleRender + refreshStatus  ← 第二次渲染（显示正确 ↓N）
        │
        ▼
 presentation.GetBranchListDisplayStrings()
@@ -412,12 +514,14 @@ ListRenderer 渲染到 Branches View
 
 3. **Push 计数隐藏设计**：`AheadForPush` / `BehindForPush` 在 UI 上不可见，仅在 push 操作时用于判断是否需要 force push 确认。这是三角工作流（pull from origin, push to fork）的必要支持，但对普通用户来说是无感的安全保障。
 
-4. **排序影响刷新路径**：`recency` 模式下分支加载必须串行等待 reflog，而 `date` / `alphabetical` 模式下分支与 reflog 可以并行加载，启动更快。
+4. **排序影响刷新路径**：`recency` 模式下必须走 `refreshReflogAndBranches` 串行链路，而 `date` / `alphabetical` 模式下分支与 reflog 可以并行加载。
 
-5. **渐进式渲染**：`BehindBaseBranch` 使用 `atomic.Int32` 存储，在后台 worker 中计算，完成后触发局部 UI 刷新。同时从旧分支列表继承该值以减少视觉闪烁。
+5. **recency 模式的两次刷新策略**：启动时先用 `loadBehindCounts=false` 快速展示分支列表，reflog 加载完后再用 `loadBehindCounts=true` 刷新一次并调度 BehindBaseBranch 计算。两次刷新之间状态仍为 INITIAL，第二次刷新完成后才切换到 COMPLETE。
 
-6. **两阶段启动**：首次启动时处于 INITIAL 阶段，跳过 BehindBaseBranch 计算以加速首屏显示；reflog 加载完成后进入 COMPLETE 阶段，后续刷新才会计算 BehindBaseBranch。
+6. **date/alphabetical 模式无两阶段**：与 recency 模式不同，`date` / `alphabetical` 排序下启动第一次刷新就硬编码 `loadBehindCounts=true`，BehindBaseBranch 计算立即调度，无需等 reflog。
 
-7. **状态优先级**：展示时 `itemOperation`（正在 push/pull 等）优先级最高，覆盖所有追踪状态显示；其次是 `UpstreamGone`，最后才是常规 ahead/behind 状态。
+7. **渐进式渲染三层机制**：① 从旧分支列表继承 BehindBaseBranch 减少闪烁；② `loadBehindCounts=true` 仅调度不阻塞；③ 计算完成后通过 `renderFunc()` 切 UI 线程局部重绘。
 
-8. **两个独立维度**：BranchStatus（`✓`/`↓N↑M` 等）反映与 **upstream** 的同步关系，divergenceStr（右对齐 `↓N`）反映与 **base branch** 的落后关系，两者在视觉位置和语义上都做了区分。
+8. **状态优先级**：展示时 `itemOperation`（正在 push/pull 等）优先级最高，覆盖所有追踪状态显示；其次是 `UpstreamGone`，最后才是常规 ahead/behind 状态。
+
+9. **两个独立维度**：BranchStatus（`✓`/`↓N↑M` 等）反映与 **upstream** 的同步关系，divergenceStr（右对齐 `↓N`）反映与 **base branch** 的落后关系，两者在视觉位置和语义上都做了区分。
