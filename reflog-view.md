@@ -85,7 +85,18 @@ return a.Hash() == b.Hash() &&
        a.Name == b.Name
 ```
 
-> 只用 hash 不够，因为同一个 commit 可能对应多条 reflog 记录；加上时间戳和 reflog 消息才能唯一区分。
+**时间戳的真实含义与碰撞边界**：
+
+源码注释（第 46-49 行）明确指出：
+
+> the unix timestamp here is the timestamp of the COMMIT, not the reflog entry itself,
+> so two consecutive reflog entries may have both the same hash and therefore same timestamp.
+> We use the reflog message to disambiguate, and fingers crossed that we never see the same
+> of those twice in a row. Reason being that it would mean we'd be erroneously exiting early.
+
+关键事实：
+1. `%ct` 产出的是 **commit 的作者时间戳**，不是 reflog 条目自身的操作时间。因此当同一个 commit 连续出现在多条 reflog 记录中时，hash 和时间戳**完全相同**，三元组中只有 `Name`（reflog 消息，即 `%gs`）能消歧。
+2. 存在**理论碰撞边界**：如果同一个 commit 连续产生两条 `%gs` 消息完全相同的 reflog 记录（例如快速连续执行两次完全一样的操作），三元组会错误命中断点，导致提前终止读取、丢失后续条目。代码用 "fingers crossed" 承认了这一风险，但在实践中极为罕见。
 
 ### 2.3 行解析：parseLine()
 
@@ -103,7 +114,7 @@ models.NewCommit(hashPool, models.NewCommitOpts{
 })
 ```
 
-`Status == StatusReflog` 是后续代码中区分 reflog 条目和普通 commit 的关键依据。
+`Status == StatusReflog` 的**真实用途**仅有一处：`pkg/gui/presentation/commits.go` 第 499 行的 hash 颜色 switch 分支，将 reflog 条目的 hash 映射为蓝色（`style.FgBlue`）。它**并不**用于控制"子提交是否显示分支头标记"——那是由 `ReflogCommitsContext.ShowBranchHeadsInSubCommits()` 直接返回 `false` 实现的。
 
 ### 2.4 通用行处理：loadCommits()
 
@@ -306,7 +317,14 @@ controllers.AttachControllers(gui.State.Contexts.ReflogCommits,
 
 文件：`pkg/gui/controllers/reflog_commits_controller.go` 第 40-62 行
 
-光标移动时触发，在主面板显示 reflog 条目详情：
+**触发机制**：不是"光标移动时自动触发"，而是通过框架的 `onRenderToMainFn` 回调机制。注册发生在 `AttachControllers` 时（`pkg/gui/controllers/attach.go` 第 12 行），controller 的 `GetOnRenderToMain()` 返回值被挂到 context 上。该回调在两个时机被调用：
+
+1. **Context 获得焦点**：`HandleFocus()` → `SimpleContext.HandleFocus()` → 调用 `onRenderToMainFn()`（`pkg/gui/context/simple_context.go` 第 44-46 行）。包括用户切换到 reflog 面板、从弹窗返回等场景。
+2. **数据刷新后**：`PostRefreshUpdate` → `c.RenderToMainViews` 链路中调用 `HandleRenderToMain()`（`pkg/gui/view_helpers.go` 第 154、161 行）。侧边面板数据变化后，主面板内容需要同步更新。
+
+因此主面板的刷新发生在"获得焦点"和"数据变更后"两个时机，而非"光标移动时"。
+
+回调内部逻辑：
 
 ```go
 func (self *ReflogCommitsController) GetOnRenderToMain() func() {
@@ -408,13 +426,20 @@ refreshReflogCommits()                  pkg/gui/controllers/helpers/refresh_help
     │    └─ ReflogCommitLoader.GetReflogCommits()
     │         pkg/commands/git_commands/reflog_commit_loader.go:27
     │         └─ git log -g --format=+%H%x00%ct%x00%gs%x00%P
+    │         └─ 增量断点: hash + commit时间戳 + reflog消息 三元组
     │
     ├─ 刷新 FilteredReflogCommits（过滤子集）
     │
     └─ refreshView(ReflogCommits)  →  UI 线程重绘
               │
               ▼
-用户切换到 Reflog 面板 / 移动光标
+用户切换到 Reflog 面板 / 数据刷新后
+    │
+    ▼
+HandleFocus / HandleRenderToMain       ← 触发主面板渲染的两种时机
+    │
+    ▼
+ReflogCommitsController.GetOnRenderToMain()  → git show <hash>
     │
     ▼
 ReflogCommitsContext                    pkg/gui/context/reflog_commits_context.go
@@ -426,10 +451,6 @@ ReflogCommitsContext                    pkg/gui/context/reflog_commits_context.g
     │
     ▼
 用户按操作键
-    │
-    ├─ 空格/回车 → ReflogCommitsController.GetOnRenderToMain()
-    │                pkg/gui/controllers/reflog_commits_controller.go:40
-    │                git show <hash> → 主面板 PTY 渲染
     │
     ├─ checkout 键 → BasicCommitsController.checkout()
     │                 pkg/gui/controllers/basic_commits_controller.go:53
@@ -449,7 +470,7 @@ ReflogCommitsContext                    pkg/gui/context/reflog_commits_context.g
 ## 八、关键设计要点总结
 
 ### 1. 增量加载
-Reflog 是 lazygit 中**唯一做增量加载**的面板。通过 hash + 时间戳 + reflog 消息三元组识别断点，遇到已加载条目立即终止 git 命令输出，避免每次刷新都从头重读全部 reflog 历史。
+Reflog 是 lazygit 中**唯一做增量加载**的面板。通过 hash + commit 时间戳 + reflog 消息三元组识别断点，遇到已加载条目立即终止 git 命令输出，避免每次刷新都从头重读全部 reflog 历史。需注意：时间戳是 commit 的（`%ct`），不是 reflog 条目自身的操作时间，因此同一 commit 的连续 reflog 条目 hash 和时间戳完全相同，只能靠 reflog 消息消歧，存在理论碰撞风险。
 
 ### 2. 双模型设计
 `ReflogCommits`（完整全集）与 `FilteredReflogCommits`（渲染用）分离：
@@ -463,8 +484,8 @@ Reflog 不重复实现 commit 操作逻辑，直接通过 `BasicCommitsControlle
 ### 4. 启动两阶段加载
 启动时先进入 INITIAL 阶段快速显示 UI，后台异步加载 reflog，加载完成后再刷新分支排序，避免 reflog 数据量大时阻塞首屏。
 
-### 5. Status 标记区分类型
-reflog 条目用 `Status == StatusReflog` 标记，在需要区分普通 commit 和 reflog 条目的场景（例如子提交中是否显示分支头标记）用作判断条件。
+### 5. Status 标记的用途
+`StatusReflog` 在 gui 包中仅有一处实际使用：`pkg/gui/presentation/commits.go` 的 hash 颜色 switch 分支，将 reflog 条目 hash 映射为蓝色。它并不用于控制分支头标记等逻辑——那些由 `ReflogCommitsContext` 的方法（如 `CanRebase()` 返回 `false`、`ShowBranchHeadsInSubCommits()` 返回 `false`）直接决定。`StatusReflog` 本质上是一个颜色分型标记。
 
 ### 6. 可见行渲染优化
 设置 `renderOnlyVisibleLines: true`，配合按视口范围计算显示字符串的机制，即使 reflog 条目极多也不会因全量渲染导致卡顿。
