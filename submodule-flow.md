@@ -148,9 +148,77 @@ viewModel := NewFilteredListViewModel(
 - 选中项追踪（ListCursor）
 - 索引映射（过滤后的索引 ↔ 原始索引）
 
-### 2.5 视图渲染链
+### 2.5 视图渲染链（条件分支触发，非固定顺序）
 
-从数据到 UI 的完整渲染链路：
+**⚠️ 之前的理解不准确**：渲染、聚焦和主面板更新不是固定顺序的三步依次执行，而是由 [postRefreshUpdate](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/view_helpers.go#L127-L164) 根据当前视图与上下文栈的关系**条件分支触发**。
+
+#### ContextKind 与上下文栈基础
+
+ContextKind 定义（[types/context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/types/context.go#L12-L27)）：
+- `SIDE_CONTEXT` = 侧栏（files, commits, submodules 等）
+- `MAIN_CONTEXT` = 主面板（normal, staging, patchBuilding 等）
+- `PERSISTENT_POPUP` = 持久弹窗（菜单、确认框）
+- `TEMPORARY_POPUP` = 临时弹窗
+
+ContextStack 栈结构（栈底 → 栈顶）：
+```
+栈底: SIDE_CONTEXT (如 submodules)
+      MAIN_CONTEXT (如 normal/main)
+栈顶: TEMPORARY_POPUP (如确认框) ← Current() 返回这里
+```
+
+关键方法：
+- [Current()](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/context.go#L204-L209)：返回栈顶 Context
+- [CurrentStatic()](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/context.go#L239-L263)：从栈顶向下找第一个非 POPUP 的 Context
+- [NextInStack(c)](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/context.go#L361-L375)：返回 c 在栈中的下一个元素（i-1）
+
+#### postRefreshUpdate 完整条件分支逻辑
+
+```
+postRefreshUpdate(c)  // c = SubmodulesContext
+    ↓
+【总是执行】c.HandleRender()
+    └─ ListContextTrait.HandleRender()
+        ├─ list.ClampSelection()              // 确保选中项不越界
+        └─ ListRenderer.renderLines()         // 生成显示文本
+               ↓
+           presentation.GetSubmoduleListDisplayStrings()
+               └─ getSubmoduleDisplayStrings() // 处理嵌套缩进
+    ↓
+if gui.currentViewName() == c.GetViewName()  // 当前聚焦在 submodules 视图？
+    ├─ 【是，分支1】c.HandleFocus(OnFocusOpts{})
+    │      └─ ListContextTrait.HandleFocus()
+    │          ├─ FocusLine(true)            // 滚动选中项到视图中央 + 设置光标
+    │          ├─ SetHighlight(list.Len()>0) // 启用高亮
+    │          └─ Context.HandleFocus()      // 触发 onFocus 回调
+    │
+    └─ 【否，分支2】c.FocusLine(false)        // 仅定位，不滚动（确保非活跃选中正确绘制）
+           ↓
+           currentCtx = ContextMgr.Current()
+           ↓
+           if currentCtx 是 NORMAL_MAIN 或 NORMAL_SECONDARY  // 在主面板？
+               ├─ 【分支2a】if !IsSearching()  // 不在搜索中（搜索时不刷新避免冲突）
+               │       sidePanelCtx = NextInStack(currentCtx)  // 主面板下面就是侧栏
+               │       if sidePanelCtx.GetKey() == c.GetKey()  // 本 context 就是那个侧栏？
+               │           └─ sidePanelCtx.HandleRenderToMain()  → 更新主面板 diff
+               │
+               └─ 【分支2b】elif c.GetKey() == CurrentStatic().GetKey()
+                   // 说明当前有 POPUP，c 是 POPUP 下面的静态上下文
+                   └─ c.HandleRenderToMain()  → 刷新 POPUP 后面的主视图
+
+               // 其他情况（如当前在另一个侧栏 commits）：不更新主面板
+```
+
+#### SubmodulesContext 的 4 种实际场景
+
+| 场景 | 当前聚焦 | 执行内容 |
+|------|---------|---------|
+| **A** | submodules 视图 | HandleRender + HandleFocus（完整聚焦） |
+| **B** | main 面板（submodules 是 NextInStack） | HandleRender + FocusLine(false) + HandleRenderToMain（更新主面板 diff） |
+| **C** | 有 popup（submodules 是 CurrentStatic） | HandleRender + FocusLine(false) + HandleRenderToMain（刷新 popup 后面的主视图） |
+| **D** | 另一个侧栏（commits） | HandleRender + FocusLine(false)（仅渲染，不更新主面板） |
+
+从数据到 UI 的完整渲染链路（Refresh 触发）：
 
 ```
 refreshView()
@@ -160,17 +228,7 @@ searchHelper.ReApplyFilter()     // 重新应用过滤
 PostRefreshUpdate()
     ↓
 postRefreshUpdate() [view_helpers.go:127]
-    ├─ c.HandleRender()          // 渲染列表内容
-    │      ↓
-    │   ListContextTrait.HandleRender() [list_context_trait.go:110]
-    │      ├─ list.ClampSelection()              // 确保选中项不越界
-    │      └─ ListRenderer.renderLines()         // 生成显示文本
-    │             ↓
-    │         presentation.GetSubmoduleListDisplayStrings()
-    │             └─ getSubmoduleDisplayStrings() // 处理嵌套缩进
-    │
-    ├─ c.HandleFocus() / c.FocusLine()  // 调整光标、滚动位置
-    └─ c.HandleRenderToMain()           // 更新主面板（diff 视图）
+    └─ 根据上述条件分支执行相应操作
 ```
 
 嵌套 submodule 的显示在 [getSubmoduleDisplayStrings](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/presentation/submodules.go#L17-L29) 中处理：
@@ -672,9 +730,15 @@ scope 包含 SUBMODULES → 触发 refreshFilesAndSubmodules()
 2. OnUIThread { refreshView(Submodules) }
     ↓
 searchHelper.ReApplyFilter()    // 重新过滤
-PostRefreshUpdate()             // 见 2.5 渲染链
+PostRefreshUpdate()             // 见 2.5 节条件分支逻辑
     ↓
-HandleRender() → HandleRenderToMain() → UI 更新
+postRefreshUpdate(c)
+    ├─ 【总是】HandleRender → 重新渲染列表
+    └─ 【条件分支】根据当前聚焦决定：
+        • 场景 A（聚焦 submodules）：HandleFocus（完整聚焦）
+        • 场景 B（聚焦 main）：FocusLine + HandleRenderToMain
+        • 场景 C（有 popup）：FocusLine + HandleRenderToMain
+        • 场景 D（聚焦其他侧栏）：FocusLine（仅渲染）
 ```
 
 ---
@@ -743,11 +807,13 @@ type SubmoduleConfig struct {
                   │    ├─ Model.Submodules = 新数据
                   │    └─ OnUIThread { refreshView(Submodules) }
                   │         ↓
-                  │      PostRefreshUpdate → HandleRender → 重新渲染列表
-                  │         ↓
-                  │      如果当前聚焦在 Submodules 视图，还会：
-                  │         HandleFocus → 更新光标位置
-                  │         HandleRenderToMain → 刷新主面板 diff
+                  │      PostRefreshUpdate → postRefreshUpdate(c)
+                  │         ├─ 【总是】HandleRender → 重新渲染列表
+                  │         └─ 【条件分支】见 2.5 节：
+                  │              • 场景 A（当前在 submodules）：HandleFocus（完整聚焦）
+                  │              • 场景 B（当前在 main 面板）：FocusLine + HandleRenderToMain
+                  │              • 场景 C（有 popup）：FocusLine + HandleRenderToMain
+                  │              • 场景 D（在其他侧栏）：FocusLine（仅渲染）
                   │
                   └─ wg.Wait() → Refresh 返回
                      ⚠️ 但 OnUIThread 中的渲染是异步投递，此时不一定已完成
@@ -796,6 +862,12 @@ submodule 操作的错误处理是**双路径异步传递**模型：
       ├─ GetConfigs(nil) → Model.Submodules = 新数据
       ├─ refreshStateFiles() → Model.Files = 新数据
       ├─ OnUIThread { refreshView(Submodules); refreshView(Files) }
+      │   ├─ Submodules: postRefreshUpdate(c)
+      │   │   ├─ 【总是】HandleRender → 渲染列表
+      │   │   └─ 【条件分支】根据当前聚焦决定 HandleFocus / HandleRenderToMain
+      │   └─ Files: postRefreshUpdate(c)
+      │       ├─ 【总是】HandleRender → 渲染文件列表
+      │       └─ 【条件分支】同上
       └─ RefreshingFilesMutex.Unlock() ← 仅一次锁释放
 ```
 
