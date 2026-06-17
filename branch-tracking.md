@@ -20,53 +20,56 @@
 
 ### 2.1 Branch 结构体
 
-文件：[branch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/models/branch.go#L10-L43)
+[branch.go](pkg/commands/models/branch.go#L10-L43)
 
 上游追踪状态相关字段：
 
-| 字段 | 含义 |
-|------|------|
-| `UpstreamRemote` | 追踪的远端名称，如 "origin"；来自 git config |
-| `UpstreamBranch` | 追踪的远端分支名，如 "main"；来自 git config |
-| `AheadForPull` | 相对 upstream 领先的提交数（可 pull 的反向），来自 `%(upstream:track)` |
-| `BehindForPull` | 相对 upstream 落后的提交数（可 pull 的数量），来自 `%(upstream:track)` |
-| `AheadForPush` | 相对 push 目标分支领先的提交数（三角工作流），来自 `%(push:track)` |
-| `BehindForPush` | 相对 push 目标分支落后的提交数，来自 `%(push:track)` |
-| `UpstreamGone` | 追踪的远端分支是否已被删除，track 为 `[gone]` 时为 true |
-| `BehindBaseBranch` | 相对基准分支（main/develop 等）的落后提交数，`atomic.Int32` 异步计算 |
+| 字段 | 含义 | 来源 |
+|------|------|------|
+| `UpstreamRemote` | 追踪的远端名称，如 "origin" | git config `branch.<name>.remote` |
+| `UpstreamBranch` | 追踪的远端分支名，如 "main" | git config `branch.<name>.merge` |
+| `AheadForPull` | 相对 upstream 领先的提交数 | `%(upstream:track)` |
+| `BehindForPull` | 相对 upstream 落后的提交数 | `%(upstream:track)` |
+| `AheadForPush` | 相对 push 目标分支领先的提交数 | `%(push:track)` |
+| `BehindForPush` | 相对 push 目标分支落后的提交数 | `%(push:track)` |
+| `UpstreamGone` | 追踪的远端分支是否已被删除 | `%(upstream:track) == "[gone]"` |
+| `BehindBaseBranch` | 相对基准分支的落后提交数 | `atomic.Int32`，异步计算 |
 
 ### 2.2 状态判断辅助方法
 
-文件：[branch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/models/branch.go#L92-L125)
+[branch.go](pkg/commands/models/branch.go#L92-L125)
 
 | 方法 | 判定条件 | 含义 |
 |------|---------|------|
 | `IsTrackingRemote()` | `UpstreamRemote != ""` | 是否配置了上游追踪 |
-| `RemoteBranchStoredLocally()` | 已追踪 且 `AheadForPull != "?" && BehindForPull != "?"` | 远端分支引用是否已本地缓存（即 `upstream:short` 非空） |
-| `RemoteBranchNotStoredLocally()` | 已追踪 且 `AheadForPull == "?" && BehindForPull == "?"` | 远端分支引用未在本地存储（配置了追踪但从未 fetch） |
+| `RemoteBranchStoredLocally()` | 已追踪 且 `AheadForPull != "?" && BehindForPull != "?"` | 远端分支引用是否已本地缓存 |
+| `RemoteBranchNotStoredLocally()` | 已追踪 且 `AheadForPull == "?" && BehindForPull == "?"` | 远端分支引用未在本地存储 |
 | `MatchesUpstream()` | 已存储 且 ahead 和 behind 均为 "0" | 与上游完全同步 |
-| `IsAheadForPull()` | 已存储 且 `AheadForPull != "0"` | 领先于上游（有可 push 的提交） |
-| `IsBehindForPull()` | 已存储 且 `BehindForPull != "0"` | 落后于上游（有可 pull 的提交） |
+| `IsAheadForPull()` | 已存储 且 `AheadForPull != "0"` | 领先于上游 |
+| `IsBehindForPull()` | 已存储 且 `BehindForPull != "0"` | 落后于上游 |
+| `IsBehindForPush()` | 已存储 且 `BehindForPush != "0"` | 落后于 push 目标分支 |
+| `IsRealBranch()` | `AheadForPull != "" && BehindForPull != ""` | 非 detached head 状态 |
 
-**关键点**：当 AheadForPull/BehindForPull 为 `"?"` 时，表示本地没有对应远端分支引用，无法计算差异。
+**关键点**：当 AheadForPull/BehindForPull 为 `"?"` 时，表示本地没有对应远端分支引用，无法计算差异。当为 `""` 时表示 detached head 状态。
 
 ## 三、数据加载层：从 Git 获取原始数据
 
 ### 3.1 入口：BranchLoader.Load
 
-文件：[branch_loader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/git_commands/branch_loader.go#L67-L146)
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L67-L146)
 
 加载流程：
 
 1. `obtainBranches()` → 通过 `git for-each-ref` 获取所有本地分支及其追踪信息
 2. 若按 recency 排序，通过 reflog 补充最近检出信息
 3. 把 HEAD 分支移到列表首位
-4. **从 git config 补充 UpstreamRemote 和 UpstreamBranch**（`for-each-ref` 没给）
-5. 可选：异步计算 BehindBaseBranch（相对基准分支落后数）
+4. **从 git config 补充 UpstreamRemote 和 UpstreamBranch**
+5. 从旧分支列表继承 BehindBaseBranch（减少闪烁）
+6. 可选：异步计算 BehindBaseBranch（相对基准分支落后数）
 
 ### 3.2 获取原始分支数据：git for-each-ref
 
-文件：[branch_loader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/git_commands/branch_loader.go#L392-L428)
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L392-L428)
 
 查询字段定义在 `branchFields`：
 
@@ -85,12 +88,12 @@ var branchFields = []string{
 
 Git 命令：
 ```bash
-git for-each-ref --sort=-committerdate --format="%(HEAD)%00%(refname:short)%00%(upstream:short)%00%(upstream:track)%00%(push:track)%00%(subject)%00%(objectname)%00%(committerdate:unix)" refs/heads
+git for-each-ref --sort=<sortOrder> --format="%(HEAD)%00%(refname:short)%00%(upstream:short)%00%(upstream:track)%00%(push:track)%00%(subject)%00%(objectname)%00%(committerdate:unix)" refs/heads
 ```
 
 ### 3.3 解析追踪状态：parseUpstreamInfo
 
-文件：[branch_loader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/git_commands/branch_loader.go#L466-L491)
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L466-L491)
 
 核心逻辑：
 
@@ -106,11 +109,22 @@ upstream:short 为空?
             提取不到则默认 "0"
 ```
 
-该函数被调用两次，分别处理 upstream:track 和 push:track。
+该函数在 [obtainBranch](pkg/commands/git_commands/branch_loader.go#L431-L464) 中被调用**两次**，分别处理不同的追踪来源：
+
+```go
+aheadForPull, behindForPull, gone := parseUpstreamInfo(upstreamName, track)       // %(upstream:track)
+aheadForPush, behindForPush, _ := parseUpstreamInfo(upstreamName, pushTrack)      // %(push:track)
+```
+
+**注意**：两次调用都传入同一个 `upstreamName`（即 `%(upstream:short)` 的值），但传入不同的 `track` 字符串。这意味着：
+- 当 `upstreamName` 为空时，两次调用都返回 `"?"`
+- 当 `upstreamName` 非空但 `track` 为 `""`（即与上游同步，Git 不输出 track 信息时），两次调用都返回 `("0", "0", false)`
+
+对于 `pushTrack`，第三次返回值（gone 标记）被丢弃，因为 push 分支不存在不算 "gone"。
 
 ### 3.4 从 git config 补全上游名称
 
-文件：[config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/commands/git_commands/config.go#L80-L114)
+[config.go](pkg/commands/git_commands/config.go#L80-L114)
 
 调用：
 ```bash
@@ -125,62 +139,179 @@ git config --local --get-regexp ^branch\.
 
 **原因**：`git for-each-ref` 的 `%(upstream:short)` 只在本地缓存了远端引用时才有值，而 git config 始终保存追踪配置，两者互为补充。
 
-## 四、刷新触发层：何时重新加载
+### 3.5 BehindBaseBranch 的异步计算
 
-### 4.1 刷新入口：RefreshHelper.Refresh
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L148-L330)
 
-文件：[refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237)
+根据 Git 版本有两条路径：
 
-当刷新范围包含 `BRANCHES` 或 `COMMITS` 时，会触发分支刷新：
+| 路径 | Git 版本要求 | 方式 |
+|------|-------------|------|
+| **Fast** | ≥ 2.41 | 一次 `git for-each-ref --format="%(ahead-behind:<base>)" refs/heads` 批量获取 |
+| **Legacy** | < 2.41 | 对每个分支单独 `git merge-base` + `git rev-list --left-right --count` |
 
-- 按 recency 排序：`refreshReflogAndBranches()` → 先加载 reflog，再加载分支
-- 其他排序：`refreshBranches()` → 直接加载分支
+两条路径最终都调用 `renderFunc()` 在 UI 线程触发重绘，实现渐进式渲染。
 
-### 4.2 实际刷新：refreshBranches
+## 四、排序配置对加载流程的影响
 
-文件：[refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L486-L543)
+### 4.1 三种排序模式
 
-```go
-branches, err := self.c.Git().Loaders.BranchLoader.Load(
-    self.c.Model().ReflogCommits,      // reflog 提交（用于 recency 排序）
-    self.c.Model().MainBranches,       // 基准分支列表
-    self.c.Model().Branches,           // 旧分支列表（缓存 BehindBaseBranch）
-    loadBehindCounts,                  // 是否异步计算 BehindBaseBranch
-    onWorker,                          // 把任务调度到 worker goroutine
-    renderFunc,                        // BehindBaseBranch 完成后触发 UI 重绘
-)
+[user_config.go](pkg/config/user_config.go#L331-L334) 定义了 `git.localBranchSortOrder`：
+
+| 配置值 | for-each-ref 排序参数 | 对 Recency 字段的影响 | 对刷新路径的影响 |
+|--------|----------------------|----------------------|----------------|
+| `date`（默认） | `--sort=-committerdate` | 直接用提交时间戳算 Recency | 无需 reflog，直接调用 `refreshBranches` |
+| `recency` | `--sort=-committerdate` | 从 reflog 中提取最近检出时间 | 需先加载 reflog，走 `refreshReflogAndBranches` |
+| `alphabetical` | `--sort=refname` | 直接用提交时间戳算 Recency | 无需 reflog，直接调用 `refreshBranches` |
+
+### 4.2 排序对数据加载步骤的差异
+
+[branch_loader.go](pkg/commands/git_commands/branch_loader.go#L74-L119)
+
+**`date` / `alphabetical` 模式**：
+```
+obtainBranches()
+  → git for-each-ref (排序参数生效)
+  → obtainBranch(): storeCommitDateAsRecency = true
+  → 直接用 committerdate:unix 计算 Recency
+
+跳过 reflog 合并步骤
 ```
 
-BehindBaseBranch 的计算在异步 worker 中进行，完成后通过 `renderFunc` 在 UI 线程调用 `HandleRender()` 和 `refreshStatus()`，实现渐进式渲染。
+**`recency` 模式**：
+```
+obtainBranches()
+  → git for-each-ref --sort=-committerdate
+  → obtainBranch(): storeCommitDateAsRecency = false
+  → Recency 暂时为空
 
-## 五、展示渲染层：如何呈现给用户
+obtainReflogBranches(reflogCommits)
+  → 遍历 reflog 中的 checkout 记录
+  → 按 checkout 时间给分支赋予 Recency
 
-### 5.1 展示入口：BranchesContext
+合并：按 reflog 顺序重排分支（最近 checkout 的排前面）
+  → branchesWithRecency 在前
+  → 其余分支按字母序排在后面
+  → 合并结果 = branchesWithRecency + 按字母序的其余分支
+```
 
-文件：[branches_context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/context/branches_context.go#L19-L61)
+### 4.3 刷新路径差异
+
+[refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L131-L152)
+
+```go
+if self.c.UserConfig().Git.LocalBranchSortOrder == "recency" {
+    // 需要先有 reflog 数据才能排序
+    refresh("reflog and branches", func() {
+        self.refreshReflogAndBranches(...)
+    })
+} else {
+    // 不依赖 reflog，可以并行
+    refresh("branches", func() {
+        self.refreshBranches(..., true)  // loadBehindCounts = true
+    })
+    refresh("reflog", func() { ... })    // reflog 独立加载
+}
+```
+
+**影响**：`recency` 模式下，分支加载必须等待 reflog 完成；其他模式下两者可以并行，加快首屏加载速度。
+
+### 4.4 启动阶段的两阶段加载
+
+[refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go#L283-L304)
+
+为解决 recency 排序下 reflog 加载瓶颈，系统设计了两阶段启动：
+
+| 阶段 | 行为 | BehindBaseBranch |
+|------|------|-----------------|
+| `INITIAL` | 异步加载 reflog，加载后刷新分支 | `loadBehindCounts = false`（跳过） |
+| `COMPLETE` | 同步加载 reflog | `loadBehindCounts = true`（计算） |
+
+这意味着首次启动时不会计算 BehindBaseBranch，等 reflog 加载完毕进入 COMPLETE 阶段后才会在后续刷新中计算。
+
+## 五、推送计数对分支状态展示的影响
+
+### 5.1 展示层不使用 Push 计数
+
+[branches.go](pkg/gui/presentation/branches.go#L215-L245) 中的 `BranchStatus` 函数**仅使用 `*ForPull` 字段**：
+
+```go
+if branch.IsBehindForPull() && branch.IsAheadForPull() {
+    result = style.FgYellow.Sprintf("↓%s↑%s", branch.BehindForPull, branch.AheadForPull)
+} else if branch.IsBehindForPull() {
+    result = style.FgYellow.Sprintf("↓%s", branch.BehindForPull)
+} else if branch.IsAheadForPull() {
+    result = style.FgYellow.Sprintf("↑%s", branch.AheadForPull)
+}
+```
+
+`AheadForPush` 和 `BehindForPush` 在展示层**完全不出现**。分支列表中的 `↓N↑M` 仅反映与 upstream 分支（pull 方向）的差异。
+
+### 5.2 Push 计数的实际使用场景
+
+`IsBehindForPush()` 唯一的业务调用在 [sync_controller.go](pkg/gui/controllers/sync_controller.go#L89-L98)：
+
+```go
+func (self *SyncController) push(currentBranch *models.Branch) error {
+    if currentBranch.IsTrackingRemote() {
+        opts := pushOpts{remoteBranchStoredLocally: currentBranch.RemoteBranchStoredLocally()}
+        if currentBranch.IsBehindForPush() {
+            // push 目标分支有你没有的提交 → 需要确认是否 force push
+            return self.requestToForcePush(currentBranch, opts)
+        }
+        return self.pushAux(currentBranch, opts)
+    }
+    ...
+}
+```
+
+在**三角工作流**（triangular workflow）中：
+- `branch.<name>.remote` = origin（pull 来源）
+- `remote.pushDefault` 或 `branch.<name>.pushRemote` = fork（push 目标）
+- `%(upstream:track)` 反映与 origin 的差异
+- `%(push:track)` 反映与 fork 的差异
+
+当 push 目标分支有本地没有的提交时，`IsBehindForPush()` 为 true，push 操作会触发 force push 确认对话框。
+
+### 5.3 完整的状态来源与用途对照
+
+| 字段 | 数据来源 | 展示用途 | 业务逻辑用途 |
+|------|---------|---------|-------------|
+| `AheadForPull` / `BehindForPull` | `%(upstream:track)` | BranchStatus 中的 `↑N` / `↓N` / `↓N↑M` | 判断是否可以 push/pull |
+| `AheadForPush` / `BehindForPush` | `%(push:track)` | **不展示** | push 时判断是否需要 force push 确认 |
+| `UpstreamGone` | `%(upstream:track) == "[gone]"` | BranchStatus 中的 `upstream gone`（红色） | 无额外用途 |
+| `BehindBaseBranch` | 异步 `%(ahead-behind:<base>)` 或 `rev-list` | divergenceStr 中的 `↓N`（青色，右对齐） | 无额外用途 |
+
+## 六、展示渲染层：如何呈现给用户
+
+### 6.1 展示入口：BranchesContext
+
+[branches_context.go](pkg/gui/context/branches_context.go#L19-L61)
 
 `getDisplayStrings` 调用 `presentation.GetBranchListDisplayStrings`，把 `[]*models.Branch` 转成 `[][]string` 供列表渲染。
 
-### 5.2 追踪状态图标：BranchStatus
+### 6.2 追踪状态图标：BranchStatus
 
-文件：[branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/presentation/branches.go#L215-L245)
+[branches.go](pkg/gui/presentation/branches.go#L215-L245)
 
 分支名称后面会附加状态标记，优先级如下：
 
-| 状态 | 显示 | 颜色 | 判定条件 |
-|------|------|------|---------|
-| 正在操作中 | `Pushing \|` 等 + spinner | 青色 | 有 `itemOperation`（优先显示） |
-| 上游已删除 | `upstream gone` | 红色 | `UpstreamGone == true` |
-| 与上游同步 | `✓` | 绿色 | `MatchesUpstream()` |
-| 远端分支未本地存储 | `?` | 品红 | `RemoteBranchNotStoredLocally()` |
-| 既领先又落后 | `↓N↑M` | 黄色 | `IsBehindForPull() && IsAheadForPull()` |
-| 仅落后 | `↓N` | 黄色 | `IsBehindForPull()` |
-| 仅领先 | `↑N` | 黄色 | `IsAheadForPull()` |
-| 无追踪 | （空） | - | `!IsTrackingRemote()` |
+| 优先级 | 状态 | 显示 | 颜色 | 判定条件 |
+|--------|------|------|------|---------|
+| 1（最高） | 正在操作中 | `Pushing |` 等 + spinner | 青色 | 有 `itemOperation` |
+| 2 | 上游已删除 | `upstream gone` | 红色 | `UpstreamGone == true` |
+| 3 | 与上游同步 | `✓` | 绿色 | `MatchesUpstream()` |
+| 4 | 远端分支未本地存储 | `?` | 品红 | `RemoteBranchNotStoredLocally()` |
+| 5 | 既领先又落后 | `↓N↑M` | 黄色 | `IsBehindForPull() && IsAheadForPull()` |
+| 6 | 仅落后 | `↓N` | 黄色 | `IsBehindForPull()` |
+| 7 | 仅领先 | `↑N` | 黄色 | `IsAheadForPull()` |
+| — | 无追踪 | （空） | — | `!IsTrackingRemote()` |
 
-### 5.3 基准分支分歧：divergenceStr
+**注意**：优先级 5-7 的数字来自 `BehindForPull` / `AheadForPull`，不是 `*ForPush`。
 
-文件：[branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/presentation/branches.go#L247-L266)
+### 6.3 基准分支分歧：divergenceStr
+
+[branches.go](pkg/gui/presentation/branches.go#L247-L266)
 
 在分支名**右侧**显示相对基准分支的落后数（由配置 `gui.showDivergenceFromBaseBranch` 控制）：
 
@@ -188,9 +319,11 @@ BehindBaseBranch 的计算在异步 worker 中进行，完成后通过 `renderFu
 - `onlyArrow`：显示 `↓`
 - `arrowAndNumber`：显示 `↓N`
 
-### 5.4 完整渲染：getBranchDisplayStrings
+此指标与 BranchStatus 是**独立的两个维度**：BranchStatus 反映与 upstream 的关系，divergenceStr 反映与 base branch（如 main/master）的关系。
 
-文件：[branches.go](file:///d:/fz/0601-2/solo-dogfeeding/code/24-lazygit/pkg/gui/presentation/branches.go#L47-L186)
+### 6.4 完整渲染：getBranchDisplayStrings
+
+[branches.go](pkg/gui/presentation/branches.go#L47-L186)
 
 每一行的列组成（按顺序）：
 
@@ -203,49 +336,88 @@ BehindBaseBranch 的计算在异步 worker 中进行，完成后通过 `renderFu
 | 5 | 上游信息 | `fullDescription` 时显示：`UpstreamRemote UpstreamBranch` |
 | 6 | Commit 标题 | `fullDescription` 时显示 |
 
-## 六、完整调用链路图
+## 七、完整调用链路图
 
 ```
 触发刷新 (Refresh)
   │
-  ▼
-refresh_helper.refreshBranches()
+  ├─ recency 模式 ─────────────────────────────────────────────────┐
+  │   refreshReflogAndBranches()                                   │
+  │     ├─ refreshReflogCommitsConsideringStartup()                │
+  │     │   ├─ INITIAL: 异步加载 reflog → 完成后 refreshBranches   │
+  │     │   └─ COMPLETE: 同步加载 reflog                           │
+  │     └─ refreshBranches(loadBehindCounts 取决于 startup stage)  │
+  │                                                                │
+  └─ date/alphabetical 模式 ───────────────────────────────────────┤
+      refreshBranches(loadBehindCounts=true) 与 refreshReflog 并行 │
+                                                                   │
+  ┌────────────────────────────────────────────────────────────────┘
   │
-  ├─ git_commands.BranchLoader.Load()
+  ▼
+refreshBranches()
+  │
+  ├─ BranchLoader.Load()
   │    │
   │    ├─ obtainBranches()
   │    │    ├─ getRawBranches()
-  │    │    │   └─ git for-each-ref refs/heads  ── 取 %(upstream:short), %(upstream:track), %(push:track)
+  │    │    │   └─ git for-each-ref --sort=<sortOrder> refs/heads
+  │    │    │       ├─ %(upstream:short)  ── 本地是否有远端引用
+  │    │    │       ├─ %(upstream:track)  ── ahead/behind/gone
+  │    │    │       └─ %(push:track)      ── push 目标的 ahead/behind
   │    │    │
   │    │    └─ obtainBranch(split)
-  │    │         └─ parseUpstreamInfo(upstreamName, track)
-  │    │              ├─ upstream:short 空 → ("?","?",false)
-  │    │              ├─ track="[gone]"   → ("?","?",true)
-  │    │              └─ 正则提取 ahead/behind 数字
+  │    │         ├─ parseUpstreamInfo(upstreamName, track)
+  │    │         │   → AheadForPull, BehindForPull, UpstreamGone
+  │    │         └─ parseUpstreamInfo(upstreamName, pushTrack)
+  │    │             → AheadForPush, BehindForPush (gone 丢弃)
   │    │
-  │    └─ config.Branches(cmd)
-  │         └─ git config --local --get-regexp ^branch\.  ── 补 UpstreamRemote, UpstreamBranch
+  │    ├─ [recency 模式] obtainReflogBranches() + 合并重排
+  │    │
+  │    ├─ config.Branches(cmd) → 补 UpstreamRemote, UpstreamBranch
+  │    │
+  │    ├─ 继承旧 BehindBaseBranch 值（减少闪烁）
+  │    │
+  │    └─ [异步] GetBehindBaseBranchValuesForAllBranches()
+  │         ├─ git ≥ 2.41: for-each-ref %(ahead-behind:<base>)
+  │         └─ git < 2.41: per-branch merge-base + rev-list
   │
-  └─ 异步（可选）：BehindBaseBranch 计算完成 → renderFunc → HandleRender
+  └─ renderFunc() → UI 线程 HandleRender + refreshStatus
        │
        ▼
 presentation.GetBranchListDisplayStrings()
   │
-  ├─ BranchStatus()  → ✓ / ↓N / ↑N / ↓N↑M / ? / upstream gone
-  └─ divergenceStr() → ↓N (相对基准分支)
+  ├─ BranchStatus()
+  │   ├─ itemOperation  → "Pushing |" (优先)
+  │   ├─ UpstreamGone   → "upstream gone" (红色)
+  │   ├─ MatchesUpstream() → "✓" (绿色)
+  │   ├─ RemoteBranchNotStoredLocally() → "?" (品红)
+  │   ├─ IsBehindForPull() && IsAheadForPull() → "↓N↑M" (黄色)
+  │   ├─ IsBehindForPull() → "↓N" (黄色)
+  │   └─ IsAheadForPull() → "↑N" (黄色)
+  │       ↑ 仅用 *ForPull，不用 *ForPush
+  │
+  └─ divergenceStr()
+      └─ BehindBaseBranch.Load() → "↓N" (青色，右对齐)
+          ↑ 与 BranchStatus 独立，反映对 base branch 而非 upstream
        │
        ▼
 ListRenderer 渲染到 Branches View
 ```
 
-## 七、关键设计要点
+## 八、关键设计要点
 
 1. **双来源互补**：追踪状态来自两处——`git for-each-ref` 的 `%(upstream:track)` 提供 ahead/behind 计数和 [gone] 状态，`git config` 提供 remote 和 merge 名称。前者依赖本地远端引用缓存，后者始终可用。
 
 2. **"?" 的语义**：`AheadForPull == "?"` 并非异常，而是表示"本地没有对应远端分支的引用，无法计算差异"。常见于配置了 upstream 但从未执行过 fetch。
 
-3. **渐进式渲染**：`BehindBaseBranch` 使用 `atomic.Int32` 存储，在后台 worker 中计算，完成后触发局部 UI 刷新，避免阻塞。
+3. **Push 计数隐藏设计**：`AheadForPush` / `BehindForPush` 在 UI 上不可见，仅在 push 操作时用于判断是否需要 force push 确认。这是三角工作流（pull from origin, push to fork）的必要支持，但对普通用户来说是无感的安全保障。
 
-4. **三角工作流支持**：同时维护 `*ForPull` 和 `*ForPush` 两套计数，分别对应 upstream 分支和 push 目标分支，两者可以不同。
+4. **排序影响刷新路径**：`recency` 模式下分支加载必须串行等待 reflog，而 `date` / `alphabetical` 模式下分支与 reflog 可以并行加载，启动更快。
 
-5. **状态优先级**：展示时 `itemOperation`（正在 push/pull 等）优先级最高，其次是 `UpstreamGone`，最后才是常规 ahead/behind 状态。
+5. **渐进式渲染**：`BehindBaseBranch` 使用 `atomic.Int32` 存储，在后台 worker 中计算，完成后触发局部 UI 刷新。同时从旧分支列表继承该值以减少视觉闪烁。
+
+6. **两阶段启动**：首次启动时处于 INITIAL 阶段，跳过 BehindBaseBranch 计算以加速首屏显示；reflog 加载完成后进入 COMPLETE 阶段，后续刷新才会计算 BehindBaseBranch。
+
+7. **状态优先级**：展示时 `itemOperation`（正在 push/pull 等）优先级最高，覆盖所有追踪状态显示；其次是 `UpstreamGone`，最后才是常规 ahead/behind 状态。
+
+8. **两个独立维度**：BranchStatus（`✓`/`↓N↑M` 等）反映与 **upstream** 的同步关系，divergenceStr（右对齐 `↓N`）反映与 **base branch** 的落后关系，两者在视觉位置和语义上都做了区分。
