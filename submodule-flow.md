@@ -1,10 +1,12 @@
 # Submodule 视图操作流程分析
 
-本文档详细解析 lazygit 中 submodule 视图的三大核心流程：**列表加载**、**动作分派**和**结果回写**。
+本文档详细解析 lazygit 中 submodule 视图的三大核心流程：**列表加载**、**动作分派**和**结果回写**，并深入分析刷新偏差原因、嵌套 submodule 的目录处理方式，以及各操作之间的实现差异。
+
+---
 
 ## 一、整体架构概览
 
-Submodule 功能涉及 4 个核心文件，分层职责清晰：
+Submodule 功能涉及 5 个核心文件，分层职责清晰：
 
 | 层级 | 文件 | 职责 |
 |------|------|------|
@@ -57,11 +59,17 @@ func (self *RefreshHelper) refreshStateSubmoduleConfigs() error {
 
 ### 2.3 加载触发时机
 
-Submodule 的刷新与 Files 刷新**绑定在一起**，在 [refreshFilesAndSubmodules](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L545-L568) 中：
+Submodule 的刷新与 Files 刷新**强制绑定在一起**，在 [refreshFilesAndSubmodules](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L545-L568) 中：
 
 ```go
 func (self *RefreshHelper) refreshFilesAndSubmodules() error {
-    // ... 加锁 ...
+    self.c.Mutexes().RefreshingFilesMutex.Lock()
+    self.c.State().SetIsRefreshingFiles(true)
+    defer func() {
+        self.c.State().SetIsRefreshingFiles(false)
+        self.c.Mutexes().RefreshingFilesMutex.Unlock()
+    }()
+
     if err := self.refreshStateSubmoduleConfigs(); err != nil {  // 1. 加载 submodule 数据
         return err
     }
@@ -77,7 +85,7 @@ func (self *RefreshHelper) refreshFilesAndSubmodules() error {
 }
 ```
 
-在 [Refresh](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237) 主函数中，只要 scope 包含 `FILES` 或 `SUBMODULES`，就会触发此流程：
+在 [Refresh](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237) 主函数中，只要 scope 包含 `FILES` **或** `SUBMODULES`，就会触发此流程：
 
 ```go
 if scopeSet.Includes(types.FILES) || scopeSet.Includes(types.SUBMODULES) {
@@ -88,6 +96,8 @@ if scopeSet.Includes(types.FILES) || scopeSet.Includes(types.SUBMODULES) {
     })
 }
 ```
+
+> ⚠️ **关键设计**：刷新 SUBMODULES 时必然连带刷新 FILES，反之亦然。这是为了保证两者数据一致（submodule 状态变化会体现在 file 列表中）。
 
 ### 2.4 Context 与 Model 的连接
 
@@ -239,11 +249,11 @@ type SubmodulesController struct {
 
 ---
 
-## 四、结果回写流程
+## 四、结果回写流程（深度分析）
+
+### 4.1 通用三步模式
 
 所有写操作（增删改、初始化、更新等）遵循相同的模式：**执行 Git 命令 → 刷新视图**。
-
-### 4.1 通用模式
 
 以 [update](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/submodules_controller.go#L287-L298) 为例：
 
@@ -261,24 +271,287 @@ func (self *SubmodulesController) update(submodule *models.SubmoduleConfig) erro
 }
 ```
 
-**三步回写模式**：
-1. `LogAction()` - 记录用户操作（用于撤销/重做、日志显示）
-2. `Git().Submodule.Xxx()` - 调用底层 Git 命令
-3. `Refresh()` - 指定 scope 触发局部刷新
+### 4.2 ⚠️ 刷新偏差的根本原因分析
 
-### 4.2 各动作的回写差异
+经过深入代码分析，发现 **4 个关键因素** 可能导致刷新结果与预期不符：
 
-| 动作 | Git 命令 | 刷新 Scope | 特殊处理 |
-|------|----------|------------|----------|
-| `enter()` | 无（切换工作目录） | 无 | 调用 `Repos.EnterSubmodule()` |
-| `add()` | `git submodule add` | `SUBMODULES` | 3 层 Prompt 收集 url/name/path |
-| `editURL()` | 修改 `.gitmodules` + `git submodule sync` | `SUBMODULES` | Prompt 输入新 URL |
-| `init()` | `git submodule init` | `SUBMODULES` | - |
-| `update()` | `git submodule update --init` | `SUBMODULES` | - |
-| `remove()` | `deinit` + `git rm` + 删除目录 | `SUBMODULES`, `FILES` | 需 Confirm 确认 |
-| `openBulkActionsMenu()` | 批量 init/update/deinit | `SUBMODULES` | 通过菜单选择批量操作 |
+#### 原因 1：WithWaitingStatus 的错误吞没问题
 
-### 4.3 Refresh 如何触发 UI 更新
+[PopupHandler.WithWaitingStatus](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/popup/popup_handler.go#L74-L77) 的签名存在设计问题：
+
+```go
+func (self *PopupHandler) WithWaitingStatus(message string, f func(gocui.Task) error) error {
+    self.withWaitingStatusFn(message, f)
+    return nil  // ❌ 总是返回 nil！即使内部函数返回了错误
+}
+```
+
+`withWaitingStatusFn` 最终指向 [AppStatusHelper.WithWaitingStatus](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/app_status_helper.go#L62-L66)，它通过 `OnWorker` 提交任务到后台 worker 队列：
+
+```go
+func (self *AppStatusHelper) WithWaitingStatus(message string, f func(gocui.Task) error) {
+    self.c.OnWorker(func(task gocui.Task) error {
+        return self.WithWaitingStatusImpl(message, f, task)
+    })
+}
+```
+
+**问题**：
+- `WithWaitingStatus` 函数**立即返回 nil**，而实际任务被放入 worker 队列
+- 内部函数（含 Git 命令执行 + Refresh）的错误被**完全吞掉**
+- 调用方无法感知 Git 命令执行是否真正成功
+
+#### 原因 2：Refresh 的 SYNC 模式仍是并发执行
+
+[RefreshOptions](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/types/refresh.go#L36-L47) 有 3 种模式：
+
+| Mode | 值 | 行为 |
+|------|----|------|
+| SYNC | 0（默认） | 用 `wg.Wait()` 等所有 goroutine 完成，但各刷新任务仍是并发 goroutine |
+| ASYNC | 1 | 每个任务通过 `OnWorker` 提交，立即返回 |
+| BLOCK_UI | 2 | 在 UI 线程上同步执行所有操作 |
+
+Submodule 操作调用 Refresh 时**没有指定 Mode**，所以使用默认的 SYNC：
+
+```go
+// 这意味着 Mode 是 SYNC，但不是"同步顺序执行"
+self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.SUBMODULES}})
+```
+
+在 SYNC 模式下，[Refresh](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L109-L127) 的实现：
+
+```go
+wg := sync.WaitGroup{}
+refresh := func(name string, f func()) {
+    if !self.c.InDemo() && options.Mode == types.ASYNC {
+        // ASYNC: 用 OnWorker
+        self.c.OnWorker(func(t gocui.Task) error { f(); return nil })
+    } else {
+        // SYNC（默认）: 起新 goroutine，但用 wg.Wait() 等全部完成
+        wg.Add(1)
+        go utils.Safe(func() {
+            t := time.Now()
+            defer wg.Done()
+            f()  // 各任务并发执行
+            self.c.Log.Infof("refreshed %s in %s", name, time.Since(t))
+        })
+    }
+}
+```
+
+**问题**：虽然 Refresh 函数会在 `wg.Wait()` 后返回，但：
+1. 如果 Refresh 本身在 worker goroutine 中（由 `WithWaitingStatus` 提交），UI 线程已经继续处理下一个按键事件
+2. `refreshView` 中的 `OnUIThread` 调用是**异步投递**的，Refresh 返回时 UI 渲染未必完成
+
+#### 原因 3：Refresh 调用方未使用 Then 回调
+
+`RefreshOptions` 提供了 `Then` 字段在所有刷新完成后执行，但 submodule 操作**均未使用**：
+
+```go
+type RefreshOptions struct {
+    Then  func()              // ← 所有 submodule 操作都未设置此字段
+    Scope []RefreshableView
+    Mode  RefreshMode
+    KeepBranchSelectionIndex bool
+}
+```
+
+**后果**：如果需要在刷新完成后做某些事（如重新定位选中项），没有可靠的时序保证。
+
+#### 原因 4：嵌套 submodule 删除时的双重刷新问题
+
+`remove()` 操作额外刷新了 FILES：
+
+```go
+self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.SUBMODULES, types.FILES}})
+```
+
+虽然 `FILES` 和 `SUBMODULES` 最终都走 `refreshFilesAndSubmodules()`（见 2.3 节绑定逻辑），但 Mutex `RefreshingFilesMutex` 会串行化两次调用，导致多余的锁等待。
+
+---
+
+### 4.3 嵌套 submodule 的目录处理方式深度对比
+
+对于嵌套 submodule，有 **两种截然不同的目录处理策略**：
+
+#### 策略 A：`os.Chdir` 切换进程工作目录
+
+适用于需要**执行多个连续 Git 命令**或涉及**非 Git 命令**（如 `os.RemoveAll`）的场景。
+
+**使用者**：[Delete](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L150-L165)、[UpdateUrl](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L218-L231)
+
+```go
+// Delete 的实现
+if submodule.ParentModule != nil {
+    wd, err := os.Getwd()         // 1. 保存原目录
+    if err != nil { return err }
+    err = os.Chdir(submodule.ParentModule.FullPath())  // 2. 切到父目录
+    if err != nil { return err }
+    defer func() { _ = os.Chdir(wd) }()  // 3. defer 切回（即使发生错误）
+}
+// 后续执行 deinit → git rm → os.RemoveAll 等多个命令
+```
+
+**特点**：
+- ✅ 后续所有命令（包括 `os.RemoveAll`）自动在正确目录下执行
+- ✅ 不需要为每个 Git 命令传 `Dir` 参数
+- ❌ 非线程安全：修改了整个进程的工作目录
+- ❌ 必须用 defer 确保切回，否则整个程序的相对路径都会出错
+
+#### 策略 B：`git -C <path>` 通过参数指定目录
+
+适用于**只执行单个 Git 命令**的场景。
+
+**使用者**：[Reset](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L130-L141)、[Stash](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L114-L128)
+
+```go
+// Reset 的实现
+parentDir := ""
+if submodule.ParentModule != nil {
+    parentDir = submodule.ParentModule.FullPath()
+}
+cmdArgs := NewGitCmd("submodule").
+    Arg("update", "--init", "--force", "--", submodule.Path).
+    DirIf(parentDir != "", parentDir).   // ← 生成 git -C <parentDir> submodule ...
+    ToArgv()
+
+return self.cmd.New(cmdArgs).Run()
+```
+
+[GitCommandBuilder.Dir](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/git_command_builder.go#L57-L62) 的实现是插入 `-C` 参数：
+
+```go
+func (self *GitCommandBuilder) Dir(path string) *GitCommandBuilder {
+    self.args = append([]string{"-C", path}, self.args...)  // 生成: git -C path subcommand
+    return self
+}
+```
+
+**特点**：
+- ✅ 线程安全：不修改进程工作目录
+- ✅ 无需恢复目录
+- ❌ 只对 Git 命令生效，对后续 `os.RemoveAll` 等非 Git 操作无效
+- ❌ 路径参数需要更仔细处理（`submodule.Path` 是相对于父目录的相对路径）
+
+#### 各操作目录处理方式对照表
+
+| 操作 | 目录处理策略 | 嵌套支持 | 说明 |
+|------|-------------|----------|------|
+| **Init** | 无特殊处理 | ❌ 仅顶层 | 直接 `git submodule init -- <path>`，**不支持嵌套 submodule** |
+| **Update** | 无特殊处理 | ❌ 仅顶层 | 直接 `git submodule update --init -- <path>`，**不支持嵌套 submodule** |
+| **Stash** | 策略 B (`git -C`) | ✅ 完整 | `git -C <FullPath> stash`，支持任意深度 |
+| **Reset** | 策略 B (`DirIf`) | ✅ 完整 | `git -C <parentFullPath> submodule update -- <relativePath>` |
+| **UpdateUrl** | 策略 A (`os.Chdir`) | ✅ 完整 | 需连续执行两条 git 命令 (config + sync) |
+| **Delete** | 策略 A (`os.Chdir`) | ✅ 完整 | 需执行 deinit → git rm → os.RemoveAll，混合 Git/OS 操作 |
+| **Add** | 无参数切目录 | ⚠️ 仅顶层 | 始终在当前工作目录执行，只能添加顶层 submodule |
+| **BulkInit** | 无参数切目录 | ❌ 仅顶层 | 对所有嵌套 level 无效 |
+| **BulkUpdate** | 无参数切目录 | ❌ 仅顶层 | 不递归（与 BulkUpdateRecursively 区分） |
+| **BulkUpdateRecursively** | 无参数切目录 | ✅ 完整 | 使用 `--recursive` 标志，让 git 自身处理嵌套 |
+| **BulkDeinit** | 无参数切目录 | ⚠️ 仅顶层 | 使用 `--all`，但只反初始化当前 repo 的直接 submodule |
+
+---
+
+### 4.4 各操作的详细实现差异
+
+#### EnterSubmodule：切换工作目录 + 重建整个 Git 上下文
+
+[EnterSubmodule](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/repos_helper.go#L46-L54) 不只是切换目录，它会**完全重建 lazygit 的状态**：
+
+```go
+func (self *ReposHelper) EnterSubmodule(submodule *models.SubmoduleConfig) error {
+    wd, err := os.Getwd()
+    if err != nil { return err }
+    self.c.State().GetRepoPathStack().Push(wd)   // 1. 将原路径压入栈（按 Escape 返回用）
+    return self.DispatchSwitchToRepo(submodule.FullPath(), context.NO_CONTEXT)
+}
+```
+
+[DispatchSwitchTo](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/gui/controllers/helpers/repos_helper.go#L148-L197) 的完整步骤：
+
+1. `env.UnsetGitLocationEnvVars()` → 清除 `GIT_DIR`, `GIT_WORK_TREE` 等环境变量
+2. `os.Chdir(path)` → 切到 submodule 目录
+3. `commands.VerifyInGitRepo()` → 验证目标是合法 Git repo（否则回滚）
+4. `direnv.Load()` → 加载目录相关环境变量
+5. **`onNewRepo()`** → 重新加载整个 Git 命令环境、所有 Model 数据
+6. 所有 Context 重新绑定、重新渲染
+
+**差异**：Enter 不调用 Refresh，因为它是整个 repo 的切换，Refresh 只是局部数据刷新。
+
+#### Remove：四步清理 + Confirm 保护
+
+[Delete](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L150-L202) 执行四步清理，每一步都有容错：
+
+```
+Step 1: git submodule deinit --force -- <path>
+    → 如果报 "did not match any file(s) known to git"，则跳过后续 deinit，走手动清理
+    → 手动清理: git config --file .gitmodules --remove-section + git config --remove-section
+Step 2: git rm --force -r <path>
+    → 删除失败仅记录日志（目录不存在时忽略）
+Step 3: os.RemoveAll(<gitDirPath>)
+    → 手动删除 .git/modules/<name> 目录（git submodule deinit 不会删这个）
+```
+
+**Controller 层差异**：用 `Confirm` 包裹，用户必须确认才能执行。
+
+#### Init / Update：单行命令，无嵌套支持
+
+两者结构几乎完全相同：
+```go
+func (self *SubmoduleCommands) Init(path string) error {
+    cmdArgs := NewGitCmd("submodule").Arg("init", "--", path).ToArgv()
+    return self.cmd.New(cmdArgs).Run()
+}
+
+func (self *SubmoduleCommands) Update(path string) error {
+    cmdArgs := NewGitCmd("submodule").Arg("update", "--init", "--", path).ToArgv()
+    return self.cmd.New(cmdArgs).Run()
+}
+```
+
+**⚠️ 嵌套缺陷**：两者传入的是 `submodule.Path`（相对路径），但没有切到父目录也没有用 `-C`。对于嵌套 submodule（如 `parent/child` 的 `Path` 是 `child`），**直接从顶层 repo 执行会找不到路径**。
+
+#### 批量操作：通过 CmdObj 直接构建和执行
+
+批量操作的 Controller 层写法与单项操作不同：
+
+```go
+// 单项操作：直接调用方法
+err := self.c.Git().Submodule.Update(submodule.Path)
+
+// 批量操作：先拿 CmdObj，再 Run
+err := self.c.Git().Submodule.BulkUpdateCmdObj().Run()
+```
+
+[BulkXxxCmdObj](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L268-L301) 系列函数返回 `*oscommands.CmdObj` 而非直接执行：
+
+```go
+func (self *SubmoduleCommands) BulkInitCmdObj() *oscommands.CmdObj {
+    cmdArgs := NewGitCmd("submodule").Arg("init").ToArgv()
+    return self.cmd.New(cmdArgs)  // ← 仅构建，不执行
+}
+```
+
+**设计原因**：Menu 的 `LabelColumns` 需要用 `cmdObj.ToString()` 显示完整命令字符串给用户看：
+
+```go
+LabelColumns: []string{
+    self.c.Tr.BulkUpdateSubmodules,
+    style.FgYellow.Sprint(self.c.Git().Submodule.BulkUpdateCmdObj().ToString())
+},
+```
+
+四种批量操作对比：
+
+| 批量操作 | 实际命令 | 嵌套行为 |
+|----------|---------|----------|
+| BulkInit | `git submodule init` | 仅初始化直接 submodule，不递归 |
+| BulkUpdate | `git submodule update` | 仅更新直接 submodule |
+| BulkUpdateRecursively | `git submodule update --init --recursive` | 递归初始化并更新所有层级 |
+| BulkDeinit | `git submodule deinit --all --force` | 仅反初始化当前 repo 的直接 submodule |
+
+---
+
+### 4.5 Refresh 如何触发 UI 更新
 
 调用 `self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.SUBMODULES}})` 后：
 
@@ -297,25 +570,6 @@ PostRefreshUpdate()             // 见 2.5 渲染链
     ↓
 HandleRender() → HandleRenderToMain() → UI 更新
 ```
-
-### 4.4 嵌套 submodule 的特殊处理
-
-在 Git 命令层，涉及嵌套 submodule 的操作需要**切换工作目录**到父 submodule：
-
-以 [Delete](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L150-L202) 为例：
-
-```go
-func (self *SubmoduleCommands) Delete(submodule *models.SubmoduleConfig) error {
-    if submodule.ParentModule != nil {
-        wd, _ := os.Getwd()
-        os.Chdir(submodule.ParentModule.FullPath())  // cd 到父目录
-        defer func() { _ = os.Chdir(wd) }()          // 操作完切回
-    }
-    // ... 执行 deinit、git rm 等命令 ...
-}
-```
-
-同样的模式也出现在 [UpdateUrl](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L218-L252) 和 [Reset](file:///d:/fz/0601-2/solo-dogfeeding/code/26-lazygit/pkg/commands/git_commands/submodule.go#L130-L141) 中。
 
 ---
 
@@ -358,21 +612,29 @@ type SubmoduleConfig struct {
    ├─ getSelectedItem() → 从 FilteredListViewModel 获取当前选中的 SubmoduleConfig
    └─ 调用 update(submodule)
          ↓
-      5a. LogAction 记录操作
-      5b. Git().Submodule.Update(path)
-          → 执行 `git submodule update --init -- <path>`
-      5c. Refresh(Scope: [SUBMODULES])
-            ↓
-         RefreshHelper.Refresh()
-            ↓
-         refreshFilesAndSubmodules()
-            ├─ GetConfigs(nil) 重新解析 .gitmodules
-            ├─ Model.Submodules = 新数据
-            └─ refreshView(Submodules)
-                  ↓
-               PostRefreshUpdate → HandleRender → 重新渲染列表
-                  ↓
-               如果当前聚焦在 Submodules 视图，还会：
-                  HandleFocus → 更新光标位置
-                  HandleRenderToMain → 刷新主面板 diff
+      5a. WithWaitingStatus("Updating submodule", ...)
+            ├─ 显示 Loading 状态到 AppStatus 视图
+            └─ 将任务提交到 OnWorker 队列异步执行
+            └─ update() 立即 return nil（错误可能已被吞）
+         ↓
+      5b. [Worker goroutine]
+            ├─ LogAction 记录操作
+            ├─ Git().Submodule.Update(path)
+            │     → 执行 `git submodule update --init -- <path>`
+            │     → ⚠️ 嵌套 submodule 此命令可能失败（见 4.4 节）
+            │
+            └─ Refresh(Scope: [SUBMODULES])
+                  ├─ Mode 默认 SYNC：refreshFilesAndSubmodules 在 goroutine 中执行
+                  │    ├─ GetConfigs(nil) 重新解析 .gitmodules
+                  │    ├─ Model.Submodules = 新数据
+                  │    └─ OnUIThread { refreshView(Submodules) }
+                  │         ↓
+                  │      PostRefreshUpdate → HandleRender → 重新渲染列表
+                  │         ↓
+                  │      如果当前聚焦在 Submodules 视图，还会：
+                  │         HandleFocus → 更新光标位置
+                  │         HandleRenderToMain → 刷新主面板 diff
+                  │
+                  └─ wg.Wait() → Refresh 返回
+                     ⚠️ 但 OnUIThread 中的渲染是异步投递，此时不一定已完成
 ```
