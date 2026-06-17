@@ -10,12 +10,12 @@
 
 ### 1.1 入口：触发编辑操作
 
-所有操作都从 [local_commits_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go) 中的按键绑定开始：
+所有操作都从 [local_commits_controller.go](pkg/gui/controllers/local_commits_controller.go) 中的按键绑定开始：
 
-- **Reword（面板内编辑）**：调用 `reword(commit)` [L424-L449](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L424-L449)
-- **Reword（外部编辑器）**：调用 `rewordEditor(commit)` [L516-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L516-L523)
-- **Amend**：调用 `amendTo(commit)` [L813-L844](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L813-L844)
-- **CreateFixupCommit / CreateAmendCommit**：调用 `createFixupCommit(commit)` [L989-L1044](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L989-L1044)，弹出菜单后根据选项调用 `createAmendCommit(commit, includeFileChanges)` [L1090-L1127](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1090-L1127)
+- **Reword（面板内编辑）**：调用 `reword(commit)` [L424-L449](pkg/gui/controllers/local_commits_controller.go#L424-L449)
+- **Reword（外部编辑器）**：调用 `rewordEditor(commit)` [L516-L523](pkg/gui/controllers/local_commits_controller.go#L516-L523)
+- **Amend**：调用 `amendTo(commit)` [L813-L844](pkg/gui/controllers/local_commits_controller.go#L813-L844)
+- **CreateFixupCommit / CreateAmendCommit**：调用 `createFixupCommit(commit)` [L989-L1044](pkg/gui/controllers/local_commits_controller.go#L989-L1044)，弹出菜单后根据选项调用 `createAmendCommit(commit, includeFileChanges)` [L1090-L1127](pkg/gui/controllers/local_commits_controller.go#L1090-L1127)
 
 ### 1.2 获取原始提交消息
 
@@ -26,7 +26,7 @@
 commitMessage, err := self.c.Git().Commit.GetCommitMessage(commit.Hash())
 ```
 
-实现在 [commit.go:157-165](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L157-L165)：
+实现在 [commit.go:157-165](pkg/commands/git_commands/commit.go#L157-L165)：
 
 ```go
 func (self *CommitCommands) GetCommitMessage(commitHash string) (string, error) {
@@ -45,11 +45,11 @@ func (self *CommitCommands) GetCommitMessage(commitHash string) (string, error) 
 
 ### 1.3 自动换行预处理
 
-如果用户配置了 `Git.Commit.AutoWrapCommitMessage`，会调用 [commits_helper.go:83-103](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go#L83-L103) 中的 `TryRemoveHardLineBreaks` 把硬换行转成软换行（空格），让消息在编辑面板内自然流动。
+如果用户配置了 `Git.Commit.AutoWrapCommitMessage`，会调用 [commits_helper.go:83-103](pkg/gui/controllers/helpers/commits_helper.go#L83-L103) 中的 `TryRemoveHardLineBreaks` 把硬换行转成软换行（空格），让消息在编辑面板内自然流动。
 
 ### 1.4 打开 Commit Message Panel
 
-通过 `CommitsHelper.OpenCommitMessagePanel` [commits_helper.go:138-176](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go#L138-L176) 打开编辑面板。核心步骤：
+通过 `CommitsHelper.OpenCommitMessagePanel` [commits_helper.go:138-176](pkg/gui/controllers/helpers/commits_helper.go#L138-L176) 打开编辑面板。核心步骤：
 
 1. **包装确认回调**：用户确认时先关闭面板，再调用业务层 `OnConfirm`
 2. **消息保留（PreserveMessage）**：如果开启了消息保留且没有初始消息，从保留文件中恢复
@@ -65,30 +65,30 @@ func (self *CommitCommands) GetCommitMessage(commitHash string) (string, error) 
 
 ### 1.5 消息拆分与合并逻辑
 
-在 [commits_helper.go:43-81](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go#L43-L81)：
+在 [commits_helper.go:43-81](pkg/gui/controllers/helpers/commits_helper.go#L43-L81)：
 
 - **`SplitCommitMessageAndDescription`**：按第一个 `\n` 切割，前面是 summary，后面去掉开头的 `\n` 是 description
 - **`JoinCommitMessageAndUnwrappedDescription`**：如果 description 为空只返回 summary，否则用 `\n` 连接
 
 ### 1.6 面板内确认提交流程
 
-用户按提交键触发 `CommitMessageController.confirm()` [commit_message_controller.go:176-192](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/commit_message_controller.go#L176-L192)：
+用户按提交键触发 `CommitMessageController.confirm()` [commit_message_controller.go:176-192](pkg/gui/controllers/commit_message_controller.go#L176-L192)：
 
 1. 特殊处理：如果正在粘贴文本且回车是默认提交键，则跳到 description 面板而非提交
-2. 调用 `CommitsHelper.HandleCommitConfirm()` [commits_helper.go:182-195](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go#L182-L195)：
+2. 调用 `CommitsHelper.HandleCommitConfirm()` [commits_helper.go:182-195](pkg/gui/controllers/helpers/commits_helper.go#L182-L195)：
    - 校验 summary 非空
    - 获取当前 summary 和 description
    - 调用之前注册的 `OnConfirm` 回调执行业务逻辑
 
 #### 1.6.1 Reword 的确认回调（handleReword）
 
-`handleReword` [local_commits_controller.go:478-L494](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L478-L494) 根据是否是 HEAD 走不同分支：
+`handleReword` [local_commits_controller.go:478-L494](pkg/gui/controllers/local_commits_controller.go#L478-L494) 根据是否是 HEAD 走不同分支：
 - HEAD → 用 GpgHelper 封装执行 `RewordLastCommit`
 - 非 HEAD → `WithWaitingStatus` 中调用 `Rebase.RewordCommit` 完成后 `Refresh(ASYNC)`
 
 #### 1.6.2 CreateAmendCommit 的确认回调（OnConfirm 闭包）
 
-`createAmendCommit` 的 OnConfirm 在 [local_commits_controller.go:1106-L1121](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1106-L1121) 内联定义，执行步骤：
+`createAmendCommit` 的 OnConfirm 在 [local_commits_controller.go:1106-L1121](pkg/gui/controllers/local_commits_controller.go#L1106-L1121) 内联定义，执行步骤：
 
 ```
 CreateAmendCommit 的 OnConfirm(summary, description):
@@ -104,18 +104,18 @@ CreateAmendCommit 的 OnConfirm(summary, description):
      → 同步模式刷新，确保所有 UI 状态与磁盘一致
 ```
 
-对应的 Fixup 菜单项（非 Amend 模式）流程相同，只是调用 `Commit.CreateFixupCommit`，也同样执行 `moveFixupCommitToOwnerStackedBranch` + `MoveSelectedLine(1)` + `Refresh(SYNC)` [local_commits_controller.go:1007-L1018](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1007-L1018)。
+对应的 Fixup 菜单项（非 Amend 模式）流程相同，只是调用 `Commit.CreateFixupCommit`，也同样执行 `moveFixupCommitToOwnerStackedBranch` + `MoveSelectedLine(1)` + `Refresh(SYNC)` [local_commits_controller.go:1007-L1018](pkg/gui/controllers/local_commits_controller.go#L1007-L1018)。
 
 ### 1.7 切换到外部编辑器
 
-通过 `CommitsHelper.SwitchToEditor()` [commits_helper.go:105-118](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go#L105-L118)：
+通过 `CommitsHelper.SwitchToEditor()` [commits_helper.go:105-118](pkg/gui/controllers/helpers/commits_helper.go#L105-L118)：
 
 1. 拼接 summary + description 为完整消息
 2. 写入临时文件：`{tempDir}/{repoName}/{timestamp}.msg`
 3. 关闭面板
 4. 调用 `CommitMessageContext.SwitchToEditor(filepath)` 触发业务层注册的 `OnSwitchToEditor` 回调
 
-Reword 的 `OnSwitchToEditor` = `switchFromCommitMessagePanelToEditor` [local_commits_controller.go:451-L476](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L451-L476)：
+Reword 的 `OnSwitchToEditor` = `switchFromCommitMessagePanelToEditor` [local_commits_controller.go:451-L476](pkg/gui/controllers/local_commits_controller.go#L451-L476)：
 - HEAD → `RunSubprocessAndRefresh(RewordLastCommitInEditorWithMessageFileCmdObj(filepath))`
 - 非 HEAD → BeginInteractiveRebaseForCommit → RunSubprocessAndRefresh amend → ContinueRebase → Refresh(ASYNC)
 
@@ -129,7 +129,7 @@ Reword 的 `OnSwitchToEditor` = `switchFromCommitMessagePanelToEditor` [local_co
 
 #### 面板内编辑
 
-入口在 `handleReword` [local_commits_controller.go:478-L494](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L478-L494)，是 HEAD 提交时：
+入口在 `handleReword` [local_commits_controller.go:478-L494](pkg/gui/controllers/local_commits_controller.go#L478-L494)，是 HEAD 提交时：
 
 ```go
 return self.c.Helpers().GPG.WithGpgHandling(
@@ -138,7 +138,7 @@ return self.c.Helpers().GPG.WithGpgHandling(
     self.c.Tr.RewordingStatus, nil, nil)
 ```
 
-`RewordLastCommit` 在 [commit.go:120-129](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L120-L129)：
+`RewordLastCommit` 在 [commit.go:120-129](pkg/commands/git_commands/commit.go#L120-L129)：
 
 ```go
 func (self *CommitCommands) RewordLastCommit(summary string, description string) *oscommands.CmdObj {
@@ -151,7 +151,7 @@ func (self *CommitCommands) RewordLastCommit(summary string, description string)
 }
 ```
 
-`commitMessageArgs` [commit.go:131-139](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L131-L139) 负责把 summary/description 转成 `-m` 参数：
+`commitMessageArgs` [commit.go:131-139](pkg/commands/git_commands/commit.go#L131-L139) 负责把 summary/description 转成 `-m` 参数：
 - summary → 第一个 `-m`
 - description 非空 → 追加第二个 `-m`
 
@@ -159,7 +159,7 @@ func (self *CommitCommands) RewordLastCommit(summary string, description string)
 
 #### 外部编辑器编辑
 
-`RewordLastCommitInEditorCmdObj` [commit.go:101-103](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L101-L103)：
+`RewordLastCommitInEditorCmdObj` [commit.go:101-103](pkg/commands/git_commands/commit.go#L101-L103)：
 
 ```go
 return self.cmd.New(NewGitCmd("commit").Arg("--allow-empty", "--amend", "--only").ToArgv())
@@ -167,7 +167,7 @@ return self.cmd.New(NewGitCmd("commit").Arg("--allow-empty", "--amend", "--only"
 
 命令：`git commit --allow-empty --amend --only`（不加 `-m`，git 会启动编辑器）
 
-如果是从面板切换到编辑器（有临时消息文件），用 `RewordLastCommitInEditorWithMessageFileCmdObj` [commit.go:105-108](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L105-L108)：
+如果是从面板切换到编辑器（有临时消息文件），用 `RewordLastCommitInEditorWithMessageFileCmdObj` [commit.go:105-108](pkg/commands/git_commands/commit.go#L105-L108)：
 
 ```go
 return self.cmd.New(NewGitCmd("commit").
@@ -178,7 +178,7 @@ return self.cmd.New(NewGitCmd("commit").
 
 ### 2.2 Reword 非 HEAD 提交
 
-需要通过交互式 rebase 实现。入口同样是 `handleReword`，但走 else 分支 [local_commits_controller.go:486-L493](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L486-L493)：
+需要通过交互式 rebase 实现。入口同样是 `handleReword`，但走 else 分支 [local_commits_controller.go:486-L493](pkg/gui/controllers/local_commits_controller.go#L486-L493)：
 
 ```go
 return self.c.WithWaitingStatus(self.c.Tr.RewordingStatus, func(gocui.Task) error {
@@ -192,7 +192,7 @@ return self.c.WithWaitingStatus(self.c.Tr.RewordingStatus, func(gocui.Task) erro
 })
 ```
 
-`RebaseCommands.RewordCommit` 在 [rebase.go:37-56](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go#L37-L56)：
+`RebaseCommands.RewordCommit` 在 [rebase.go:37-56](pkg/commands/git_commands/rebase.go#L37-L56)：
 
 ```go
 func (self *RebaseCommands) RewordCommit(commits []*models.Commit, index int, summary string, description string) error {
@@ -207,7 +207,7 @@ func (self *RebaseCommands) RewordCommit(commits []*models.Commit, index int, su
 }
 ```
 
-如果使用外部编辑器 reword 非 HEAD 提交，走 `RewordCommitInEditor` [rebase.go:58-69](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go#L58-L69)：
+如果使用外部编辑器 reword 非 HEAD 提交，走 `RewordCommitInEditor` [rebase.go:58-69](pkg/commands/git_commands/rebase.go#L58-L69)：
 
 ```go
 changes := []daemon.ChangeTodoAction{{
@@ -222,7 +222,7 @@ return self.PrepareInteractiveRebaseCommand(PrepareInteractiveRebaseCommandOpts{
 
 ### 2.3 Amend HEAD 提交
 
-`amendTo` [local_commits_controller.go:816-L825](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L816-L825) 判断是 HEAD 提交时：
+`amendTo` [local_commits_controller.go:816-L825](pkg/gui/controllers/local_commits_controller.go#L816-L825) 判断是 HEAD 提交时：
 
 ```go
 handleCommit = func() error {
@@ -236,7 +236,7 @@ handleCommit = func() error {
 }
 ```
 
-`AmendHelper.AmendHead` [amend_helper.go:20-23](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/amend_helper.go#L20-L23)：
+`AmendHelper.AmendHead` [amend_helper.go:20-23](pkg/gui/controllers/helpers/amend_helper.go#L20-L23)：
 
 ```go
 func (self *AmendHelper) AmendHead() error {
@@ -246,7 +246,7 @@ func (self *AmendHelper) AmendHead() error {
 }
 ```
 
-`AmendHeadCmdObj` [commit.go:235-241](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L235-L241)：
+`AmendHeadCmdObj` [commit.go:235-241](pkg/commands/git_commands/commit.go#L235-L241)：
 
 ```go
 cmdArgs := NewGitCmd("commit").
@@ -260,7 +260,7 @@ cmdArgs := NewGitCmd("commit").
 
 ### 2.4 Amend 非 HEAD 提交
 
-`amendTo` 的 else 分支 [local_commits_controller.go:826-L835](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L826-L835)：
+`amendTo` 的 else 分支 [local_commits_controller.go:826-L835](pkg/gui/controllers/local_commits_controller.go#L826-L835)：
 
 ```go
 handleCommit = func() error {
@@ -276,7 +276,7 @@ handleCommit = func() error {
 }
 ```
 
-`RebaseCommands.AmendTo` [rebase.go:298-315](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go#L298-L315)：
+`RebaseCommands.AmendTo` [rebase.go:298-315](pkg/commands/git_commands/rebase.go#L298-L315)：
 
 ```go
 func (self *RebaseCommands) AmendTo(commits []*models.Commit, commitIndex int) error {
@@ -297,7 +297,7 @@ func (self *RebaseCommands) AmendTo(commits []*models.Commit, commitIndex int) e
 }
 ```
 
-`CreateFixupCommit` [commit.go:290-294](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L290-L294)：
+`CreateFixupCommit` [commit.go:290-294](pkg/commands/git_commands/commit.go#L290-L294)：
 
 ```go
 cmdArgs := NewGitCmd("commit").Arg("--fixup=" + hash).ToArgv()
@@ -311,7 +311,7 @@ cmdArgs := NewGitCmd("commit").Arg("--fixup=" + hash).ToArgv()
 
 #### 2.5.1 CreateFixupCommit（Fixup 菜单项）
 
-[local_commits_controller.go:1004-L1019](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1004-L1019)：
+[local_commits_controller.go:1004-L1019](pkg/gui/controllers/local_commits_controller.go#L1004-L1019)：
 
 ```
 WithEnsureCommittableFiles
@@ -326,7 +326,7 @@ WithEnsureCommittableFiles
 
 #### 2.5.2 CreateAmendCommit（两个 Amend 菜单项）
 
-`createAmendCommit` 函数 [local_commits_controller.go:1090-L1127](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1090-L1127)：
+`createAmendCommit` 函数 [local_commits_controller.go:1090-L1127](pkg/gui/controllers/local_commits_controller.go#L1090-L1127)：
 
 **面板打开阶段**：
 1. 获取原提交消息 `GetCommitMessage(commit.Hash())`
@@ -349,7 +349,7 @@ OnConfirm(summary, description):
 
 #### 2.5.3 Commit.CreateAmendCommit 参数组织
 
-[commit.go:297-309](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L297-L309)：
+[commit.go:297-309](pkg/commands/git_commands/commit.go#L297-L309)：
 
 ```go
 func (self *CommitCommands) CreateAmendCommit(originalSubject, newSubject, newDescription string, includeFileChanges bool) error {
@@ -375,7 +375,7 @@ git commit -m "amend! original subject text" -m "new subject\n\nnew description"
 
 #### 2.5.4 moveFixupCommitToOwnerStackedBranch 前置条件判断
 
-[local_commits_controller.go:1046-L1088](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1046-L1088)：
+[local_commits_controller.go:1046-L1088](pkg/gui/controllers/local_commits_controller.go#L1046-L1088)：
 
 ```go
 func (self *LocalCommitsController) moveFixupCommitToOwnerStackedBranch(targetCommit *models.Commit) error {
@@ -403,7 +403,7 @@ func (self *LocalCommitsController) moveFixupCommitToOwnerStackedBranch(targetCo
 }
 ```
 
-`Rebase.MoveFixupCommitDown` [rebase.go:317-L328](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go#L317-L328)：
+`Rebase.MoveFixupCommitDown` [rebase.go:317-L328](pkg/commands/git_commands/rebase.go#L317-L328)：
 
 ```go
 func (self *RebaseCommands) MoveFixupCommitDown(commits []*models.Commit, targetCommitIndex int) error {
@@ -424,7 +424,7 @@ func (self *RebaseCommands) MoveFixupCommitDown(commits []*models.Commit, target
 
 ### 2.6 Amend Commit 属性（作者、Co-author）
 
-通过 `GenericAmend` [rebase.go:89-112](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go#L89-L112) 统一处理：
+通过 `GenericAmend` [rebase.go:89-112](pkg/commands/git_commands/rebase.go#L89-L112) 统一处理：
 
 ```go
 func (self *RebaseCommands) GenericAmend(commits []*models.Commit, start, end int, f func(commit *models.Commit) error) error {
@@ -445,18 +445,18 @@ func (self *RebaseCommands) GenericAmend(commits []*models.Commit, start, end in
 
 具体属性修改的命令：
 
-- **ResetAuthor** [commit.go:24-30](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L24-L30)：
+- **ResetAuthor** [commit.go:24-30](pkg/commands/git_commands/commit.go#L24-L30)：
   `git commit --allow-empty --allow-empty-message --only --no-edit --amend --reset-author`
 
-- **SetAuthor** [commit.go:33-39](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L33-L39)：
+- **SetAuthor** [commit.go:33-39](pkg/commands/git_commands/commit.go#L33-L39)：
   `git commit --allow-empty --allow-empty-message --only --no-edit --amend --author="Name <Email>"`
 
-- **AddCoAuthor** [commit.go:42-55](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go#L42-L55)：
+- **AddCoAuthor** [commit.go:42-55](pkg/commands/git_commands/commit.go#L42-L55)：
   先获取原消息 → 在末尾追加 `Co-authored-by:` 行 → 执行 `git commit --allow-empty --amend --only -m <newMessage>`
 
 ### 2.7 GPG 签名处理封装
 
-`GpgHelper.WithGpgHandling` [gpg_helper.go:26-41](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/gpg_helper.go#L26-L41) 根据配置决定执行方式：
+`GpgHelper.WithGpgHandling` [gpg_helper.go:26-41](pkg/gui/controllers/helpers/gpg_helper.go#L26-L41) 根据配置决定执行方式：
 
 - **需要 GPG 子进程**（如需要输入密码）：用 `RunSubprocess` 挂起 lazygit 让 git 与终端交互，成功后调 `onSuccess` 回调，最后 `Refresh(ASYNC)`
 - **不需要**：用 `runAndStream` 包装在 `WithWaitingStatus` 中，流式输出命令日志，成功后同样 `Refresh(ASYNC)`
@@ -497,7 +497,7 @@ func (self *RebaseCommands) GenericAmend(commits []*models.Commit, start, end in
 
 ### 3.3 选择状态同步（MoveSelectedLine）
 
-CreateFixupCommit 和 CreateAmendCommit 完成后会执行 `self.context().MoveSelectedLine(1)` [local_commits_controller.go L1016, L1117](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L1016)。
+CreateFixupCommit 和 CreateAmendCommit 完成后会执行 `self.context().MoveSelectedLine(1)` [local_commits_controller.go L1016, L1117](pkg/gui/controllers/local_commits_controller.go#L1016)。
 
 原因与效果：
 - 执行前，用户选中的是目标 commit（要被 fixup/amend 的那个）
@@ -510,7 +510,7 @@ CreateFixupCommit 和 CreateAmendCommit 完成后会执行 `self.context().MoveS
 
 ### 3.4 Refresh 核心流程
 
-`RefreshHelper.Refresh` [refresh_helper.go:63-237](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237) 是刷新的总入口：
+`RefreshHelper.Refresh` [refresh_helper.go:63-237](pkg/gui/controllers/helpers/refresh_helper.go#L63-L237) 是刷新的总入口：
 
 #### 步骤 1：确定刷新范围（Scope）
 
@@ -551,12 +551,12 @@ refresh := func(name string, f func()) {
 
 #### 步骤 4：Commits 刷新细节
 
-`refreshCommitsAndCommitFiles` [refresh_helper.go:306-323](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L306-L323)：
+`refreshCommitsAndCommitFiles` [refresh_helper.go:306-323](pkg/gui/controllers/helpers/refresh_helper.go#L306-L323)：
 
 1. 调用 `refreshCommitsWithLimit` 重新加载提交列表
 2. 如果当前在查看某个 commit 的文件列表，同步刷新 commit files context
 
-`refreshCommitsWithLimit` [refresh_helper.go:351-383](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L351-L383)：
+`refreshCommitsWithLimit` [refresh_helper.go:351-383](pkg/gui/controllers/helpers/refresh_helper.go#L351-L383)：
 
 ```go
 func (self *RefreshHelper) refreshCommitsWithLimit() error {
@@ -584,7 +584,7 @@ func (self *RefreshHelper) refreshCommitsWithLimit() error {
 
 #### 步骤 5：Rebase Commits 单独刷新
 
-如果 Scope 只有 `REBASE_COMMITS`（如修改 TODO 文件后），走 `refreshRebaseCommits` [refresh_helper.go:446-459](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L446-L459)：
+如果 Scope 只有 `REBASE_COMMITS`（如修改 TODO 文件后），走 `refreshRebaseCommits` [refresh_helper.go:446-459](pkg/gui/controllers/helpers/refresh_helper.go#L446-L459)：
 
 ```go
 updatedCommits, err := self.c.Git().Loaders.CommitLoader.MergeRebasingCommits(
@@ -598,7 +598,7 @@ self.refreshView(self.c.Contexts().LocalCommits)
 
 #### 步骤 6：视图更新（refreshView）
 
-`refreshView` [refresh_helper.go:785-809](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L785-L809) 将数据同步到 UI：
+`refreshView` [refresh_helper.go:785-809](pkg/gui/controllers/helpers/refresh_helper.go#L785-L809) 将数据同步到 UI：
 
 ```go
 func (self *RefreshHelper) refreshView(context types.Context) {
@@ -618,11 +618,11 @@ func (self *RefreshHelper) refreshView(context types.Context) {
 
 #### 步骤 7：执行 Then 回调
 
-如果 `RefreshOptions.Then` 不为空，所有刷新完成后在当前线程执行该回调（仅支持 SYNC 和 BLOCK_UI 模式）。典型场景：启动 rebase 后通过 `Then` 重新恢复选中的 commit 范围，因为 rebase TODO 文件中可能插入 update-ref 行导致 commit 列表位置变化 [local_commits_controller.go:597-L600](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go#L597-L600)。
+如果 `RefreshOptions.Then` 不为空，所有刷新完成后在当前线程执行该回调（仅支持 SYNC 和 BLOCK_UI 模式）。典型场景：启动 rebase 后通过 `Then` 重新恢复选中的 commit 范围，因为 rebase TODO 文件中可能插入 update-ref 行导致 commit 列表位置变化 [local_commits_controller.go:597-L600](pkg/gui/controllers/local_commits_controller.go#L597-L600)。
 
 ### 3.5 Merge/Rebase 结果检查
 
-`MergeAndRebaseHelper.CheckMergeOrRebase` [merge_and_rebase_helper.go:152-170](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L152-L170) 在刷新后处理特殊情况：
+`MergeAndRebaseHelper.CheckMergeOrRebase` [merge_and_rebase_helper.go:152-170](pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L152-L170) 在刷新后处理特殊情况：
 
 ```go
 func (self *MergeAndRebaseHelper) CheckMergeOrRebaseWithRefreshOptions(result error, refreshOptions types.RefreshOptions) error {
@@ -733,13 +733,13 @@ handleReword（HEAD 分支）
 
 | 文件 | 职责 |
 |------|------|
-| [local_commits_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/local_commits_controller.go) | 按键绑定、操作入口、HEAD/非 HEAD 分支判断、createFixupCommit 菜单、createAmendCommit 面板回调、moveFixupCommitToOwnerStackedBranch 前置检查、MoveSelectedLine 选择同步 |
-| [commit_message_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/commit_message_controller.go) | 消息面板的键盘/鼠标事件处理、粘贴拦截、历史消息切换 |
-| [commits_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/commits_helper.go) | 消息面板打开/关闭、消息拆分合并、自动换行处理、切换外部编辑器（写临时文件）、commit 菜单（AddCoAuthor/Paste）|
-| [amend_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/amend_helper.go) | Amend HEAD 的 GPG 封装入口 |
-| [gpg_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/gpg_helper.go) | GPG 签名分支处理（子进程 vs 流式输出）、统一触发 ASYNC Refresh |
-| [merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go) | rebase/merge 结果检查、空提交自动 skip、冲突检测与处理菜单、continue/abort/skip、冲突解决后自动提示 continue |
-| [refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/controllers/helpers/refresh_helper.go) | 统一刷新入口、Scope 拆分并发刷新、WaitGroup 同步等待、ASYNC/SYNC/BLOCK_UI 模式调度、视图 PostRefreshUpdate |
-| [commit.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/commit.go) | 构建 commit/amend/reword/fixup/CreateAmendCommit 的 git 命令参数、GetCommitMessage 获取原消息、AddCoAuthorToMessage 拼接 Co-author |
-| [rebase.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/commands/git_commands/rebase.go) | 非 HEAD 提交修改：BeginInteractiveRebaseForCommit、RewordCommit（三步法）、GenericAmend（循环 rebase）、AmendTo（fixup + autosquash）、MoveFixupCommitDown（stacked branch 移动）|
-| [gui_common.go](file:///d:/fz/0601-2/solo-dogfeeding/code/35-lazygit/pkg/gui/gui_common.go) | RunSubprocessAndRefresh：执行子进程挂起 lazygit，恢复后自动触发刷新 |
+| [local_commits_controller.go](pkg/gui/controllers/local_commits_controller.go) | 按键绑定、操作入口、HEAD/非 HEAD 分支判断、createFixupCommit 菜单、createAmendCommit 面板回调、moveFixupCommitToOwnerStackedBranch 前置检查、MoveSelectedLine 选择同步 |
+| [commit_message_controller.go](pkg/gui/controllers/commit_message_controller.go) | 消息面板的键盘/鼠标事件处理、粘贴拦截、历史消息切换 |
+| [commits_helper.go](pkg/gui/controllers/helpers/commits_helper.go) | 消息面板打开/关闭、消息拆分合并、自动换行处理、切换外部编辑器（写临时文件）、commit 菜单（AddCoAuthor/Paste）|
+| [amend_helper.go](pkg/gui/controllers/helpers/amend_helper.go) | Amend HEAD 的 GPG 封装入口 |
+| [gpg_helper.go](pkg/gui/controllers/helpers/gpg_helper.go) | GPG 签名分支处理（子进程 vs 流式输出）、统一触发 ASYNC Refresh |
+| [merge_and_rebase_helper.go](pkg/gui/controllers/helpers/merge_and_rebase_helper.go) | rebase/merge 结果检查、空提交自动 skip、冲突检测与处理菜单、continue/abort/skip、冲突解决后自动提示 continue |
+| [refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go) | 统一刷新入口、Scope 拆分并发刷新、WaitGroup 同步等待、ASYNC/SYNC/BLOCK_UI 模式调度、视图 PostRefreshUpdate |
+| [commit.go](pkg/commands/git_commands/commit.go) | 构建 commit/amend/reword/fixup/CreateAmendCommit 的 git 命令参数、GetCommitMessage 获取原消息、AddCoAuthorToMessage 拼接 Co-author |
+| [rebase.go](pkg/commands/git_commands/rebase.go) | 非 HEAD 提交修改：BeginInteractiveRebaseForCommit、RewordCommit（三步法）、GenericAmend（循环 rebase）、AmendTo（fixup + autosquash）、MoveFixupCommitDown（stacked branch 移动）|
+| [gui_common.go](pkg/gui/gui_common.go) | RunSubprocessAndRefresh：执行子进程挂起 lazygit，恢复后自动触发刷新 |
