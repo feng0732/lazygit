@@ -160,22 +160,41 @@ func getConflictedCommitImpl(
     ▼
 ┌─ 4. Rescheduled 检测（老版本 Git bug） ─────────────────────────┐
 │  len(done) >= 3 且                                              │
-│  done[倒数第二条] == todo[第一条] 且                             │
+│  done[倒数第二项] == todo[第一条] 且                             │
 │  done[最后一条] == done[倒数第三条]？                            │
 │  是 → 返回 nil                                                   │
 │                                                                  │
-│  说明（注释 427-445 行）：                                       │
+│  说明（注释 427-431 行）：                                       │
 │   老版本 Git 有 bug：命令 rescheduled 时，会把"上一个成功的     │
-│   命令"再追加一份到 done 末尾，导致 done 最后两条相同。需要额    │
-│   外检测这种情况，避免误判。                                     │
+│   命令"再追加一份到 done 末尾。需要额外检测这种情况，避免误判。  │
 │                                                                  │
-│  示例：                                                          │
-│    todo 序列：pick A → exec make → pick B → exec make           │
-│    pick B 冲突 rescheduled 后：                                  │
-│      done = [pick A, exec make, pick B, pick A]  ← pick A 重复了 │
-│      todo = [exec make]                                         │
-│    此时 done[倒数第二]=exec make == todo[第一]=exec make，       │
-│    且 done[最后] == done[倒数第三] → 判定为 rescheduled。        │
+│  三个比较项的关系：                                              │
+│    ① done[倒数第二项]  ==  ② todo[第一项]                        │
+│    ③ done[最后一项]  ==  ④ done[倒数第三项]                      │
+│    两个等式必须同时成立                                          │
+│                                                                  │
+│  场景 A：真正的 bug 场景（来自单元测试）                          │
+│    原命令序列：pick deadbeaf → pick fa1afe1                      │
+│    fa1afe1 失败被 rescheduled 后：                                │
+│      done = [pick deadbeaf, pick fa1afe1, pick deadbeaf]         │
+│                                          ↑ 重复了（bug 导致）    │
+│      todo = [pick fa1afe1]                                       │
+│    检测：                                                        │
+│      ① done[1] = pick fa1afe1 == ② todo[0] = pick fa1afe1 ✓     │
+│      ③ done[2] = pick deadbeaf == ④ done[0] = pick deadbeaf ✓   │
+│      → 判定为 rescheduled，返回 nil                              │
+│                                                                  │
+│  场景 B：防止误判的场景（来自代码注释）                          │
+│    原命令序列：pick A → exec make → pick B → exec make           │
+│    pick B 失败（无 bug）：                                        │
+│      done = [pick A, exec make, pick B]                          │
+│      todo = [exec make]                                          │
+│    如果只有第一个条件：                                          │
+│      done[1] = exec make == todo[0] = exec make ✓                │
+│      → 误判为 rescheduled                                        │
+│    加上第二个条件：                                              │
+│      done[2] = pick B == done[0] = pick A? ✗                     │
+│      → 不判定，正确返回冲突                                      │
 └──────────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -345,10 +364,26 @@ UI 显示：
 
 **两种 rescheduled 检测的区别：**
 
-| 检测方式 | 适用场景 | 判定条件 |
-|----------|----------|----------|
-| 标准检测 | 新版 Git | `done[last] == todo[first]` |
-| Bug 检测 | 老版 Git | `done[last-1] == todo[first]` 且 `done[last] == done[last-2]` |
+| 检测方式 | 代码位置 | 适用场景 | 判定条件 |
+|----------|----------|----------|----------|
+| 标准检测 | L422-424 | 新版 Git 正常情况 | `done[最后一条] == todo[第一条]` |
+| Bug 检测 | L446-450 | 老版 Git bug 情况 | `done[倒数第二条] == todo[第一条]` 且 `done[最后一条] == done[倒数第三条]` |
+
+**Bug 检测的三个比较项：**
+
+```
+done 列表：[ ... , X , Y , X ]
+           ↑       ↑   ↑   ↑
+           │       │   │   └─ 最后一条（重复的 X，bug 导致）
+           │       │   └─ 倒数第二条（被 rescheduled 的命令 Y）
+           │       └─ 倒数第三条（原始的 X）
+           └─ ...
+
+比较关系：
+  倒数第二条 Y == todo[0] Y     ✓
+  最后一条 X == 倒数第三条 X     ✓
+  → 判定为 rescheduled
+```
 
 ---
 
@@ -809,6 +844,37 @@ commit-01
 ```
 
 用户通过文件视图中的 UU 文件感知冲突。
+
+#### 子情况 B3：被 rescheduled 且触发老版本 Git bug
+
+假设 Git 版本有 bug，且之前有一个成功的 `pick commit-01`：
+
+```
+原命令序列：pick commit-01 → edit commit-02 → pick commit-03
+```
+
+Git 处理 edit commit-02 时冲突，被 rescheduled，且触发 bug：
+1. `pick commit-01` 成功 → `done = [pick commit-01]`
+2. `edit commit-02` 被取出 → `done = [pick commit-01, edit commit-02]`
+3. `edit commit-02` 冲突，rescheduled → `todo = [edit commit-02, pick commit-03]`
+4. **Bug 触发**：上一个成功命令 `pick commit-01` 被再次追加 → `done = [pick commit-01, edit commit-02, pick commit-01]`
+
+此时 `.git/rebase-merge/` 中的状态：
+- `git-rebase-todo`：`edit commit-02`, `pick commit-03`
+- `done`：`pick commit-01`, `edit commit-02`, `pick commit-01`（最后一条重复了）
+- `amend`：不存在
+- `message`：存在
+
+Lazygit 判定：
+- done 最后一条 = `pick commit-01`
+- 不是 break/exec/reword
+- `done[last] = pick commit-01` != `todo[first] = edit commit-02` → 标准检测不命中
+- `len(done) >= 3` ✓
+- `done[倒数第二] = edit commit-02` == `todo[第一] = edit commit-02` ✓
+- `done[最后] = pick commit-01` == `done[倒数第三] = pick commit-01` ✓
+- → **老版本 bug 检测命中，返回 nil**
+
+UI 显示与 B2 相同，没有红色冲突标记。
 
 ---
 
