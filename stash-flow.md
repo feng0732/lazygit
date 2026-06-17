@@ -20,16 +20,18 @@
 | 全局 Model 存储 | [common.go](pkg/gui/types/common.go) | `Model.StashEntries` 存放位置 |
 | 顶层 Git 门面 | [git.go](pkg/commands/git.go) | `GitCommand.Stash` / `GitCommand.Loaders.StashLoader` 依赖注入点 |
 | Confirm/Prompt 错误传递 | [popup_handler.go](pkg/gui/popup/popup_handler.go) | `Confirm` / `ConfirmIf` / `Prompt` 的 Popup 创建和错误返回机制 |
+| Popup 关闭与回调 | [confirmation_helper.go](pkg/gui/controllers/helpers/confirmation_helper.go) | `closeAndCallConfirmationFunction` 关闭弹窗后执行回调 |
+| gocui 错误处理 | [gui.go](pkg/gocui/gui.go) | `handleError` → `ErrorHandler` 统一处理 keybinding 返回的 error |
 
 ---
 
 ## 二、Stash 入栈（Push）流程
 
-### 2.1 入口动作（按代码核对后的默认键位
+### 2.1 入口动作（按代码核对后的默认键位）
 
 入栈操作统一从 **Files 面板**触发，有两条入口路径：
 
-#### 路径 A：快捷键直接入栈（默认 **`s`** 小写）
+#### 路径 A：快捷键直接入栈（默认 `s` 小写）
 
 定义在 [user_config.go:1053](pkg/config/user_config.go#L1053)：
 
@@ -41,10 +43,10 @@ StashAllChanges: Keybinding{"s"},
 
 ```go
 {
-    Keys:        opts.GetKeys(opts.Config.Files.StashAllChanges),
-    Handler:     self.stash,
-    Description: self.c.Tr.Stash,
-    Tooltip:     self.c.Tr.StashTooltip,
+    Keys:            opts.GetKeys(opts.Config.Files.StashAllChanges),
+    Handler:         self.stash,
+    Description:     self.c.Tr.Stash,
+    Tooltip:         self.c.Tr.StashTooltip,
     DisplayOnScreen: true,
 },
 ```
@@ -57,7 +59,7 @@ func (self *FilesController) stash() error {
 }
 ```
 
-#### 路径 B：菜单多选项入栈（默认 **`S`** 大写 / Shift+S）
+#### 路径 B：菜单多选项入栈（默认 `S` 大写 / Shift+S）
 
 定义在 [user_config.go:1054](pkg/config/user_config.go#L1054)：
 
@@ -70,14 +72,14 @@ ViewStashOptions: Keybinding{"S"},
 菜单定义在 [files_controller.go:1107-1165](pkg/gui/controllers/files_controller.go#L1107-L1165)，共 **5 个菜单项**：
 
 | 菜单热键 | 菜单项标签 | 调用的 StashCommands 方法 | 前置条件检查 |
-|----------|-----------|------------------------|-------------|
-| `a` | StashAllChanges | `Push` | 工作树有改动（排除子模块）|
+|----------|-----------|--------------------------|-------------|
+| `a` | StashAllChanges | `Push` | 工作树有改动（排除子模块） |
 | `i` | StashAllChangesKeepIndex | `StashAndKeepIndex` | 工作树有改动 |
 | `U` | StashIncludeUntrackedChanges | `StashIncludeUntrackedChanges` | 无 |
-| `s` | StashStagedChanges | `SaveStagedChanges` | 存在已暂存文件（排除子模块）|
-| `u` | StashUnstagedChanges | 有暂存 → `StashUnstagedChanges`<br>无暂存 → 降级 `Push` | 工作树有改动 |
+| `s` | StashStagedChanges | `SaveStagedChanges` | 存在已暂存文件（排除子模块） |
+| `u` | StashUnstagedChanges | 有暂存→`StashUnstagedChanges`<br>无暂存→降级`Push` | 工作树有改动 |
 
-#### 通用外壳：`handleStashSave
+#### 通用外壳：`handleStashSave`
 
 所有入栈路径最终汇聚到 [files_controller.go:1344-1360](pkg/gui/controllers/files_controller.go#L1344-L1360)：
 
@@ -86,9 +88,9 @@ func (self *FilesController) handleStashSave(stashFunc func(message string) erro
     self.c.Prompt(types.PromptOpts{
         Title: self.c.Tr.StashChanges,
         HandleConfirm: func(stashComment string) error {
-            self.c.LogAction(action)                      // ① 写操作审计日志
-            if err := stashFunc(stashComment); err != nil {  // ② 执行 git stash 命令
-                return err                                   // ⚠️ 失败：直接 return，**不刷新**
+            self.c.LogAction(action)                          // ① 写操作审计日志
+            if err := stashFunc(stashComment); err != nil {   // ② 执行 git stash 命令
+                return err                                    // ⚠️ 失败：直接 return，不刷新
             }
             // ③ 仅在成功时刷新 STASH 和 FILES
             self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.STASH, types.FILES}})
@@ -101,8 +103,8 @@ func (self *FilesController) handleStashSave(stashFunc func(message string) erro
 ```
 
 **⚠️ 关键边界结论 1 — 入栈刷新策略：**
-- ✅ **成功** → `Refresh({STASH, FILES})
-- ❌ **失败** → **不刷新任何视图**，`stashFunc 返回的 error 由 Prompt 的 OnConfirm → `self.context().State.OnConfirm() 错误冒泡到 GUI 框架层显示错误消息
+- ✅ **成功** → `Refresh({STASH, FILES})`
+- ❌ **失败** → **不刷新任何视图**，`stashFunc` 返回的 error 由 Prompt 的 OnConfirm 沿 keybinding → `ErrorHandler` 冒泡，最终弹出 Alert 显示红色错误消息
 
 ---
 
@@ -110,7 +112,7 @@ func (self *FilesController) handleStashSave(stashFunc func(message string) erro
 
 全部定义在 [stash.go](pkg/commands/git_commands/stash.go) 中的 `StashCommands` 结构体。
 
-底层执行模式**全部走相同模式：
+底层执行模式**全部走相同模式**：
 
 ```go
 cmdArgs := NewGitCmd("stash").Arg(...).ToArgv()
@@ -122,24 +124,26 @@ return self.cmd.New(cmdArgs).Run()  // 返回 error
 | [Push(message)](pkg/commands/git_commands/stash.go#L56-L61) | `git stash push -m <msg>` | 基础入栈 |
 | [StashAndKeepIndex(message)](pkg/commands/git_commands/stash.go#L105-L110) | `git stash push --keep-index -m <msg>` | 入栈后保留暂存区 |
 | [StashIncludeUntrackedChanges(message)](pkg/commands/git_commands/stash.go#L195-L200) | `git stash push --include-untracked -m <msg>` | 含未跟踪文件 |
-| [SaveStagedChanges(message)](pkg/commands/git_commands/stash.go#L133-L193) | Git ≥2.35: `git stash push --staged -m <msg>`<br>Git <2.35: **6 步复合操作**（见下文） | 仅暂存区入栈 |
-| [StashUnstagedChanges(message)](pkg/commands/git_commands/stash.go#L112-L130) | **3 步复合**：临时 commit → stash → reset soft | 仅未暂存入栈 |
+| [SaveStagedChanges(message)](pkg/commands/git_commands/stash.go#L133-L193) | Git≥2.35: `git stash push --staged -m <msg>`<br>Git<2.35: **6 步复合操作**（见下文） | 仅暂存区入栈 |
+| [StashUnstagedChanges(message)](pkg/commands/git_commands/stash.go#L112-L130) | **3 步复合**：临时commit→stash→reset soft | 仅未暂存入栈 |
 | [Store(hash, message)](pkg/commands/git_commands/stash.go#L63-L72) | `git stash store [-m msg] <hash>` | Rename 内部使用 |
 
 #### 复合命令细节：SaveStagedChanges（Git < 2.35 兼容方案）
 
 6 个步骤：
+
 1. `git stash --keep-index` — 临时藏起未暂存改动
 2. `git stash push -m <msg>` — 保存暂存改动入栈
 3. `git stash apply refs/stash@{1}` — 恢复步骤 1 临时藏的改动
-4. `git stash show -p \| git apply -R` — 反向应用补丁，从工作树移除临时 stash 的内容
+4. `git stash show -p | git apply -R` — 反向应用补丁，从工作树移除临时 stash 的内容
 5. `git stash drop refs/stash@{1}` — 删除步骤 1 的临时 stash
-6. 遍历文件列表，**清理 `AD` 状态**（新增已暂存 + 工作树已删除）的文件
+6. 遍历文件列表，清理 `AD` 状态（新增已暂存 + 工作树已删除）的文件
 
 #### 复合命令细节：StashUnstagedChanges
 
 3 个步骤：
-1. `git commit --no-verify -m "[lazygit] stashing unstaged changes` — 先把暂存改动临时提交（跳过 githooks）
+
+1. `git commit --no-verify -m "[lazygit] stashing unstaged changes"` — 先把暂存改动临时提交（跳过 githooks）
 2. `git stash push -m <msg>` — 把真正要保存的未暂存入栈
 3. `git reset --soft HEAD^` — 回滚步骤 1 的临时提交，恢复暂存区
 
@@ -153,13 +157,13 @@ return self.cmd.New(cmdArgs).Run()  // 返回 error
 
 | 默认键位来源 | 默认值 | Handler | 说明 |
 |------------|--------|---------|------|
-| `Universal.Select` | **`<space>` 空格** | `handleStashApply` | 应用 stash（**不删除**）|
-| `Stash.PopStash` | **`g`** | `handleStashPop` | 弹出 stash（应用后删除）|
-| `Universal.Remove` | **`d`** | `handleStashDrop` | 删除 stash（**支持多选范围删除）|
-| `Universal.New` | **`n`** | `handleNewBranchOffStashEntry` | 基于 stash 创建分支 |
-| `Stash.RenameStash` | **`r`** | `handleRenameStashEntry` | 重命名 stash |
+| `Universal.Select` | `<space>` 空格 | `handleStashApply` | 应用 stash（不删除） |
+| `Stash.PopStash` | `g` | `handleStashPop` | 弹出 stash（应用后删除） |
+| `Universal.Remove` | `d` | `handleStashDrop` | 删除 stash（支持多选范围删除） |
+| `Universal.New` | `n` | `handleNewBranchOffStashEntry` | 基于 stash 创建分支 |
+| `Stash.RenameStash` | `r` | `handleRenameStashEntry` | 重命名 stash |
 
-> ⚠️ **注意**：`<enter` 在 Stash 面板上**不绑定** apply 操作，绑定的是 `space`。
+> ⚠️ **注意**：`<enter>` 在 Stash 面板上**不绑定** apply 操作，apply 绑定的是 `space`。
 
 #### handleStashApply
 
@@ -172,14 +176,14 @@ func (self *StashController) handleStashApply(stashEntry *models.StashEntry) err
             Title:  self.c.Tr.StashApply,
             Prompt: self.c.Tr.SureApplyStashEntry,
             HandleConfirm: func() error {
-                self.c.LogAction(self.c.Tr.Actions.ApplyStash)          // ① 日志
-                err := self.c.Git().Stash.Apply(stashEntry.Index)         // ② 执行 git stash apply
-                self.postStashRefresh()                               // ③ ⚠️ 先刷新（无论成功失败都刷新）
-                if err != nil {                                       // ④ 再检查错误
+                self.c.LogAction(self.c.Tr.Actions.ApplyStash)       // ① 日志
+                err := self.c.Git().Stash.Apply(stashEntry.Index)     // ② 执行 git stash apply
+                self.postStashRefresh()                                // ③ ⚠️ 先刷新（无论成功失败都刷新）
+                if err != nil {                                        // ④ 再检查错误
                     return err
                 }
                 if self.c.UserConfig().Gui.SwitchToFilesAfterStashApply {
-                    self.c.Context().Push(self.c.Contexts().Files, ...)  // ⑤ 成功才跳 Files
+                    self.c.Context().Push(self.c.Contexts().Files, types.OnFocusOpts{})  // ⑤ 成功才跳 Files
                 }
                 return nil
             },
@@ -194,11 +198,13 @@ func (self *StashController) handleStashApply(stashEntry *models.StashEntry) err
 ```go
 pop := func() error {
     self.c.LogAction(self.c.Tr.Actions.PopStash)
-    self.c.LogCommand(...) // 额外记录到 Command Log 面板
+    self.c.LogCommand(...)                                      // 额外记录到 Command Log 面板
     err := self.c.Git().Stash.Pop(stashEntry.Index)
-    self.postStashRefresh()  // ⚠️ 先刷新，再检错
+    self.postStashRefresh()                                     // ⚠️ 先刷新，再检错
     if err != nil { return err }
-    if SwitchToFilesAfterStashPop { 切换到 Files }
+    if self.c.UserConfig().Gui.SwitchToFilesAfterStashPop {
+        self.c.Context().Push(self.c.Contexts().Files, types.OnFocusOpts{})
+    }
     return nil
 }
 ```
@@ -210,7 +216,7 @@ pop := func() error {
 [stash_controller.go:161-181](pkg/gui/controllers/stash_controller.go#L161-L181)，**支持多选删除，倒序遍历**：
 
 ```go
-for i := len(stashEntries) - 1; i >= 0; i-- {   // ⚠️ 从大 index 往小删，避免索引重排
+for i := len(stashEntries) - 1; i >= 0; i-- {              // ⚠️ 从大 index 往小删，避免索引重排
     self.c.LogCommand(...)
     err := self.c.Git().Stash.Drop(stashEntries[i].Index)
     self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.STASH}})  // 每删一个刷一次
@@ -223,7 +229,7 @@ self.context().CollapseRangeSelectionToTop()
 
 #### handleRenameStashEntry
 
-[stash_controller.go:191-218](pkg/gui/controllers/stash_controller.go#L191-L218)，**特殊的刷新策略**——**成败都刷新**：
+[stash_controller.go:191-218](pkg/gui/controllers/stash_controller.go#L191-L218)，**特殊的刷新策略——成败都刷新**：
 
 ```go
 HandleConfirm: func(response string) error {
@@ -233,9 +239,9 @@ HandleConfirm: func(response string) error {
         self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.STASH}})  // ❌ 失败也刷新
         return err
     }
-    self.context().SetSelection(0)
+    self.context().SetSelection(0)          // 选第 0 项（renamed stash）
     self.context().FocusLine(true)
-    self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.STASH}})  // ✅ 成功也刷新
+    self.c.Refresh(types.RefreshOptions{Scope: []types.RefreshableView{types.STASH}})      // ✅ 成功也刷新
     return nil
 }
 ```
@@ -261,9 +267,9 @@ func (self *StashController) postStashRefresh() {
 | [Apply(index)](pkg/commands/git_commands/stash.go#L48-L53) | `git stash apply refs/stash@{<index>}` |
 | [Pop(index)](pkg/commands/git_commands/stash.go#L41-L46) | `git stash pop refs/stash@{<index>}` |
 | [Drop(index)](pkg/commands/git_commands/stash.go#L34-L39) | `git stash drop refs/stash@{<index>}` |
-| [DropNewest()](pkg/commands/git_commands/stash.go#L28-L32) | `git stash drop`（无参数 = drop stash@{0}）|
+| [DropNewest()](pkg/commands/git_commands/stash.go#L28-L32) | `git stash drop`（无参数 = drop stash@{0}） |
 | [Rename(index, msg)](pkg/commands/git_commands/stash.go#L202-L218) | 3 步：`Hash(index)` → `Drop(index)` → `Store(hash, msg)` |
-| [Hash(index)](pkg/commands/git_commands/stash.go#L74-L81) | `git rev-parse refs/stash@{<index>}`（Rename 内部用）|
+| [Hash(index)](pkg/commands/git_commands/stash.go#L74-L81) | `git rev-parse refs/stash@{<index>}`（Rename 内部用） |
 
 ---
 
@@ -273,8 +279,8 @@ func (self *StashController) postStashRefresh() {
 
 ```
 Controller.c.Refresh(opts)
-    └─► guiCommon.Refresh()           [gui_common.go:29-31]
-          └─► RefreshHelper.Refresh(options)  [refresh_helper.go:63-237]
+    └─► guiCommon.Refresh()              [gui_common.go:29-31]
+          └─► RefreshHelper.Refresh(options) [refresh_helper.go:63-237]
 ```
 
 ### 4.2 RefreshOptions 结构
@@ -283,9 +289,9 @@ Controller.c.Refresh(opts)
 
 | 字段 | 说明 | Stash 相关操作的取值 |
 |------|------|---------------------|
-| `Scope []RefreshableView` | 指定刷新哪些视图（空=全部）| `{STASH, FILES}`（入栈/应用/弹出）<br>`{STASH}`（删除/重命名仅刷列表）|
-| `Mode RefreshMode` | 刷新模式：`SYNC`（默认，等待所有 goroutine 结束）/ `ASYNC` / `BLOCK_UI` | 始终默认 `SYNC`
-| `Then func()` | 刷新完成回调（仅 SYNC 可用）| 未使用 |
+| `Scope []RefreshableView` | 指定刷新哪些视图（空=全部） | `{STASH, FILES}`（入栈/应用/弹出）<br>`{STASH}`（删除/重命名仅刷列表） |
+| `Mode RefreshMode` | `SYNC`（默认）/ `ASYNC` / `BLOCK_UI` | 始终默认 `SYNC` |
+| `Then func()` | 刷新完成回调（仅 SYNC 可用） | 未使用 |
 
 ### 4.3 RefreshHelper.Refresh 调度逻辑
 
@@ -354,31 +360,31 @@ type StashEntry struct {
 
 ## 五、刷新时机与失败/冲突时的状态更新先后
 
-### 5.1 各操作刷新策略对照表（核心修正后的完整对比）
+### 5.1 各操作刷新策略对照表
 
 | 操作 | git 命令位置 | Refresh 调用位置 | ✅ 成功时 | ❌ 失败/冲突时 |
 |------|-------------|-----------------|----------|---------------|
-| **入栈 Push**（5 种） | `stashFunc(msg)` 之后 | `if err != nil { return }` 之后 | ✅ Refresh `{STASH, FILES}` | ❌ **不刷新**，error 上抛 |
-| **Apply** | `Apply(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err |
-| **Pop** | `Pop(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err |
-| **Drop**（多选）| 每次 `Drop` 之后立即 Refresh，每次 `Drop` 之后 | 每删一个 Refresh `{STASH}` | ✅ 全部删完后 `CollapseRangeSelectionToTop` | ✅ 已执行的 Refresh 已生效，中途停止 |
-| **Rename** | `Rename` 之后 | err 分支和成功分支**都 Refresh `{STASH}` | ✅ 刷新 + 选第 0 项 + Focus | ✅ **刷新**（Drop 失败但已生效的状态 |
+| **入栈 Push**（5 种） | `stashFunc(msg)` 之后 | `if err != nil { return }` 之后 | ✅ `Refresh({STASH, FILES})` | ❌ **不刷新**，error 上抛至 ErrorHandler |
+| **Apply** | `Apply(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err） |
+| **Pop** | `Pop(index)` 之后 | `postStashRefresh()` 先于 err 判断 | ✅ 同上 + 可选跳 Files | ✅ **刷新**（先 Refresh 再 return err） |
+| **Drop**（多选） | 每次 `Drop` 之后 | 每删一个后立即 `Refresh({STASH})` | ✅ 全部删完后 `CollapseRangeSelectionToTop` | ✅ 已执行的 Refresh 已生效，中途停止 |
+| **Rename** | `Rename` 之后 | err 分支和成功分支**都** `Refresh({STASH})` | ✅ 刷新 + 选第 0 项 + Focus | ✅ **刷新**（Drop 失败但已生效的状态） |
 
-### 5.2 为什么 Apply/Pop **冲突场景的状态更新先后分析
+### 5.2 Apply/Pop 冲突场景的状态更新先后分析
 
-Apply/Pop **先 Refresh 再判断 err 是不是刻意为之的设计，冲突后果：
+Apply/Pop **先 Refresh 再判断 err** 是刻意为之的设计，冲突时完整时间线：
 
 ```
-时间线  ─────────────────────────────────────────────────────────────────────►
+时间线  ─────────────────────────────────────────────────────────────────►
 
 Step 1  用户按 <space>（Apply）
          │
          ├─ ① git stash apply refs/stash@{0}
-         │     Git 执行 apply，
+         │     Git 执行 apply：
          │     ├─ 若冲突：Git 写入 <<<<<<< 标记到工作树文件，返回 exit code 1
-         │     └─ 若干净：工作树变干净，stash entry 仍在（apply 不删）
+         │     └─ 若干净：工作树变更生效，stash entry 仍在（apply 不删）
          │
-         ├─ ② postStashRefresh()  ← **无论上面返回什么都立刻执行**
+         ├─ ② postStashRefresh()  ← 无论上面返回什么都立刻执行
          │     ├─ 刷新 Stash 列表（STASH scope）→ 重新 git stash list
          │     │   Apply 冲突：stash@{0} 仍在列表
          │     │   Apply 干净：stash@{0} 仍在（apply 本来就不删除）
@@ -386,88 +392,107 @@ Step 1  用户按 <space>（Apply）
          │     │   Pop 干净：stash@{0} 被删除
          │     └─ 刷新 Files 面板（FILES scope）→ 重新 git status
          │         Apply/Pop 冲突：显示冲突文件状态（UU 等）
-         │         Apply/Pop 干净：显示工作树变干净或变更
+         │         Apply/Pop 干净：显示工作树变更或变干净
          │
          └─ ③ if err != nil { return err }
-               返回错误 → GUI 弹出错误提示框显示冲突信息
+               返回错误 → ErrorHandler → Alert 弹窗显示红色冲突信息
 ```
 
-**设计合理性分析**：冲突时工作树已经被 Git 写入了冲突标记，stash 列表状态也改变了（Pop 冲突时 Git 不会删除 stash），**先 Refresh 保证 UI 立即反映真实的磁盘状态**，再通过 error 提醒用户有冲突需要解决。
+**设计合理性**：冲突时工作树已经被 Git 写入了冲突标记，stash 列表状态也改变了（Pop 冲突时 Git 不会删除 stash），**先 Refresh 保证 UI 立即反映真实的磁盘状态**，再通过 error 提醒用户有冲突需要解决。
 
-### 5.3 ConfirmIf / Prompt 的错误传递机制
+### 5.3 Confirm / Prompt / ConfirmIf 的错误传递机制（按代码核对）
 
-| API | 返回值 | HandleConfirm 返回的 error 去向 |
-|-----|--------|------------------------------|
-| `Confirm(opts)` | **无返回值 (void)** | 创建 ConfirmationContext Popup → 用户按 enter → `context.State.OnConfirm()` 执行 → error 冒泡到 keybinding handler 层 → GUI error toast |
-| `ConfirmIf(cond, opts)` | **error** | cond=true：同上，外层始终 `return nil`<br>cond=false：直接 `return opts.HandleConfirm()`，error 原样返回给调用方 |
-| `Prompt(opts)` | **无返回值 (void)** | 创建 PromptContext Popup → 用户 enter → `context.State.OnConfirm()` 执行 → error 冒泡到 GUI 层显示 |
+三种弹窗 API 的调用方式和错误返回路径**完全不同**，对照如下：
 
-**影响**：Apply 走 `ConfirmIf`，SkipStashWarning=false 时弹框 error 走 GUI；SkipStashWarning=true 时直接返回 error 给调用方。Pop 两种路径都有。
+| API | 函数签名 | 外层是否获得返回 error | HandleConfirm 返回 error 的去向 |
+|-----|---------|----------------------|-------------------------------|
+| `Confirm(opts)` | `func Confirm(opts ConfirmOpts)` **无返回值** | 否 | 弹窗内用户按 enter → `closeAndCallConfirmationFunction` 执行 HandleConfirm → error 沿 keybinding 返回 → `ErrorHandler` → Alert 红色弹窗 |
+| `ConfirmIf(cond, opts)` | `func ConfirmIf(cond bool, opts ConfirmOpts) error` | 条件性 | cond=true：同 Confirm，外层始终 `return nil`<br>cond=false：**直接** `return opts.HandleConfirm()`，error 原样返回给调用方 |
+| `Prompt(opts)` | `func Prompt(opts PromptOpts)` **无返回值** | 否 | 弹窗内用户按 enter → `wrappedPromptConfirmationFunction` → `closeAndCallConfirmationFunction` 执行 HandleConfirm(input) → error 沿 keybinding 返回 → `ErrorHandler` → Alert 红色弹窗 |
+
+**关键细节**：
+
+1. **所有路径的 error 最终都走向 `ErrorHandler`**。区别仅在于 `ConfirmIf` 在 `cond=false` 时额外把 error 原样返回给 keybinding handler 调用方（但 keybinding handler 返回的 error 同样会被 `handleError` → `ErrorHandler` 捕获）。
+
+2. **`closeAndCallConfirmationFunction`**（[confirmation_helper.go:27-39](pkg/gui/controllers/helpers/confirmation_helper.go#L27-L39)）在执行 HandleConfirm 之前**先关闭弹窗**（`cancel()` + `Pop()`），所以 HandleConfirm 中的 error 不会导致弹窗卡住。
+
+3. **`wrappedPromptConfirmationFunction`**（[confirmation_helper.go:47-77](pkg/gui/controllers/helpers/confirmation_helper.go#L47-L77)）在 `response == "" && !allowEmptyInput` 时直接 `ErrorToast` 提示，**不调用 HandleConfirm 也不关闭弹窗**，用户可以继续输入。
+
+**对 Stash 操作的影响**：
+
+- **Apply**：走 `ConfirmIf`。`SkipStashWarning=false` → cond=true → 弹 Confirm 框 → error 走 ErrorHandler；`SkipStashWarning=true` → cond=false → 直接执行 HandleConfirm → error 走 keybinding → ErrorHandler。两条路径效果一致。
+- **Pop**：同样走 `ConfirmIf`，逻辑同上。
+- **入栈**：走 `Prompt`。error 始终走 keybinding → ErrorHandler。
+- **Drop**：走 `Confirm`。error 走 ErrorHandler。
+- **Rename**：走 `Prompt`。error 始终走 keybinding → ErrorHandler。
 
 ---
 
 ## 六、操作边界总结图
 
-### Stash Push 入栈边界（键位 s 和 S）
+### Stash Push 入栈边界（键位 s / S）
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  1. 入口层  FilesController                                            │
-│     • s → stash() → handleStashSave(Push)                            │
-│     • S → createStashMenu() → 5 选项 → handleStashSave(5种func)      │
-│     • Prompt(AllowEmptyInput) → 输入 message（可空）                    │
-│     • HandleConfirm 内：LogAction → stashFunc → [err 不刷/才刷 Refresh] │
-├─────────────────────────────────────────────────────────────────────┤
-│  2. 命令层  StashCommands.*                                            │
-│     • NewGitCmd("stash").Arg(...).ToArgv()                            │
-│     • self.cmd.New(cmdArgs).Run() → 返回 error                        │
-│     • 复合命令多步执行，任一步失败即 error 终止                         │
-├─────────────────────────────────────────────────────────────────────┤
-│  3. 状态层  Refresh({STASH, FILES})  ← 仅成功时执行                   │
-│     • parallel: refreshStashEntries() + refreshFilesAndSubmodules()     │
-│     • Model.StashEntries ← StashLoader.GetStashEntries()              │
-│     • refreshView(StashContext) 重绘列表                                │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  1. 入口层  FilesController                                       │
+│     • s → stash() → handleStashSave(Push)                        │
+│     • S → createStashMenu() → 5 选项 → handleStashSave(5种func)  │
+│     • Prompt(AllowEmptyInput) → 输入 message（可空）               │
+│     • HandleConfirm 内：LogAction → stashFunc → 成功才 Refresh    │
+├──────────────────────────────────────────────────────────────────┤
+│  2. 命令层  StashCommands.*                                       │
+│     • NewGitCmd("stash").Arg(...).ToArgv()                       │
+│     • self.cmd.New(cmdArgs).Run() → 返回 error                   │
+│     • 复合命令多步执行，任一步失败即 error 终止                    │
+├──────────────────────────────────────────────────────────────────┤
+│  3. 状态层  Refresh({STASH, FILES}) ← 仅成功时执行               │
+│     • parallel: refreshStashEntries() + refreshFilesAndSubmodules│
+│     • Model.StashEntries ← StashLoader.GetStashEntries()         │
+│     • refreshView(StashContext) 重绘列表                          │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Stash Apply / Pop 应用边界（键位 space / g）
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  1. 入口层  StashController                                            │
-│     • space → handleStashApply                                             │
-│     • g → handleStashPop                                                  │
-│     • ConfirmIf(SkipStashWarning)                                         │
-│     • HandleConfirm 内：                                                  │
-│         LogAction[+LogCommand] → Apply/Pop → postStashRefresh → if err │
-│         ✅ 成功才跳 Files（可配置）                                        │
-├──────────────────────────────────────────────────────────────────────┤
-│  2. 命令层  StashCommands.Apply / Pop                                    │
-│     • git stash apply/pop refs/stash@{index}                              │
-│     • 冲突时 Git 返回 exit code 1 + 工作树写冲突标记                       │
-│     • Pop 冲突时 Git 不删 stash（apply 本来就不删）                        │
-├──────────────────────────────────────────────────────────────────────┤
-│  3. 状态层  postStashRefresh() → Refresh({STASH, FILES})  ← 必执行    │
-│     （**无论成功失败**：先反映真实磁盘状态，                                │
-│      再 return err 给 GUI 显示错误消息                                           │
-└──────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  1. 入口层  StashController                                       │
+│     • space → handleStashApply                                   │
+│     • g → handleStashPop                                         │
+│     • ConfirmIf(SkipStashWarning)                                │
+│     • HandleConfirm 内：                                          │
+│         LogAction[+LogCommand] → Apply/Pop → postStashRefresh    │
+│         → if err → ErrorHandler                                  │
+│         → 成功才跳 Files（可配置）                                │
+├──────────────────────────────────────────────────────────────────┤
+│  2. 命令层  StashCommands.Apply / Pop                             │
+│     • git stash apply/pop refs/stash@{index}                     │
+│     • 冲突时 Git 返回 exit code 1 + 工作树写冲突标记              │
+│     • Pop 冲突时 Git 不删 stash（apply 本来就不删）               │
+├──────────────────────────────────────────────────────────────────┤
+│  3. 状态层  postStashRefresh() → Refresh({STASH, FILES})         │
+│     ← 无论成功失败必执行：先反映真实磁盘状态，                    │
+│       再 return err 给 ErrorHandler 显示错误消息                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 关键设计观察（修正清单
+### 关键设计观察
 
 1. **入口与状态解耦**：Controller 从不直接操作 Model，统一通过 `Refresh(Scope)` 发出刷新信号，由 `RefreshHelper` 统一调度数据加载和视图重绘。
 
 2. **Scope 精准控制**：
-   - 入栈/应用/弹出：`{STASH, FILES}`（stash 内容变更 + 工作树变更
-   - 删除/重命名：`{STASH}`（仅列表变动而已）
+   - 入栈/应用/弹出：`{STASH, FILES}`（stash 内容变更 + 工作树变更）
+   - 删除/重命名：`{STASH}`（仅列表变动）
 
 3. **刷新时机因场景差异是核心**：
-   - **入栈**：失败不刷新（命令失败 = 没写任何事情发生，不需要刷了反而旧 UI 还是老状态）
-   - **Apply/Pop**：**先刷新再报错误**（Git 即使冲突时文件内容，先确保 UI 显示真实状态）
-   - **Rename**：成败都刷新（Drop 中间步骤失败可能丢失数据需要显示）
+   - **入栈**：失败不刷新（命令失败 = 什么都没发生，旧 UI 仍是正确状态）
+   - **Apply/Pop**：先刷新再报错误（Git 即使冲突也改了磁盘，先确保 UI 显示真实状态）
+   - **Rename**：成败都刷新（Drop 中间步骤失败可能丢失条目，需要显示）
 
 4. **索引安全策略**：多选 Drop **倒序**从大 index 向小 index 删除，避免 `stash@{n}` 重新编号错位。
 
-5. **命令可组合外壳**：`handleStashSave(func(msg) error, action string)`，5 种入栈命令共享 Prompt + Log + Refresh 外壳，函数参数即差异内部实现多态。
+5. **命令可组合外壳**：`handleStashSave(func(msg) error, action string)`，5 种入栈命令共享 Prompt + Log + Refresh 外壳，函数参数即差异。
 
-6. **Git 版本兼容**：`SaveStagedChanges` 分 ≥2.35 一条命令 vs <2.356 步复合作旧方案，对上层 Controller 透明。
+6. **Git 版本兼容**：`SaveStagedChanges` 分 Git≥2.35 一条命令 vs Git<2.35 六步复合旧方案，对上层 Controller 透明。
+
+7. **Error 统一出口**：无论走 Confirm、ConfirmIf 还是 Prompt，HandleConfirm 返回的 error 最终都经 `ErrorHandler` → Alert 弹窗展示给用户。区别仅在于 `ConfirmIf(cond=false)` 时 error 额外返回给 keybinding 调用方，但同样被 `handleError` → `ErrorHandler` 捕获。
