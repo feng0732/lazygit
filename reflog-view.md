@@ -60,7 +60,7 @@ cmdArgs := NewGitCmd("log").
 | 占位符 | 含义 |
 |--------|------|
 | `%H` | 完整 commit hash |
-| `%ct` | Unix 时间戳（秒） |
+| `%ct` | **提交者时间戳（committer date）**，Unix 秒。注意：是 commit 本身的 committer 时间，不是 reflog 条目自身的操作时间 |
 | `%gs` | reflog 主题消息（如 "checkout: moving from A to B"） |
 | `%P` | 父 commit hash（空格分隔） |
 | `%x00` | 空字符（字段分隔符） |
@@ -95,7 +95,7 @@ return a.Hash() == b.Hash() &&
 > of those twice in a row. Reason being that it would mean we'd be erroneously exiting early.
 
 关键事实：
-1. `%ct` 产出的是 **commit 的作者时间戳**，不是 reflog 条目自身的操作时间。因此当同一个 commit 连续出现在多条 reflog 记录中时，hash 和时间戳**完全相同**，三元组中只有 `Name`（reflog 消息，即 `%gs`）能消歧。
+1. `%ct` 产出的是 **commit 的提交者时间戳（committer date）**，不是 reflog 条目自身的操作时间。因此当同一个 commit 连续出现在多条 reflog 记录中时，hash 和时间戳**完全相同**，三元组中只有 `Name`（reflog 消息，即 `%gs`）能消歧。
 2. 存在**理论碰撞边界**：如果同一个 commit 连续产生两条 `%gs` 消息完全相同的 reflog 记录（例如快速连续执行两次完全一样的操作），三元组会错误命中断点，导致提前终止读取、丢失后续条目。代码用 "fingers crossed" 承认了这一风险，但在实践中极为罕见。
 
 ### 2.3 行解析：parseLine()
@@ -409,6 +409,75 @@ BasicCommitsController.createResetMenu(commit)
 - 以当前 reflog commit 为起点创建新分支
 - 实现：`RefsHelper.NewBranch(from, fromFormattedName, suggestedBranchName)`
 
+### 6.7 动作五：进入子提交视图（View Commits）
+
+**控制器注册**：`pkg/gui/controllers.go` 第 241-248 行
+
+`SwitchToSubCommitsController` 被挂载到 4 个 context 上共享使用，其中就包括 `ReflogCommits`：
+
+```go
+for _, context := range []controllers.CanSwitchToSubCommits{
+    gui.State.Contexts.Branches,
+    gui.State.Contexts.RemoteBranches,
+    gui.State.Contexts.Tags,
+    gui.State.Contexts.ReflogCommits,    // ← reflog 也支持进入子提交视图
+} {
+    controllers.AttachControllers(context, controllers.NewSwitchToSubCommitsController(...))
+}
+```
+
+`CanSwitchToSubCommits` 接口 (`pkg/gui/controllers/switch_to_sub_commits_controller.go` 第 11-15 行) 要求实现：
+- `GetSelectedRef()` — 返回选中的 ref（对 reflog 来说就是 commit 本身）
+- `ShowBranchHeadsInSubCommits()` — 是否在子提交中显示分支头标记
+
+**触发方式**：
+1. **GoInto 键**：默认 `Universal.GoInto`（通常是 Enter 键），见 `switch_to_sub_commits_controller.go` 第 50 行
+2. **双击**：`GetOnDoubleClick()` 同样绑定到 `viewCommits()`，见第 58-60 行
+
+**完整跳转链路**：
+
+```
+用户按 Enter / 双击 reflog 条目
+    │
+    ▼
+SwitchToSubCommitsController.viewCommits()   pkg/gui/controllers/switch_to_sub_commits_controller.go:62
+    │
+    ├─ ref := context.GetSelectedRef()       // ReflogCommitsContext 第 73-79 行
+    │                                       // 返回当前选中的 commit
+    │
+    └─ SubCommitsHelper.ViewSubCommits()     pkg/gui/controllers/helpers/sub_commits_helper.go:34
+        │
+        ├─ 1. 加载子提交数据
+        │     CommitLoader.GetCommits(
+        │       RefName = commit.FullRefName(), // 即 commit hash
+        │       Limit = true,                    // 只加载有限数量
+        │       ...
+        │     )
+        │
+        ├─ 2. 写入 Model.SubCommits           // setSubCommits() 第 75-79 行
+        │
+        ├─ 3. 配置 SubCommitsContext           // 第 55-66 行
+        │     ├─ SetSelection(0)               // 光标归零
+        │     ├─ SetParentContext(ReflogCommits)  // 按 ESC 返回 reflog
+        │     ├─ SetTitleRef(commit hash 前 50 字符)
+        │     ├─ SetRef(commit)
+        │     ├─ SetLimitCommits(true)         // 限制加载数量
+        │     ├─ SetShowBranchHeads(false)     // ← 关键：reflog 入口不显示分支头
+        │     └─ ClearSearchString()
+        │
+        ├─ 4. PostRefreshUpdate(SubCommits)   // 刷新主面板和侧边
+        │
+        ├─ 5. FocusLine(true)                 // 聚焦到第一条
+        │
+        └─ 6. Context.Push(SubCommits)        // 压入 context 栈，切到子提交面板
+```
+
+**Reflog 的特殊配置**：
+
+1. **不显示分支头标记**：`ReflogCommitsContext.ShowBranchHeadsInSubCommits()` 第 100-102 行直接返回 `false`。这是因为 reflog 条目代表的是一个任意的历史时间点，在这个时间点上显示"哪些分支头恰好位于这些 commit"没有明确语义，反而容易引起误解。分支、Tag 等 context 则会返回 `true`。
+
+2. **GetSelectedRef() 返回 commit 自身**：`pkg/gui/context/reflog_commits_context.go` 第 73-79 行直接返回 `self.GetSelected()`（即 `*models.Commit`），因为 reflog 条目本身就代表了一个可寻址的 commit ref。
+
 ---
 
 ## 七、完整调用链路图
@@ -426,7 +495,7 @@ refreshReflogCommits()                  pkg/gui/controllers/helpers/refresh_help
     │    └─ ReflogCommitLoader.GetReflogCommits()
     │         pkg/commands/git_commands/reflog_commit_loader.go:27
     │         └─ git log -g --format=+%H%x00%ct%x00%gs%x00%P
-    │         └─ 增量断点: hash + commit时间戳 + reflog消息 三元组
+    │         └─ 增量断点: hash + commit提交者时间戳 + reflog消息 三元组
     │
     ├─ 刷新 FilteredReflogCommits（过滤子集）
     │
@@ -452,6 +521,12 @@ ReflogCommitsContext                    pkg/gui/context/reflog_commits_context.g
     ▼
 用户按操作键
     │
+    ├─ Enter / 双击 → SwitchToSubCommitsController.viewCommits()
+    │                  pkg/gui/controllers/switch_to_sub_commits_controller.go:62
+    │                    → SubCommitsHelper.ViewSubCommits()
+    │                       pkg/gui/controllers/helpers/sub_commits_helper.go:34
+    │                    → 加载子提交 → SetShowBranchHeads(false) → Push(SubCommits)
+    │
     ├─ checkout 键 → BasicCommitsController.checkout()
     │                 pkg/gui/controllers/basic_commits_controller.go:53
     │                   → RefsHelper.CreateCheckoutMenu()
@@ -470,7 +545,7 @@ ReflogCommitsContext                    pkg/gui/context/reflog_commits_context.g
 ## 八、关键设计要点总结
 
 ### 1. 增量加载
-Reflog 是 lazygit 中**唯一做增量加载**的面板。通过 hash + commit 时间戳 + reflog 消息三元组识别断点，遇到已加载条目立即终止 git 命令输出，避免每次刷新都从头重读全部 reflog 历史。需注意：时间戳是 commit 的（`%ct`），不是 reflog 条目自身的操作时间，因此同一 commit 的连续 reflog 条目 hash 和时间戳完全相同，只能靠 reflog 消息消歧，存在理论碰撞风险。
+Reflog 是 lazygit 中**唯一做增量加载**的面板。通过 hash + commit 的提交者时间戳 + reflog 消息三元组识别断点，遇到已加载条目立即终止 git 命令输出，避免每次刷新都从头重读全部 reflog 历史。需注意：时间戳是 commit 的 committer date（`%ct`），不是 reflog 条目自身的操作时间，因此同一 commit 的连续 reflog 条目 hash 和时间戳完全相同，只能靠 reflog 消息消歧，存在理论碰撞风险。
 
 ### 2. 双模型设计
 `ReflogCommits`（完整全集）与 `FilteredReflogCommits`（渲染用）分离：
@@ -489,3 +564,69 @@ Reflog 不重复实现 commit 操作逻辑，直接通过 `BasicCommitsControlle
 
 ### 6. 可见行渲染优化
 设置 `renderOnlyVisibleLines: true`，配合按视口范围计算显示字符串的机制，即使 reflog 条目极多也不会因全量渲染导致卡顿。
+
+---
+
+## 九、集成测试与单元测试证据
+
+以下测试文件从代码层面验证了 reflog 视图的各项行为，是理解其正确性的直接证据。
+
+### 9.1 单元测试：增量加载与数据解析
+
+**文件**：`pkg/commands/git_commands/reflog_commit_loader_test.go`
+
+覆盖场景：
+1. **空 reflog**：断言 git 参数正确、返回空切片
+2. **全量加载**（`lastReflogCommit=nil`）：5 条 reflog 条目完整解析
+   - 测试数据（第 17-22 行）特意构造了**同一 hash（c3c4b66...）+ 同一时间戳（1643150483）**的 4 条连续条目，只有 reflog 消息不同，直接印证了"同一 commit 的连续 reflog 条目 hash 和时间戳相同、靠消息消歧"这一事实
+3. **增量加载**（提供断点 commit）：断点是第 2 条 `"checkout: moving from B to A"`，断言只返回断点之前的 1 条增量 `"checkout: moving from A to B"`，且 `onlyObtainedNewReflogCommits=true`
+4. **路径过滤**：验证 `--follow --name-status -- path` 参数正确拼接
+5. **作者过滤**：验证 `--author=John Doe <john@doe.com>` 参数正确拼接
+6. **错误处理**：git 命令返回 error 时向上透传
+
+### 9.2 集成测试：交互行为
+
+reflog 集成测试位于 `pkg/integration/tests/reflog/`，共 5 个用例。
+
+#### checkout.go：检出 reflog commit 为 detached HEAD
+- 预置场景：3 个 commit（one/two/three）后 `git reset --hard HEAD^^` 回退到 one
+- 操作路径：ReflogCommits 面板 → 选中 `commit: three` → 按主键 → 菜单选 "Checkout commit xxx as detached head"
+- 断言：
+  - ReflogCommits 顶部新增 `checkout: moving from master to <hash>`
+  - Branches 面板显示 `(HEAD detached at ...)`
+  - LocalCommits 面板恢复 three/two/one
+
+#### reset.go：硬重置到 reflog commit
+- 预置场景：同上（回退后 two/three 在 reflog 中）
+- 操作路径：ReflogCommits → 选中 `commit: three` → 按 `ViewResetOptions` 键 → 菜单选 Hard reset
+- 断言：
+  - ReflogCommits 顶部新增 `reset: moving to <hash>`
+  - LocalCommits 面板恢复 three/two/one
+
+#### cherry_pick.go：从 reflog 复制并 cherry-pick
+- 预置场景：同上
+- 操作路径：ReflogCommits → 选中 three → `CherryPickCopy` → 切到 LocalCommits → `PasteCommits` → 确认弹窗
+- 断言：LocalCommits 变为 three、one（cherry-pick 产生新的 three 提交）
+
+#### patch.go：从 reflog commit 构建 patch 并应用
+- 预置场景：commit three 包含 file1 和 file2，回退后 file1/file2 消失
+- 操作路径：ReflogCommits → 选中 three → **按 Enter 进入 SubCommits** → 选中 three 按 Enter 进入 CommitFiles → 选中 file1 → 按主键构建 patch → 菜单选 Apply patch
+- 断言：Files 面板出现 file1（patch 被应用到工作区）
+- 此用例同时验证了 **reflog 进入子提交视图** 的完整链路
+
+#### do_not_show_branch_markers_in_reflog_subcommits.go：reflog 子提交不显示分支头标记
+- 预置场景：branch1 含 one/two，branch2 基于 two 新增 three
+- 对照：先在 Branches 面板中进入 branch2 的 SubCommits，断言显示 `CI * two`（星号表示有分支头标记）
+- 验证路径：切到 ReflogCommits → 选中任意条目 → **按 Enter 进入 SubCommits** → 断言三条提交分别显示为 `CI three`、`CI two`、`CI one`，**均无 `*` 分支头标记**
+- 直接证明了 `ShowBranchHeadsInSubCommits()` 返回 `false` 的行为
+
+### 9.3 测试用例与代码的对应关系
+
+| 测试文件 | 验证的代码路径 |
+|----------|----------------|
+| `reflog_commit_loader_test.go` | `ReflogCommitLoader.GetReflogCommits()` 增量/全量、过滤、错误处理 |
+| `checkout.go` | `BasicCommitsController.checkout()` → `RefsHelper.CheckoutRef()` |
+| `reset.go` | `BasicCommitsController.createResetMenu()` → `RefsHelper.ResetToRef()` |
+| `cherry_pick.go` | `BasicCommitsController.cherryPickCopy()` + `PasteCommitsController` |
+| `patch.go` | `SwitchToSubCommitsController.viewCommits()` → `SubCommitsHelper.ViewSubCommits()` |
+| `do_not_show_branch_markers_in_reflog_subcommits.go` | `ReflogCommitsContext.ShowBranchHeadsInSubCommits()` 返回 `false` |
