@@ -226,10 +226,22 @@ return self.cmd.New(cmdArgs).
 
 这是 Pull（以及 Merge、Rebase、Cherry-pick）共享的冲突处理核心。
 
+**关键纠正**：`CheckMergeOrRebase` 调用的是 **ASYNC** 刷新，不是 SYNC！
+
+```go
+func (self *MergeAndRebaseHelper) CheckMergeOrRebase(result error) error {
+    return self.CheckMergeOrRebaseWithRefreshOptions(result, 
+        types.RefreshOptions{Mode: types.ASYNC})  // ✅ ASYNC
+}
+```
+
+**为什么可以用 ASYNC？**
+冲突检测分两层：第一层基于 git 命令的错误字符串（即时），第二层在刷新过程中基于 Model.Files（持续）。
+
 ```
 Pull 返回 err
     └─> CheckMergeOrRebase(err)
-        ├─ Refresh(ASYNC)   // 先刷新状态，文件冲突标记等才可见
+        ├─ Refresh(ASYNC)   // 立即返回，后台开始刷新（非阻塞）
         │
         ├─ err == nil → 成功，返回 nil
         │
@@ -239,9 +251,15 @@ Pull 返回 err
         │
         ├─ "No rebase in progress?" → 认为已完成，返回 nil
         │
-        └─ CheckForConflicts(err)
+        └─ CheckForConflicts(err)  // ✅ 基于 err 字符串，不依赖 Model.Files
             ├─ 匹配冲突关键词 → PromptForConflictHandling()
             └─ 不匹配 → 返回原错误
+
+    （后台 ASYNC 刷新同时进行，负责第二层冲突处理）
+    └─ refreshStateFiles()
+        ├─ 自动 stage 已解决的内联冲突
+        ├─ 冲突 N→0 检测 → PromptToContinueRebase
+        └─ 文件过滤自动切换
 ```
 
 **冲突关键词检测** `isMergeConflictErr()`：
@@ -304,13 +322,86 @@ WaitTime   = 50 * time.Millisecond
 
 **代码位置**：[refresh_helper.go:63-237](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L63-L237)
 
-#### 三种刷新模式：
+#### ❗ 核心纠正：三种刷新模式的真实区别
 
-| 模式 | 行为 | 使用场景 |
-|------|------|----------|
-| `ASYNC` | 各 scope 独立 goroutine 并行执行，OnWorker 调度 | push/pull 成功后 |
-| `SYNC` | 各 scope 并行执行，sync.WaitGroup 等待全部完成 | 冲突检测前 |
-| `BLOCK_UI` | 在 UI 线程执行，阻塞用户交互 | 切换分支等关键操作 |
+之前的理解有误，**ASYNC 是串行，SYNC 才是并行**。关键代码在 `refresh()` 包装函数 [refresh_helper.go:110-128](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L110-L128)：
+
+```go
+refresh := func(name string, f func()) {
+    if !self.c.InDemo() && options.Mode == types.ASYNC {
+        // ASYNC: OnWorker 串行调度（gocui worker 池 FIFO）
+        self.c.OnWorker(func(t gocui.Task) error {
+            f()
+            return nil
+        })
+    } else {
+        // SYNC / BLOCK_UI: 每个 scope 独立 goroutine 并行执行
+        wg.Add(1)
+        go utils.Safe(func() {
+            defer wg.Done()
+            f()
+        })
+    }
+}
+```
+
+三种模式对比：
+
+| 模式 | 调度方式 | `Refresh()` 是否等待 | scope 执行顺序 | 能否立即读 `Model.*` | 典型场景 |
+|------|---------|---------------------|---------------|---------------------|----------|
+| **ASYNC** | `OnWorker` 串行队列 | ❌ 立即返回 | 按代码顺序**一个接一个**执行 | ❌ 不能 | push/pull 成功后 |
+| **SYNC** | 每个 scope `go func()` 独立 goroutine | ✅ `wg.Wait()` 阻塞 | **同时**并行执行 | ✅ 能（所有 scope 完成后） | PromptToContinueRebase 需立即读 Model.Files |
+| **BLOCK_UI** | `OnUIThread` 直接执行 | ✅ 同步阻塞 UI | UI 线程顺序执行 | ✅ 能 | 切换分支等关键操作 |
+
+#### ❗ CheckMergeOrRebase 实际用 ASYNC，不是 SYNC
+
+**代码事实** [merge_and_rebase_helper.go:168-170](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L168-L170)：
+```go
+func (self *MergeAndRebaseHelper) CheckMergeOrRebase(result error) error {
+    return self.CheckMergeOrRebaseWithRefreshOptions(result, types.RefreshOptions{Mode: types.ASYNC})
+}
+```
+
+**为什么 ASYNC 也能正确检测冲突？**
+
+因为冲突检测分**两层**：
+- **第一层（即时）**：`CheckForConflicts()` 基于 **git 命令返回的错误字符串**（如 "CONFLICT (content):"），不是 `Model.Files`
+- **第二层（持续）**：`refreshStateFiles()` 在刷新过程中基于 `Model.Files` 做自动处理
+
+完整的 Pull 冲突流程：
+```
+git pull 返回 err (含 "CONFLICT (content): ...")
+    │
+    ▼
+CheckMergeOrRebase(err)
+    ├─ Refresh(ASYNC)  // 立即返回，后台开始刷新
+    │
+    ├─ 空提交处理（读 err 字符串）
+    │
+    └─ CheckForConflicts(err)
+        └─ isMergeConflictErr(err.Error())  // ✅ 基于 err 字符串，不依赖 Model.Files
+            └─ PromptForConflictHandling()  // 立即弹冲突菜单
+                ├─ ViewConflicts → 跳 Files 面板
+                └─ Abort → git merge --abort
+
+    （同时，后台 ASYNC 刷新在进行）
+    ├─ refreshBranches() → 更新 ahead/behind → Branches 重绘
+    └─ refreshFilesAndSubmodules()
+        ├─ refreshStateFiles()  // 第二层检测
+        │   ├─ 自动 stage 已解决的内联冲突文件
+        │   ├─ 冲突 N→0 检测 → PromptToContinueRebase
+        │   └─ 文件过滤自动切换
+        └─ refreshView(Files) → Files 面板显示冲突文件
+```
+
+**只有 PromptToContinueRebase 用 SYNC** [merge_and_rebase_helper.go:236-238](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L236-L238)：
+```go
+// 这里用 SYNC 是因为后面要立即读 Model.Files
+self.c.Refresh(types.RefreshOptions{
+    Mode: types.SYNC, Scope: []types.RefreshableView{types.FILES},
+})
+unstagedFiles := GetUnstagedFilesExceptSubmodules(self.c.Model().Files, ...)
+```
 
 #### Push/Pull 触发的刷新 Scope（默认全量）：
 
@@ -322,39 +413,45 @@ WORKTREES, STATUS, BISECT_INFO, STAGING, PULL_REQUESTS
 #### 并行执行策略与依赖关系：
 
 ```
-Refresh(ASYNC) 入口
+Refresh() 入口
     │
-    ├─ commits and commit files (独立 goroutine)
+    ├─ commits and commit files
     │   └─ refreshCommitsAndCommitFiles()
     │       ├─ refreshCommitsWithLimit()  →  Model.Commits
     │       ├─ 计算 CheckedOutBranch
-    │       └─ refreshCommitFilesContext()
+    │       ├─ refreshCommitFilesContext()
+    │       └─ refreshView(LocalCommits)  // OnUIThread
     │
-    ├─ branchesAndRemotesWg (WaitGroup, 2-3 个子任务)
-    │   ├─ branches (+ reflog) 线程
+    ├─ branchesAndRemotesWg (WaitGroup)
+    │   ├─ branches (+ reflog)
     │   │   └─ refreshBranches() / refreshReflogAndBranches()
     │   │       ├─ BranchLoader.Load()  →  Model.Branches
     │   │       ├─ 异步加载 BehindBaseBranch (onWorker 回调)
     │   │       ├─ 恢复选中分支索引
-    │   │       └─ refreshStatus()  →  状态栏
+    │   │       ├─ refreshView(Branches)  // OnUIThread
+    │   │       └─ refreshStatus()
     │   │
-    │   └─ remotes 线程 (可选)
+    │   └─ remotes
     │       └─ refreshRemotes()
     │           ├─ RemoteLoader.GetRemotes()  →  Model.Remotes
     │           │   ├─ 并行: getRemoteBranchesByRemoteName()
     │           │   └─ getRemotesFromConfig()
     │           ├─ rebuildPullRequestsMap()
-    │           └─ 同步 Model.RemoteBranches
+    │           ├─ refreshView(Remotes)
+    │           └─ refreshView(RemoteBranches)
     │
-    ├─ fileWg (WaitGroup, files 线程)
+    ├─ fileWg (WaitGroup)
     │   └─ refreshFilesAndSubmodules()
     │       ├─ refreshStateSubmoduleConfigs()
-    │       ├─ refreshStateFiles()
+    │       ├─ refreshStateFiles()  // 第二层冲突处理
     │       │   ├─ FileLoader.GetStatusFiles()  →  Model.Files
-    │       │   ├─ 自动 stage 已解决的冲突文件
-    │       │   ├─ 检测冲突从有到无 → 弹 ContinueRebase 提示
-    │       │   └─ 文件树过滤自动切换 (冲突过滤)
-    │       └─ FileTreeViewModel.SetTree()
+    │       │   ├─ 自动 stage 已解决的内联冲突
+    │       │   ├─ 检测冲突从有到无 → PromptToContinueRebase
+    │       │   └─ 文件树过滤自动切换
+    │       ├─ FileTreeViewModel.SetTree()
+    │       └─ OnUIThread:
+    │           ├─ refreshView(Submodules)
+    │           └─ refreshView(Files)
     │
     ├─ stash 线程 (独立)
     ├─ tags 线程 (独立)
@@ -368,28 +465,105 @@ Refresh(ASYNC) 入口
     ├─ STAGING (依赖 fileWg)
     │   └─ StagingHelper.RefreshStagingPanel()
     │
-    ├─ MERGE_CONFLICTS / FILES (依赖 fileWg)
+    ├─ MERGE_CONFLICTS / FILES  ❗ **独立 goroutine，不等待任何 wg！**
     │   └─ mergeConflictsHelper.RefreshMergeState()
+    │       └─ 当前上下文不是 MergeConflicts 时直接 return nil
     │
-    └─ refreshStatus()  (主线程，最后同步调用)
-        └─ FormatStatus()  →  设置状态栏 View 内容
+    └─ refreshStatus()  ❗ 调度完所有 scope **立即**在当前线程同步执行
+        ├─ GetCheckedOutRef() 为 nil 时（branches 还没跑完）直接 return
+        └─ 否则 FormatStatus() → SetViewContent(Status)
 ```
 
-#### Scope 间的 WaitGroup 依赖：
+#### Scope 间的 WaitGroup 依赖（**代码事实**）：
 
 ```
 commitsAndCommitFiles ─┐
 branchesAndRemotes    ─┤
-files/submodules      ─┼── sync.WaitGroup (wg) 等待
+files/submodules      ─┼── sync.WaitGroup (wg) 等待  (仅 SYNC/BLOCK_UI 模式下生效)
 stash                 ─┤
 tags                  ─┤
 worktrees             ─┘
                            │
                            ▼
-                  PULL_REQUESTS 须等待 branchesAndRemotesWg
-                  STAGING 须等待 fileWg
-                  MERGE_CONFLICTS 须等待 fileWg
+                  PULL_REQUESTS scope ──▶ 内部 branchesAndRemotesWg.Wait()
+                  STAGING scope       ──▶ 内部 fileWg.Wait()
+                  MERGE_CONFLICTS scope ──▶ ❌ 不 Wait，和 FILES 完全并行
 ```
+
+**补充事实**：
+- `ASYNC` 模式下所有 scope 都通过 `OnWorker` 提交，**不参与 wg.Add/Done**，所以 `wg.Wait()` 几乎立即返回，空转
+- 因此 ASYNC + `Then` 组合会 **panic** [refresh_helper.go:64-66](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L64-L66)
+- `MERGE_CONFLICTS` 触发的是 `RefreshMergeState()`，它通过 `Current().GetKey() == MERGE_CONFLICTS_CONTEXT_KEY` 决定要不要干活，而不是通过 scope 顺序保证文件已就绪
+
+#### ASYNC vs SYNC 完整时序对比
+
+**ASYNC 模式（push/pull 成功后）：**
+```
+调用方线程 (Worker 线程，执行 push/pull 回调)
+├─ Refresh(ASYNC)
+│   ├─ refresh("commits", ...) → OnWorker(task1)
+│   ├─ refresh("branches", ...) → OnWorker(task2)  // 排队，等 task1 完成
+│   ├─ refresh("files", ...) → OnWorker(task3)     // 排队，等 task2 完成
+│   └─ ...
+│
+└─ Refresh() 立即返回 → 调用方继续执行（InlineStatus stop 等）
+
+gocui Worker 池 (串行 FIFO)
+├─ task1 执行: refreshCommitsAndCommitFiles()
+│   └─ refreshView(LocalCommits) → OnUIThread 渲染
+├─ task2 执行: refreshBranches()
+│   └─ refreshView(Branches) → OnUIThread 渲染
+└─ task3 执行: refreshFilesAndSubmodules()
+    └─ refreshView(Files) → OnUIThread 渲染
+```
+
+**SYNC 模式（PromptToContinueRebase）：**
+```
+调用方线程 (UI 线程，弹 Continue 确认框回调)
+├─ Refresh(SYNC, Scope: [FILES])
+│   ├─ refresh("files", ...)
+│   │   └─ wg.Add(1) + go func() {
+│   │              refreshFilesAndSubmodules()  // 新 goroutine 并行
+│   │              wg.Done()
+│   │          }
+│   ├─ ... (其他 scope 同样 go func())
+│   │
+│   └─ wg.Wait()  // ⚠️ 阻塞当前线程，直到所有 goroutine 完成
+│
+└─ Refresh() 返回 → Model.Files 已是最新 ✅
+
+// 现在可以安全地读 Model.Files
+unstagedFiles := GetUnstagedFilesExceptSubmodules(self.c.Model().Files, ...)
+if len(unstagedFiles) > 0 {
+    // 弹确认框询问是否 auto-stage
+}
+```
+
+**注意**：BLOCK_UI 模式与 SYNC 类似，但是在 UI 线程同步执行，完全阻塞用户交互。
+
+#### refreshView 总是 OnUIThread 异步渲染
+
+**代码位置** [refresh_helper.go:785-805](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L785-L805)：
+
+```go
+func (self *RefreshHelper) refreshView(context types.Context) {
+    // 注释明确说明：从 worker goroutine 调用，所以 bounce 到 UI 线程
+    self.c.OnUIThread(func() error {
+        self.searchHelper.ReApplyFilter(context)       // 1. 重新应用过滤
+        self.c.PostRefreshUpdate(context)              // 2. HandleRender + 焦点
+        self.c.AfterLayout(func() error {              // 3. 布局后重应用搜索
+            self.searchHelper.ReApplySearch(context)
+            return nil
+        })
+        return nil
+    })
+}
+```
+
+每个 scope 的 refresh 函数**末尾**调用 `refreshView()`：
+- `refreshBranches()` → `self.refreshView(self.c.Contexts().Branches)`
+- `refreshCommitsAndCommitFiles()` → `self.refreshView(self.c.Contexts().LocalCommits)`
+- `refreshFilesAndSubmodules()` → OnUIThread 中调用 `refreshView(Files)`
 
 ---
 
@@ -596,57 +770,128 @@ RefreshHelper.Refresh(ASYNC)
 
 #### 状态栏的特殊刷新 `refreshStatus()`：[refresh_helper.go:748-767](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L748-L767)
 
-状态栏不是通过 postRefreshUpdate，而是直接 `SetViewContent`：
+状态栏有**两个调用点**，不是通过 postRefreshUpdate：
 
+**调用点 1（Refresh 主流程末尾）** [refresh_helper.go:219](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L219)：
+- 所有 scope 调度完毕后**立即同步执行**（在调用 Refresh 的线程里）
+- ASYNC 模式下此时 branches 大概率还没跑完，`GetCheckedOutRef()` 返回 nil → **直接 return，什么都不做**
+
+```go
+// Refresh() 主流程末尾
+self.refreshStatus()   // 第 219 行
+
+// refreshStatus 内部
+currentBranch := self.refsHelper.GetCheckedOutRef()
+if currentBranch == nil {
+    // need to wait for branches to refresh
+    return   // ← ASYNC 模式下大部分走这里
+}
+```
+
+**调用点 2（refreshBranches 内部）** [refresh_helper.go:542](file:///d:/fz/0601-2/solo-dogfeeding/code/25-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L542)：
+- branches scope 完成后一定会调用，此时 `Model.Branches` 已就绪
+- 这是 ASYNC 模式下状态栏真正更新的时刻
+
+状态栏渲染：
 ```go
 status := presentation.FormatStatus(
     repoName,
     currentBranch,
-    types.ItemOperationNone,      // 状态栏不显示 spinner（spinner 在分支行内显示）
+    types.ItemOperationNone,      // ❗ 状态栏不显示 spinner（spinner 在分支行内显示）
     linkedWorktreeName,
     workingTreeState,              // 显示 "(rebasing)" / "(merging)" 等
     tr,
     userConfig,
 )
-self.c.SetViewContent(self.c.Views().Status, status)
+self.c.SetViewContent(self.c.Views().Status, status)  // 直接写 View，不走 HandleRender
 ```
 
-#### 完整刷新时序（Push 成功后 ASYNC 模式）：
+#### ❗ BehindBaseBranch 的独立二次渲染
+
+在 `BranchLoader.Load()` 内部，基分支落后计数是通过 `onWorker` 回调**异步**计算的，**不受 Refresh 的 wg 控制**：
+
+```go
+// BranchLoader.Load 内部 [branch_loader.go:139-143]
+if loadBehindCounts && self.UserConfig().Gui.ShowDivergenceFromBaseBranch != "none" {
+    onWorker(func() error {
+        return self.GetBehindBaseBranchValuesForAllBranches(branches, mainBranches, renderFunc)
+    })
+}
+// renderFunc 的实际内容 [refresh_helper.go:500-506]
+func() {
+    self.c.OnUIThread(func() error {
+        self.c.Contexts().Branches.HandleRender()  // 二次渲染：只渲染分支列表
+        self.refreshStatus()                       // 二次渲染：状态栏
+        return nil
+    })
+}
+```
+
+**效果**：ASYNC 模式下，push/pull 成功后屏幕会出现三次渲染：
+1. branches scope 完成 → 第一次渲染（显示 `✓`，但 BehindBaseBranch 还是旧值）
+2. BehindBaseBranch 异步计算完 → 第二次渲染（`↓N` 出现或更新）
+3. files、remotes 等其他 scope 各自完成 → 各自面板独立渲染
+
+#### 完整刷新时序（Push 成功后 ASYNC 模式，**代码事实修正版**）：
 
 ```
 时间轴 →
 │
-│  git push 命令执行完毕 (Worker 线程)
+│  git push 命令执行完毕 (Worker 线程，即 WithInlineStatus 的 callback 线程)
 │  │
-│  ├─ InlineStatusHelper.stop() 清除 ItemOperation（但此时 Model 还是旧数据）
-│  │   └─ (非 Demo 模式) 不立即重绘，靠下方 Refresh 覆盖
-│  │
-│  ▼
-│  RefreshHelper.Refresh(ASYNC) 启动
-│  │
-│  ├─ 线程 1: refreshBranches()
-│  │   ├─ BranchLoader.Load() 读 git → 更新 Model.Branches（ahead/behind 变 0）
-│  │   ├─ [OnUIThread] Branches.HandleRender() → 分支列表显示 ✓
-│  │   └─ refreshStatus() → 状态栏显示 "repo → main ✓"
-│  │
-│  ├─ 线程 2: refreshCommitsAndCommitFiles()
-│  │   └─ 更新 Model.Commits → LocalCommits.HandleRender()
-│  │
-│  ├─ 线程 3: refreshFilesAndSubmodules()
-│  │   ├─ 更新 Model.Files
-│  │   └─ [OnUIThread] Files.HandleRender()
-│  │
-│  ├─ 线程 4: refreshRemotes()
-│  │   └─ 更新 Model.Remotes / RemoteBranches
-│  │
-│  ├─ ... 其他 scope ...
+│  ├─ InlineStatusHelper.stop()
+│  │   ├─ ClearItemOperation(branch)
+│  │   └─ 非 Demo 模式：不立即重绘
 │  │
 │  ▼
-│  所有 scope 完成，wg.Wait() 返回
+│  RefreshHelper.Refresh(ASYNC) 启动  ← 在 Worker 线程内同步执行 f()
 │  │
-│  └─ options.Then() 回调（如果有）
+│  ├─ 逐个 scope 提交到 OnWorker 队列（FIFO 串行）
+│  │   ├─ refresh("commits and commit files") → OnWorker(task1)
+│  │   ├─ refresh("branches")                → OnWorker(task2)  [排队等 task1]
+│  │   ├─ refresh("files")                   → OnWorker(task3)  [排队等 task2]
+│  │   ├─ refresh("remotes")                 → OnWorker(task4)
+│  │   └─ ...
+│  │
+│  ├─ ❗ refreshStatus()  [立即执行，但 branches 还没跑，直接 return]
+│  │
+│  ├─ wg.Wait()  ← ASYNC 模式下什么都不等，几乎立即返回
+│  │
+│  ▼
+│  Refresh() 返回，pushAux 继续执行
 │
-▼  屏幕最终显示新状态
+├────── gocui Worker 队列开始串行执行 ──────
+│
+│  task1: refreshCommitsAndCommitFiles()
+│    ├─ Model.Commits = newCommits
+│    └─ refreshView(LocalCommits) → OnUIThread: ReApplyFilter → PostRefreshUpdate → HandleRender
+│
+│  task2: refreshBranches()
+│    ├─ BranchLoader.Load() → Model.Branches = newBranches
+│    │   └─ 异步提交 BehindBaseBranch 计算（OnWorker(taskN)，排在 task4 之后）
+│    ├─ refreshView(Branches) → OnUIThread: Branches.HandleRender()
+│    │                          → 显示 ✓，BehindBaseBranch 仍为旧值
+│    └─ refreshStatus() → 状态栏刷新 ✅  （这才是状态栏真正更新的地方）
+│
+│  task3: refreshFilesAndSubmodules()
+│    ├─ refreshStateFiles()
+│    │   ├─ 自动 stage 已解决冲突
+│    │   ├─ 冲突消失检测 → OnUIThread: PromptToContinueRebase()
+│    │   └─ 文件过滤自动切换
+│    └─ OnUIThread: refreshView(Files) + refreshView(Submodules)
+│
+│  task4: refreshRemotes()
+│    ├─ Model.Remotes = newRemotes
+│    └─ refreshView(Remotes) + refreshView(RemoteBranches)
+│
+│  ...
+│
+│  taskN: 异步 BehindBaseBranch 计算完成
+│    └─ OnUIThread:
+│        ├─ Branches.HandleRender()  → 显示 ↓N
+│        └─ refreshStatus()
+│
+▼  屏幕最终稳定显示新状态
 ```
 
 ---
@@ -785,15 +1030,23 @@ InlineStatusHelper.stop()
    - BehindBaseBranch 异步渐进加载，先显示基本信息再补充基分支差距
 7. **冲突解决闭环**：refreshStateFiles 自动 stage 已解决冲突 + 冲突消失自动提示 Continue Rebase
 
-### 6.2 易错点 / 注意事项
+### 6.2 易错点 / 注意事项（基于代码事实修正）
 
 1. **错误消息语言依赖**：冲突检测、落后提示基于英文错误字符串（如 "Updates were rejected"），非英文 Git 环境可能失效
 2. **远程分支信息缺失**：`AheadForPull == "?"` 时无法提前判断是否需要 force-push，只能先尝试普通 push
-3. **Refresh 时序**：push 成功后的 `Refresh(ASYNC)` 是异步的，UI 短暂显示旧的 ahead/behind 计数是预期行为（靠 async refresh 覆盖）
-   - branches、files、remotes 各 scope 完成时间不同，渲染是分批次出现的
-   - BehindBaseBranch 是异步 onWorker 计算，主视图先显示 `✓` 后才会显示 `↓N`
-4. **Demo 模式特殊处理**：InlineStatus stop 时会额外渲染，因为 demo 中 async refresh 被转成 sync
-5. **线程安全**：
-   - `itemOperations` map 有独立 mutex 保护
-   - `Model.Branches` / `Model.Files` 等在 Worker 线程写、UI 线程读，靠整体结构替换（非原地修改）保证可见性
-6. **过滤状态丢失**：每次 `ReApplyFilter(context)` 会重新创建过滤列表，如果用户在搜索中刷新，搜索高亮会在 `AfterLayout` 的 `ReApplySearch` 才恢复
+3. **ASYNC 不是并发，是串行**：ASYNC 模式下各 scope 提交到 `OnWorker` 全局 FIFO 队列，**按提交顺序一个接一个执行**，不是并行；只有 SYNC/BLOCK_UI 模式下才是每个 scope 独立 goroutine 并发
+4. **ASYNC + Then 会 panic**：因为 ASYNC 不参与 wg，`wg.Wait()` 不等任何 scope，Then 无法在所有 scope 完成后执行，代码直接 panic
+5. **状态栏有两个刷新入口**，ASYNC 模式下 Refresh 主流程末尾的 refreshStatus() 大概率因为 branches 还没完成而 early return，真正更新在 refreshBranches() 内部
+6. **MERGE_CONFLICTS scope 和 FILES scope 是并行的**：不保证谁先完成，RefreshMergeState 靠"当前上下文是不是 MergeConflicts"判断要不要干活，不依赖 fileWg
+7. **BehindBaseBranch 独立二次渲染**：在 BranchLoader.Load 内部通过 `onWorker` 异步提交，排在所有 Refresh scope 之后，是独立的 OnWorker task，不受 Refresh wg 控制
+8. **CheckMergeOrRebase 默认用 ASYNC**，冲突检测靠 git 命令返回的错误字符串（第一层），不是靠 Model.Files；Model.Files 上的冲突自动处理是第二层（持续刷新时触发）
+9. **Refresh 时序**：push/pull 成功后的渲染是分多批次出现的
+   - 第一批：commits 面板
+   - 第二批：branches 面板 + 状态栏（显示 ✓，BehindBaseBranch 仍为旧值）
+   - 第三批：files、remotes 等其他面板
+   - 第四批：BehindBaseBranch 计算完 → branches 面板再次渲染（显示 ↓N）
+10. **Demo 模式特殊处理**：InlineStatus stop 时会额外渲染，因为 demo 中 ASYNC 被强制降级为 SYNC
+11. **线程安全**：
+    - `itemOperations` map 有独立 mutex 保护
+    - `Model.Branches` / `Model.Files` 等在 Worker 线程写、UI 线程读，靠整体结构替换（非原地修改）保证可见性
+12. **过滤状态丢失**：每次 `ReApplyFilter(context)` 会重新创建过滤列表，如果用户在搜索中刷新，搜索高亮会在 `AfterLayout` 的 `ReApplySearch` 才恢复
