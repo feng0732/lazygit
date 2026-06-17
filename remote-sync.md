@@ -663,14 +663,38 @@ Ahead + Behind         →  "↓N↑M" (黄色)
 仅 Ahead               →  "↑N" (黄色)
 ```
 
-#### 基分支落后计数 `BehindBaseBranch`（异步加载）
+#### 基分支落后计数 `BehindBaseBranch`（异步并行加载）
 
-push/pull 后 `BranchLoader.Load()` 会通过 `onWorker` 回调异步计算所有分支相对主分支（main/master）的落后数：
+push/pull 后 `BranchLoader.Load()` 会在函数末尾通过 `onWorker` 回调**启动一个独立 goroutine**来计算所有分支相对主分支（main/master）的落后数。
 
-- **Git ≥ 2.41**：一次 `for-each-ref --format=%(ahead-behind:<base>)` 批量获取
-- **Git < 2.41**：每个分支单独 `rev-list --left-right --count <branch>...<base>`，errgroup 并发
+**关键并发事实**：BehindBaseBranch 计算**不是**在 refreshBranches 完成后才开始，而是在 `Load()` 函数返回前就被提交到另一个 goroutine，和 refreshBranches 的后半段（恢复选中、refreshView、refreshStatus）以及其他 Refresh scope（files、remotes 等）**完全并行执行**。
 
-每计算完一个分支会调用 `renderFunc()` 触发 `OnUIThread` 重绘分支上下文。
+```
+refreshBranches goroutine:
+├─ BranchLoader.Load()
+│   ├─ obtainBranches()          // 同步，git for-each-ref
+│   ├─ ... 排序、合并 config ...
+│   ├─ 复制 oldBranches 的 BehindBaseBranch 旧值  // 减少闪烁
+│   └─ onWorker(BehindBaseBranch计算)  // ← 提交到独立 goroutine，立即返回
+│
+├─ Model.Branches = branches     // BehindBaseBranch 此时还是旧值
+├─ refreshView(Branches)         // 第一次渲染：显示 ✓，BehindBaseBranch 旧值
+└─ refreshStatus()               // 第一次状态栏更新
+
+    ─── 并行 ───
+
+BehindBaseBranch goroutine:
+├─ git for-each-ref / errgroup 计算
+├─ 每个 branch.BehindBaseBranch.Store(新值)   // atomic 写入
+└─ renderFunc()                   // OnUIThread 二次渲染
+    ├─ Branches.HandleRender()    // 第二次分支渲染：↓N 出现
+    └─ refreshStatus()            // 第二次状态栏更新
+```
+
+- **Git ≥ 2.41**：一次 `for-each-ref --format=%(ahead-behind:<base>)` 批量获取，完成后统一 renderFunc
+- **Git < 2.41**：每个分支单独 `rev-list --left-right --count <branch>...<base>`，errgroup 并发，全部完成后统一 renderFunc
+
+**不参与 Refresh 的 wg**：无论 ASYNC 还是 SYNC 模式，BehindBaseBranch 都通过独立 OnWorker 提交，不受 Refresh 内 wg 的跟踪和等待。
 
 ---
 
@@ -853,9 +877,9 @@ status := presentation.FormatStatus(
 self.c.SetViewContent(self.c.Views().Status, status)  // 直接写 View，不走 HandleRender
 ```
 
-#### ❗ BehindBaseBranch 的独立二次渲染
+#### ❗ BehindBaseBranch 的并行二次渲染
 
-在 `BranchLoader.Load()` 内部，基分支落后计数是通过 `onWorker` 回调**异步**计算的，**不受 Refresh 的 wg 控制**：
+在 `BranchLoader.Load()` 内部，基分支落后计数是通过 `onWorker` 回调**提交到独立 goroutine**计算的，**不受 Refresh 的 wg 控制**，也**不与任何 scope 串行**：
 
 ```go
 // BranchLoader.Load 内部 [branch_loader.go:139-143]
@@ -874,10 +898,16 @@ func() {
 }
 ```
 
-**效果**：ASYNC 模式下，push/pull 成功后屏幕会出现三次渲染：
-1. branches scope 完成 → 第一次渲染（显示 `✓`，但 BehindBaseBranch 还是旧值）
-2. BehindBaseBranch 异步计算完 → 第二次渲染（`↓N` 出现或更新）
-3. files、remotes 等其他 scope 各自完成 → 各自面板独立渲染
+**关键澄清**：
+- BehindBaseBranch 计算和 refreshBranches 的后半段**并行**执行
+- BehindBaseBranch 计算和 files、remotes 等其他 scope **也并行**执行
+- 谁先完成完全不确定，取决于各 git 命令的耗时
+- BehindBaseBranch 完成后通过 `renderFunc` 触发**第二次** branches 面板渲染 + 状态栏更新
+
+**效果**：ASYNC 模式下，push/pull 成功后 branches 面板至少渲染两次，各面板渲染顺序不确定：
+1. branches scope 的 refreshView → 第一次渲染（显示 `✓`，BehindBaseBranch 还是旧值）
+2. BehindBaseBranch 计算完 → 第二次渲染（`↓N` 出现或更新）
+3. files、remotes、stash 等其他 scope 各自完成 → 各自面板独立渲染（可能在第二次 branches 渲染之前或之后）
 
 #### 完整刷新时序（Push 成功后 ASYNC 模式，**代码事实修正版**）：
 
@@ -905,38 +935,52 @@ func() {
 │  ▼
 │  Refresh() 返回 → pushAux 继续
 │
-├────── 以下各 goroutine 并行执行，谁先完成取决于 git 命令耗时 ──────
+├────── 以下各 goroutine **完全并行**执行，谁先完成取决于 git 命令耗时 ──────
 │
-│  goroutine_A: refreshCommitsAndCommitFiles()
+│  goroutine_A (commits):
 │    ├─ Model.Commits = newCommits
-│    └─ refreshView(LocalCommits) → OnUIThread(userEvents channel) → UI 主循环取出执行
+│    └─ refreshView(LocalCommits) → OnUIThread(userEvents) → UI 主循环取出执行
 │
-│  goroutine_B: refreshBranches()
-│    ├─ BranchLoader.Load() → Model.Branches = newBranches
-│    │   └─ 异步提交 BehindBaseBranch 计算（OnWorker → 又一个独立 goroutine）
-│    ├─ refreshView(Branches) → OnUIThread → 渲染（✓ 出现，BehindBaseBranch 可能旧值）
-│    └─ refreshStatus() → 状态栏刷新 ✅ （这才是状态栏真正更新的地方）
+│  goroutine_B (branches):
+│    ├─ BranchLoader.Load()
+│    │   ├─ obtainBranches()  [同步]
+│    │   ├─ ... 排序、合并 ...
+│    │   ├─ 复制旧 BehindBaseBranch 值
+│    │   └─ onWorker(BehindBaseBranch)  → go goroutine_E  ← 又启动一个独立 goroutine
+│    │
+│    ├─ Model.Branches = branches    // BehindBaseBranch 此时还是旧值
+│    ├─ refreshView(Branches) → OnUIThread → 渲染（✓ 出现，BehindBaseBranch 旧值）
+│    └─ refreshStatus() → 状态栏更新 ✅
 │
-│  goroutine_C: refreshFilesAndSubmodules()
+│  goroutine_C (files):
 │    ├─ refreshStateFiles()
 │    │   ├─ 自动 stage 已解决冲突
 │    │   ├─ 冲突消失检测 → OnUIThread: PromptToContinueRebase()
 │    │   └─ 文件过滤自动切换
 │    └─ OnUIThread: refreshView(Files) + refreshView(Submodules)
 │
-│  goroutine_D: refreshRemotes()
+│  goroutine_D (remotes):
 │    ├─ Model.Remotes = newRemotes
 │    └─ refreshView(Remotes) + refreshView(RemoteBranches)
 │
-│  ... 其他 scope goroutine 并行
-│
-│  BehindBaseBranch goroutine: （稍后完成）
-│    └─ OnUIThread:
-│        ├─ Branches.HandleRender()  → ↓N 出现或更新
+│  goroutine_E (BehindBaseBranch)  ← 和 goroutine_C、_D 完全并行
+│    ├─ git for-each-ref / errgroup 计算所有分支 BehindBaseBranch
+│    ├─ 每个 branch.BehindBaseBranch.Store(新值)  // atomic
+│    └─ renderFunc() → OnUIThread:
+│        ├─ Branches.HandleRender()  ← 第二次 branches 渲染，↓N 出现
 │        └─ refreshStatus()
 │
-▼  屏幕最终稳定显示新状态
+│  ... 其他 scope goroutine 并行
+│
+▼  屏幕最终稳定（各面板渲染顺序不确定，取决于各 goroutine 完成先后）
 ```
+
+**关键并发关系总结**：
+1. Refresh 内的所有 scope（commits/branches/files/remotes/...）各自独立 goroutine，完全并行
+2. BehindBaseBranch 是 branches scope 内部又启动的**子 goroutine**，和其他 scope 也完全并行
+3. branches scope 本身完成第一次渲染后，BehindBaseBranch 还在跑
+4. BehindBaseBranch 完成后触发第二次 branches 渲染 + 状态栏更新
+5. 第二次 branches 渲染和 files/remotes 等其他面板的渲染**顺序不确定**
 
 ---
 
@@ -1082,15 +1126,16 @@ InlineStatusHelper.stop()
 4. **ASYNC + Then 会 panic**：因为 ASYNC 不参与 wg，`wg.Wait()` 不等任何 scope，Then 无法在所有 scope 完成后执行，代码直接 panic
 5. **状态栏有两个刷新入口**，ASYNC 模式下 Refresh 主流程末尾的 refreshStatus() 大概率因为 branches 还没完成而 early return，真正更新在 refreshBranches() 内部
 6. **MERGE_CONFLICTS scope 和 FILES scope 是并行的**：不保证谁先完成，RefreshMergeState 靠"当前上下文是不是 MergeConflicts"判断要不要干活，不依赖 fileWg
-7. **BehindBaseBranch 独立二次渲染**：在 BranchLoader.Load 内部通过 `onWorker` 异步提交，排在所有 Refresh scope 之后，是独立的 OnWorker task，不受 Refresh wg 控制
-8. **CheckMergeOrRebase 默认用 ASYNC**，冲突检测靠 git 命令返回的错误字符串（第一层），不是靠 Model.Files；Model.Files 上的冲突自动处理是第二层（持续刷新时触发）
-9. **Refresh 时序**：push/pull 成功后的渲染是分多批次出现的
-   - 第一批：commits 面板
-   - 第二批：branches 面板 + 状态栏（显示 ✓，BehindBaseBranch 仍为旧值）
-   - 第三批：files、remotes 等其他面板
-   - 第四批：BehindBaseBranch 计算完 → branches 面板再次渲染（显示 ↓N）
-10. **Demo 模式特殊处理**：InlineStatus stop 时会额外渲染，因为 demo 中 ASYNC 被强制降级为 SYNC
-11. **线程安全**：
+7. **BehindBaseBranch 是 branches scope 内部的子 goroutine**：在 `BranchLoader.Load` 末尾通过 `onWorker` 异步提交，和 refreshBranches 后半段、files/remotes 等其他 scope **完全并行**，不受 Refresh wg 控制，完成后触发第二次 branches 渲染 + 状态栏更新
+8. **各面板渲染顺序不确定**：ASYNC 模式下，branches 第一次渲染、BehindBaseBranch 第二次渲染、files 渲染、remotes 渲染等，谁先出现完全取决于各 git 命令耗时，不是固定顺序
+9. **CheckMergeOrRebase 默认用 ASYNC**，冲突检测靠 git 命令返回的错误字符串（第一层），不是靠 Model.Files；Model.Files 上的冲突自动处理是第二层（持续刷新时触发）
+10. **Refresh 渲染批次不固定**：push/pull 成功后各面板独立完成、独立渲染，没有固定的"第一批/第二批"顺序
+    - branches 面板至少渲染两次（基本信息一次、BehindBaseBranch 一次）
+    - 其他面板（files/remotes/stash/...）各自渲染一次
+    - 先后顺序完全由各 git 命令耗时决定
+11. **Demo 模式特殊处理**：InlineStatus stop 时会额外渲染，因为 demo 中 ASYNC 被强制降级为 SYNC
+12. **线程安全**：
     - `itemOperations` map 有独立 mutex 保护
     - `Model.Branches` / `Model.Files` 等在 Worker 线程写、UI 线程读，靠整体结构替换（非原地修改）保证可见性
-12. **过滤状态丢失**：每次 `ReApplyFilter(context)` 会重新创建过滤列表，如果用户在搜索中刷新，搜索高亮会在 `AfterLayout` 的 `ReApplySearch` 才恢复
+    - `BehindBaseBranch` 用 atomic.Store/Load 保证并发安全
+13. **过滤状态丢失**：每次 `ReApplyFilter(context)` 会重新创建过滤列表，如果用户在搜索中刷新，搜索高亮会在 `AfterLayout` 的 `ReApplySearch` 才恢复
