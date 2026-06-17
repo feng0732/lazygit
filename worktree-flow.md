@@ -421,7 +421,19 @@ status += fmt.Sprintf("%s → %s", repoName, name)
 - Linked worktree（图标开启）：`my-repo(󰌹 feature-x) → feature-x`
 - 图标：`LINKED_WORKTREE_ICON`，worktree 名用青色（FgCyan）显示
 
-图标来源：与 worktree 列表面板的 worktree 图标完全相同——两者都调用 `IconForWorktree(false)` → `LINKED_WORKTREE_ICON`，定义见 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)
+**图标获取路径（Status 栏）**：直接引用常量，未走封装函数 [status.go:L42](pkg/gui/presentation/status.go#L42)
+```go
+icon = icons.LINKED_WORKTREE_ICON + " "
+```
+
+**三处 UI 获取图标的路径对比**（均指向同一个常量 `LINKED_WORKTREE_ICON`，但获取方式不同）：
+| UI 位置 | 获取方式 | 代码位置 | 是否区分 missing |
+|---------|---------|---------|----------------|
+| Status 状态栏 | 直接引用常量 `icons.LINKED_WORKTREE_ICON` | [status.go:L42](pkg/gui/presentation/status.go#L42) | ❌ 不区分 |
+| Worktrees 列表 | 调用封装函数 `icons.IconForWorktree(false/true)` | [worktrees.go:L31-L35](pkg/gui/presentation/worktrees.go#L31-L35) | ✅ 路径缺失时用 `MISSING_LINKED_WORKTREE_ICON` |
+| 文件状态面板 | 调用 `icons.IconForFile(..., isLinkedWorktree=true, ...)` → 内部返回常量 | [file_icons.go:L788-L789](pkg/gui/presentation/icons/file_icons.go#L788-L789) | ❌ 不区分 |
+
+图标常量定义见 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)：
 - Nerd Font v3 模式：`\U000f0339` → `󰌹`
 - 兼容 Nerd Font v2 模式：`\uf838` → ``
 
@@ -488,7 +500,8 @@ customIcons.Filenames → nameIconMap → customIcons.Extensions → extIconMap
 ```
 
 Linked worktree 的图标配置：
-- 与 Status 栏、Worktrees 面板共用同一个 `LINKED_WORKTREE_ICON`（三者均调用 `IconForWorktree(false)`）
+- 与 Status 栏、Worktrees 面板共用同一个常量 `LINKED_WORKTREE_ICON`，但获取路径不同（详见 5.5 节对比表）
+- 文件状态面板：通过 `IconForFile(..., isLinkedWorktree=true, ...)` → 内部直接返回常量 [file_icons.go:L788-L789](pkg/gui/presentation/icons/file_icons.go#L788-L789)
 - Nerd Font v3 模式：`\U000f0339` → `󰌹`；兼容 Nerd Font v2 模式：`\uf838` → ``
 - 颜色：`#4E4E4E`（深灰）
 - 定义在 [git_icons.go:L17-L18](pkg/gui/presentation/icons/git_icons.go#L17-L18)
