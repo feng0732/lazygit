@@ -1,246 +1,30 @@
 # Diff 视图与高亮生成机制
 
-本文档梳理了 lazygit 中 diff 视图的内容获取、行级标记和渲染输出的完整流程。
-
-## 一、内容获取：从 Git 命令到原始 Diff
-
-### 1.1 Diff 命令参数构建
-
-Diff 内容的获取入口在 [diff_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go) 中的 `DiffArgs()` 函数。
-
-**核心代码**（[diff_helper.go:26-48](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go#L26-L48)）：
-
-```go
-func (self *DiffHelper) DiffArgs() []string {
-    output := []string{"--stat", "-p", self.c.Modes().Diffing.Ref}
-    
-    right := self.currentDiffTerminal()
-    if right != "" {
-        output = append(output, right)
-    }
-    
-    if self.c.Modes().Diffing.Reverse {
-        output = append(output, "-R")
-    }
-    
-    output = append(output, "--")
-    
-    file := self.currentlySelectedFilename()
-    if file != "" {
-        output = append(output, file)
-    } else if self.c.Modes().Filtering.Active() {
-        output = append(output, self.c.Modes().Filtering.GetPath())
-    }
-    
-    return output
-}
-```
-
-**参数构成**：
-- `--stat`：显示变更统计
-- `-p`：生成 patch 格式
-- `Ref`：diff 基准引用（来自 diffing 模式状态）
-- 可选的右侧引用、反向标志 `-R`
-- 文件名或过滤路径
-
-### 1.2 Git 命令对象构建
-
-在 [diff.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/diff.go) 中构建完整的 git diff 命令。
-
-**核心代码**（[diff.go:21-40](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/diff.go#L21-L40)）：
-
-```go
-func (self *DiffCommands) DiffCmdObj(diffArgs []string) *oscommands.CmdObj {
-    extDiffCmd := self.pagerConfig.GetExternalDiffCommand()
-    useExtDiff := extDiffCmd != ""
-    useExtDiffGitConfig := self.pagerConfig.GetUseExternalDiffGitConfig()
-    ignoreWhitespace := self.UserConfig().Git.IgnoreWhitespaceInDiffView
-    
-    return self.cmd.New(
-        NewGitCmd("diff").
-            Config("diff.noprefix=false").
-            ConfigIf(useExtDiff, "diff.external="+extDiffCmd).
-            ArgIfElse(useExtDiff || useExtDiffGitConfig, "--ext-diff", "--no-ext-diff").
-            Arg("--submodule").
-            Arg(fmt.Sprintf("--color=%s", self.pagerConfig.GetColorArg())).
-            ArgIf(ignoreWhitespace, "--ignore-all-space").
-            Arg(fmt.Sprintf("--unified=%d", self.UserConfig().Git.DiffContextSize)).
-            Arg(diffArgs...).
-            Dir(self.repoPaths.worktreePath).
-            ToArgv(),
-    )
-}
-```
-
-**关键配置**：
-- `--color=always`：让 git 输出带 ANSI 颜色代码的 diff
-- `--unified=N`：上下文行数配置
-- `--ignore-all-space`：忽略空白字符（可选）
-- 支持外部 diff 工具
-
-### 1.3 Diff 模式状态管理
-
-Diff 模式状态在 [diffing.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/modes/diffing/diffing.go) 中维护：
-
-```go
-type Diffing struct {
-    Ref     string  // diff 基准引用
-    Reverse bool    // 是否反向 diff
-}
-
-func (self *Diffing) Active() bool {
-    return self.Ref != ""
-}
-```
+本文档梳理了 lazygit 中 diff 视图的**三条路径**的内容获取、行级标记和渲染输出的完整流程。
 
 ---
 
-## 二、行级标记：Diff 解析与结构化
+## 一、三条路径概览
 
-### 2.1 Patch 解析器
+Lazygit 存在三种不同的 diff 渲染场景，对应三条完全不同的代码路径：
 
-原始 diff 文本通过 [parse.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go) 中的 `Parse()` 函数进行结构化解析。
-
-**核心代码**（[parse.go:12-42](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go#L12-L42)）：
-
-```go
-func Parse(patchStr string) *Patch {
-    lines := strings.Split(strings.TrimSuffix(patchStr, "\n"), "\n")
-    
-    hunks := []*Hunk{}
-    patchHeader := []string{}
-    
-    var currentHunk *Hunk
-    for _, line := range lines {
-        if strings.HasPrefix(line, "@@") {
-            oldStart, newStart, headerContext := headerInfo(line)
-            
-            currentHunk = &Hunk{
-                oldStart:      oldStart,
-                newStart:      newStart,
-                headerContext: headerContext,
-                bodyLines:     []*PatchLine{},
-            }
-            hunks = append(hunks, currentHunk)
-        } else if currentHunk != nil {
-            currentHunk.bodyLines = append(currentHunk.bodyLines, newHunkLine(line))
-        } else {
-            patchHeader = append(patchHeader, line)
-        }
-    }
-    
-    return &Patch{
-        hunks:  hunks,
-        header: patchHeader,
-    }
-}
-```
-
-**解析流程**：
-1. 按行分割 diff 文本
-2. 识别 `@@` 开头的 hunk 头行
-3. 用正则表达式提取 `@@ -oldStart +newStart @@ context` 信息
-4. 对 hunk 内的每一行进行类型标记
-
-### 2.2 行类型标记
-
-每一行通过首字符判断类型（[parse.go:54-85](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go#L54-L85)）：
-
-```go
-func newHunkLine(line string) *PatchLine {
-    if line == "" {
-        return &PatchLine{
-            Kind:    CONTEXT,
-            Content: "",
-        }
-    }
-    
-    firstChar := line[:1]
-    kind := parseFirstChar(firstChar)
-    
-    return &PatchLine{
-        Kind:    kind,
-        Content: line,
-    }
-}
-
-func parseFirstChar(firstChar string) PatchLineKind {
-    switch firstChar {
-    case " ":
-        return CONTEXT     // 上下文行
-    case "+":
-        return ADDITION    // 新增行
-    case "-":
-        return DELETION    // 删除行
-    case "\\":
-        return NEWLINE_MESSAGE // 换行符信息
-    }
-    return CONTEXT
-}
-```
-
-### 2.3 数据结构定义
-
-**PatchLineKind 枚举**（[patch_line.go:7-14](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch_line.go#L7-L14)）：
-
-```go
-type PatchLineKind int
-
-const (
-    PATCH_HEADER PatchLineKind = iota  // Patch 头
-    HUNK_HEADER                        // Hunk 头
-    ADDITION                           // 新增行
-    DELETION                           // 删除行
-    CONTEXT                            // 上下文行
-    NEWLINE_MESSAGE                    // 换行消息
-)
-```
-
-**Patch 结构体**（[patch.go:7-16](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch.go#L7-L16)）：
-
-```go
-type Patch struct {
-    header []string  // patch 头部信息
-    hunks  []*Hunk   // hunk 列表
-}
-```
-
-**Hunk 结构体**（[hunk.go:12-21](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/hunk.go#L12-L21)）：
-
-```go
-type Hunk struct {
-    oldStart      int           // 旧文件起始行号
-    newStart      int           // 新文件起始行号
-    headerContext string        // hunk 头上下文
-    bodyLines     []*PatchLine  // hunk 内容行
-}
-```
-
-### 2.4 Hunk 头正则解析
-
-使用正则表达式解析 hunk 头（[parse.go:10](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go#L10-L10)）：
-
-```go
-var hunkHeaderRegexp = regexp.MustCompile(`(?m)^@@ -(\d+)[^\+]+\+(\d+)[^@]+@@(.*)$`)
-```
-
-**匹配示例**：
-- 输入：`@@ -16,2 +14,3 @@ func (f *CommitFile) Description() string {`
-- 分组1：`16`（旧文件起始行）
-- 分组2：`14`（新文件起始行）
-- 分组3：` func (f *CommitFile) Description() string {`（上下文）
+| 路径 | 使用场景 | 入口函数 | Git 命令 | 行级交互 |
+|------|---------|---------|---------|---------|
+| **路径 A：普通查看** | 分支/commit diff、文件列表选中查看 | `RenderDiff()` / `WorktreeFileDiffCmdObj` | `git diff --color=always` | 不支持（仅浏览） |
+| **路径 B：Staging** | 工作区暂存/取消暂存行 | `RefreshStagingPanel()` | `git diff --cached/--no-index --color=never`（plain=true） | 支持 |
+| **路径 C：Patch Building** | 从 commit 中选择性提取行构建 patch | `RefreshPatchBuildingPanel()` | `git diff from to --color=never`（plain=true） | 支持 |
 
 ---
 
-## 三、渲染输出：从结构化数据到高亮视图
+## 二、路径 A：普通查看（PTY 直接渲染）
 
-Lazygit 有两种 diff 渲染路径：
+### 2.1 Diff 文本来源
 
-### 路径 A：PTY 直接渲染（主视图 Diff 模式）
+适用于以下场景：
+- 在分支/提交上按 `d` 进入 diff 模式
+- 文件列表中选中文件后右侧预览
 
-适用于普通 diff 查看，直接利用 git 的彩色输出。
-
-**流程**（[diff_helper.go:101-119](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go#L101-L119)）：
+**入口 1：Diff 模式**（[diff_helper.go:101-119](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go#L101-L119)）：
 
 ```go
 func (self *DiffHelper) RenderDiff() {
@@ -264,171 +48,610 @@ func (self *DiffHelper) RenderDiff() {
 }
 ```
 
-**PTY 任务执行**（[main_panels.go:8-27](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/main_panels.go#L8-L27)）：
+**入口 2：文件列表预览**（[files_controller.go:322](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/files_controller.go#L322-L322)）：
 
 ```go
-func (gui *Gui) runTaskForView(view *gocui.View, task types.UpdateTask) error {
-    switch v := task.(type) {
-    case *types.RunPtyTask:
-        return gui.newPtyTask(view, v.Cmd, v.Prefix)
-    // ... 其他任务类型
-    }
-    return nil
+cmdObj := self.c.Git().WorkingTree.WorktreeFileDiffCmdObj(node, false, mainShowsStaged, pathOverrides)
+```
+
+### 2.2 Git 命令构建
+
+**Diff 模式命令**（[diff.go:21-40](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/diff.go#L21-L40)）：
+
+```go
+func (self *DiffCommands) DiffCmdObj(diffArgs []string) *oscommands.CmdObj {
+    extDiffCmd := self.pagerConfig.GetExternalDiffCommand()
+    // ...
+    return self.cmd.New(
+        NewGitCmd("diff").
+            Config("diff.noprefix=false").
+            Arg("--submodule").
+            Arg(fmt.Sprintf("--color=%s", self.pagerConfig.GetColorArg())). // 关键：输出 ANSI 颜色
+            Arg(fmt.Sprintf("--unified=%d", self.UserConfig().Git.DiffContextSize)).
+            Arg(diffArgs...).
+            Dir(self.repoPaths.worktreePath).
+            ToArgv(),
+    )
 }
 ```
 
-**特点**：
-- git 命令通过 PTY 执行，直接输出带 ANSI 颜色的文本
-- gocui 的 View 有 `escapeInterpreter` 解析 ANSI 转义序列
-- 颜色由 git 本身控制
+**文件列表命令**（[working_tree.go:395-431](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/working_tree.go#L395-L431)）：
 
-### 路径 B：Patch 格式化渲染（Staging / Patch Building 视图）
+```go
+func (self *WorkingTreeCommands) WorktreeFileDiffCmdObj(node models.IFile, plain bool, cached bool, ...) *oscommands.CmdObj {
+    colorArg := self.pagerConfig.GetColorArg()
+    if plain {
+        colorArg = "never"  // plain=true 时关闭颜色
+    }
+    // ...
+    cmdArgs := NewGitCmd("diff").
+        Arg(fmt.Sprintf("--color=%s", colorArg)). // plain=false → 输出颜色
+        ArgIf(cached, "--cached").
+        ArgIf(noIndex, "--no-index").             // 未追踪文件使用 /dev/null 对比
+        // ...
+}
+```
 
-适用于需要交互式选择行的场景（staging、patch building），需要自定义高亮和选中状态。
+### 2.3 行级标记与高亮
 
-#### 3.1 状态初始化与 Patch 解析
+**路径 A 不做行级标记**，它依赖 git 本身输出的 ANSI 颜色代码。渲染流程：
 
-在 [state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go) 中初始化 patch explorer 状态：
+1. `RunPtyTask` 启动 PTY 子进程执行 git diff
+2. git 进程输出带 ANSI 转义序列的文本（如 `\x1b[32m+新增行\x1b[0m`）
+3. gocui 的 `View` 通过 `escapeInterpreter` 解析 ANSI 序列并渲染颜色
+4. 光标选中行由 gocui View 层处理（[view.go:567-588](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gocui/view.go#L567-L588)）：
+
+```go
+if v.Highlight {
+    rangeSelectStart := v.cy
+    rangeSelectEnd := v.cy
+    if v.rangeSelectStartY != -1 {
+        relativeRangeSelectStart := v.rangeSelectStartY - v.oy
+        rangeSelectStart = min(relativeRangeSelectStart, v.cy)
+        rangeSelectEnd = max(relativeRangeSelectStart, v.cy)
+    }
+
+    if y >= rangeSelectStart && y <= rangeSelectEnd {
+        // 选中行：前景色加亮 + 粗体 + 选中背景色
+        fgColorComponent := fgColor & ^AttrAll
+        if fgColorComponent >= AttrIsValidColor && fgColorComponent < AttrIsValidColor+8 {
+            fgColor += 8  // 颜色加亮（如红→亮红）
+        }
+        fgColor = fgColor | AttrBold
+        bgColor = (bgColor & AttrStyleBits) | v.SelBgColor
+    }
+}
+```
+
+**高亮特点**：
+- 颜色由 git 控制（绿色新增、红色删除等）
+- 选中行由 gocui 视图层处理：前景色加亮 + 粗体 + 背景色
+- 无法实现首字符特殊高亮（因为不解析行内容）
+
+---
+
+## 三、路径 B：Staging（暂存区交互）
+
+### 3.1 Diff 文本来源
+
+在文件面板按 `Enter` 进入 staging 视图，左侧显示未暂存变更，右侧显示已暂存变更。
+
+**入口**（[staging_helper.go:22-115](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/staging_helper.go#L22-L115)）：
+
+```go
+func (self *StagingHelper) RefreshStagingPanel(focusOpts types.OnFocusOpts) {
+    // ...
+    var file *models.File
+    node := self.c.Contexts().Files.GetSelected()
+    if node != nil {
+        file = node.File
+    }
+    
+    // 获取未暂存 diff（左侧主视图）
+    mainDiff := self.c.Git().WorkingTree.WorktreeFileDiff(file, true, false)  // plain=true, cached=false
+    // 获取已暂存 diff（右侧副视图）
+    secondaryDiff := self.c.Git().WorkingTree.WorktreeFileDiff(file, true, true) // plain=true, cached=true
+    
+    // 初始化状态
+    mainContext.SetState(
+        patch_exploring.NewState(mainDiff, mainSelectedLineIdx, mainContext.GetView(), ...),
+    )
+    secondaryContext.SetState(
+        patch_exploring.NewState(secondaryDiff, secondarySelectedLineIdx, ...),
+    )
+    
+    // 获取渲染内容（带高亮）
+    mainContent := mainContext.GetContentToRender()
+    secondaryContent := secondaryContext.GetContentToRender()
+    
+    self.c.RenderToMainViews(types.RefreshMainOpts{
+        Pair: self.c.MainViewPairs().Staging,
+        Main: &types.ViewUpdateOpts{
+            Task:  types.NewRenderStringWithoutScrollTask(mainContent),
+            Title: self.c.Tr.UnstagedChanges,
+        },
+        Secondary: &types.ViewUpdateOpts{
+            Task:  types.NewRenderStringWithoutScrollTask(secondaryContent),
+            Title: self.c.Tr.StagedChanges,
+        },
+    })
+}
+```
+
+### 3.2 Git 命令详解
+
+Staging 使用 `WorktreeFileDiff(file, plain=true, cached)`，**强制 plain=true（无颜色）**，因为需要自己解析并重新染色。
+
+**核心命令**（[working_tree.go:395-431](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/working_tree.go#L395-L431)）：
+
+```go
+func (self *WorkingTreeCommands) WorktreeFileDiffCmdObj(node models.IFile, plain bool, cached bool, pathOverrides []string) *oscommands.CmdObj {
+    colorArg := "never"  // plain=true → 不输出 ANSI 颜色
+    contextSize := self.UserConfig().Git.DiffContextSize
+    
+    noIndex := !node.GetIsTracked() && !node.GetHasStagedChanges() && !cached && node.GetIsFile()
+    
+    cmdArgs := NewGitCmd("diff").
+        Arg("--submodule").
+        Arg(fmt.Sprintf("--unified=%d", contextSize)).
+        Arg("--color=never").                           // 纯文本，无 ANSI 颜色
+        Arg(fmt.Sprintf("--find-renames=%d%%", ...)).
+        ArgIf(cached, "--cached").                       // 已暂存：对比 HEAD 与 index
+        ArgIf(noIndex, "--no-index").                    // 未追踪：对比 /dev/null 与工作区
+        Arg("--").
+        ArgIf(noIndex, "/dev/null").
+        Arg(paths...).
+        // ...
+}
+```
+
+**三种 diff 对比方式**：
+1. **工作区 vs Index（未暂存）**：`git diff` （无参数）
+2. **Index vs HEAD（已暂存）**：`git diff --cached`
+3. **未追踪文件**：`git diff --no-index /dev/null <file>`
+
+### 3.3 Staging 的上下文初始化
+
+Staging 视图使用 `PatchExplorerContext`，在 [setup.go:44-57](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/setup.go#L44-L57) 中注册：
+
+```go
+Staging: NewPatchExplorerContext(
+    c.Views().Staging,
+    "main",
+    STAGING_MAIN_CONTEXT_KEY,
+    func() []int { return nil },  // Staging 没有"已包含行"概念，始终返回 nil
+    c,
+),
+StagingSecondary: NewPatchExplorerContext(
+    c.Views().StagingSecondary,
+    "secondary",
+    STAGING_SECONDARY_CONTEXT_KEY,
+    func() []int { return nil },
+    c,
+),
+```
+
+**Staging 中 `GetIncludedLineIndices()` 返回 nil**，因为 Staging 的高亮不区分"已包含/未包含"——它只有光标选中高亮。
+
+### 3.4 行级标记（Patch 解析）
+
+Staging 获取到 plain diff 文本后，通过 `patch_exploring.NewState()` 进行解析：
 
 ```go
 func NewState(diff string, selectedLineIdx int, view *gocui.View, oldState *State, useHunkModeByDefault bool) *State {
-    // ...
-    patch := patch.Parse(diff)  // 解析 diff
-    
+    patch := patch.Parse(diff)  // 结构化解析
     if !patch.ContainsChanges() {
         return nil
     }
     
-    // 计算行换行映射
+    // 计算换行映射（处理视图宽度不足时的自动换行）
     viewLineIndices, patchLineIndices := wrapPatchLines(diff, view)
     // ...
 }
 ```
 
-**State 结构体**（[state.go:16-37](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go#L16-L37)）：
+`Parse()` 解析过程同路径 C，详见 4.4 节。
+
+### 3.5 Staging 的交互式高亮
+
+**两层高亮叠加**：
+
+**第一层：内容颜色（Patch 格式化层）**
+
+由 `formatView()` 生成，通过 `patch.FormatView()` 输出带 ANSI 颜色的文本：
 
 ```go
-type State struct {
-    selectedLineIdx   int          // 当前选中行（视图行索引）
-    rangeStartLineIdx int          // 范围选择起始行
-    rangeIsSticky     bool         // 是否粘性选择
-    diff              string       // 原始 diff
-    patch             *patch.Patch // 解析后的 patch
-    selectMode        selectMode   // 选择模式：LINE/RANGE/HUNK
-    
-    viewLineIndices   []int  // patch 行索引 -> 视图行索引
-    patchLineIndices  []int  // 视图行索引 -> patch 行索引
+func (s *State) RenderForLineIndices(includedLineIndices []int) string {
+    includedLineIndicesSet := set.NewFromSlice(includedLineIndices)
+    return s.patch.FormatView(patch.FormatViewOpts{
+        IncLineIndices: includedLineIndicesSet,  // Staging 传入 nil/空集合
+    })
 }
 ```
 
-#### 3.2 颜色样式系统
+Staging 传入空集合，所以没有"已包含"高亮（无绿色背景），但仍然有：
+- 新增行：绿色前景（`style.FgGreen`）
+- 删除行：红色前景（`style.FgRed`）
+- Hunk 头：青色前景（`style.FgCyan`）
 
-样式定义在 [text_style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/style/text_style.go)，使用 `gookit/color` 库生成 ANSI 颜色代码。
+**第二层：选中范围高亮（gocui View 层）**
 
-**TextStyle 结构**：
+通过 `FocusSelection()` 配置视图的选中范围（[patch_explorer_context.go:96-115](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/patch_explorer_context.go#L96-L115)）：
 
 ```go
-type TextStyle struct {
-    fg         *Color      // 前景色
-    bg         *Color      // 背景色
-    decoration Decoration  // 装饰（粗体、下划线等）
-    Style      Sprinter    // 实际渲染器
+func (self *PatchExplorerContext) FocusSelection() {
+    view := self.GetView()
+    state := self.GetState()
+    
+    newOriginY := state.CalculateOrigin(origin, bufferHeight, numLines)
+    view.SetOriginY(newOriginY)
+    
+    startIdx, endIdx := state.SelectedViewRange()
+    // 设置范围选择起始行（相对于整个内容，不是相对于可视区域）
+    view.SetRangeSelectStart(startIdx)
+    // 设置光标位置（相对于可视区域）
+    view.SetCursorY(endIdx - newOriginY)
 }
 ```
 
-**预定义样式**（[basic_styles.go]）：
-- `style.FgGreen`：新增行
-- `style.FgRed`：删除行
-- `style.FgCyan`：hunk 头
-- `style.BgGreen`：选中行背景
-
-#### 3.3 Patch 格式化渲染
-
-核心渲染函数在 [format.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go) 中。
-
-**入口函数**（[format.go:48-59](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go#L48-L59)）：
+`SelectedViewRange()` 根据选择模式返回不同范围（[state.go:353-368](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go#L353-L368)）：
 
 ```go
-func formatView(patch *Patch, opts FormatViewOpts) string {
-    includedLineIndices := opts.IncLineIndices
-    if includedLineIndices == nil {
-        includedLineIndices = set.New[int]()
+func (s *State) SelectedViewRange() (int, int) {
+    switch s.selectMode {
+    case HUNK:
+        return s.selectionRangeForCurrentBlockOfChanges()  // 当前连续变更块
+    case RANGE:
+        if s.rangeStartLineIdx > s.selectedLineIdx {
+            return s.selectedLineIdx, s.rangeStartLineIdx
+        }
+        return s.rangeStartLineIdx, s.selectedLineIdx       // 用户选择的范围
+    case LINE:
+        return s.selectedLineIdx, s.selectedLineIdx         // 单行
     }
-    presenter := &patchPresenter{
-        patch:          patch,
-        plain:          false,
-        incLineIndices: includedLineIndices,
-    }
-    return presenter.format()
 }
 ```
 
-**主格式化循环**（[format.go:61-109](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go#L61-L109)）：
+gocui View 层在渲染每个字符时判断是否在选中范围内（[view.go:567-588](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gocui/view.go#L567-L588)），在范围内则叠加：
+- 前景色加亮 +8（如红→亮红）
+- 粗体
+- 选中背景色
+
+### 3.6 Staging 选择的应用
+
+用户按 `Space` 暂存选中范围时，从 State 中提取选中的 patch 行并应用：
 
 ```go
-func (self *patchPresenter) format() string {
-    stringBuilder := &strings.Builder{}
-    lineIdx := 0
+func (self *StagingController) applySelection(reverse bool) error {
+    state := self.context.GetState()
+    firstLineIdx, lastLineIdx := state.SelectedPatchRange()
     
-    // 渲染 patch 头
-    for _, line := range self.patch.header {
-        appendLine(self.formatLineAux(line, theme.DefaultTextColor.SetBold(), false))
+    patchToApply := patch.
+        Parse(state.GetDiff()).
+        Transform(patch.TransformOpts{
+            Reverse:             reverse,
+            IncludedLineIndices: patch.ExpandRange(firstLineIdx, lastLineIdx),
+            FileNameOverride:    path,
+        }).
+        FormatPlain()
+    
+    err := self.c.Git().Patch.ApplyPatch(patchToApply, ...)
+}
+```
+
+---
+
+## 四、路径 C：Patch Building（自定义 Patch 构建）
+
+### 4.1 Diff 文本来源
+
+在 Commit Files 面板按 `Enter` 进入 patch building 视图，左侧显示 commit diff，右侧显示已选中的自定义 patch。
+
+**启动 PatchBuilder**（[commits_files_controller.go:508-516](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/commits_files_controller.go#L508-L516)）：
+
+```go
+func (self *CommitFilesController) startPatchBuilder() error {
+    commitFilesContext := self.context()
+    canRebase := commitFilesContext.GetCanRebase()
+    from, to, reverse := self.currentFromToReverseForPatchBuilding()
+    
+    // 初始化 PatchBuilder，记录 from/to/reverse
+    self.c.Git().Patch.PatchBuilder.Start(from, to, reverse, canRebase)
+    return nil
+}
+```
+
+**from/to 来源**（[commit_files_context.go:82-88](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/commit_files_context.go#L82-L88)）：
+
+```go
+func (self *CommitFilesContext) GetFromAndToForDiff() (string, string) {
+    if refs := self.GetRefRange(); refs != nil {
+        return refs.From.ParentRefName(), refs.To.RefName()  // 范围：A^..B
+    }
+    ref := self.GetRef()
+    return ref.ParentRefName(), ref.RefName()                // 单 commit：A^..A
+}
+```
+
+**面板刷新入口**（[patch_building_helper.go:57-114](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/patch_building_helper.go#L57-L114)）：
+
+```go
+func (self *PatchBuildingHelper) RefreshPatchBuildingPanel(opts types.OnFocusOpts) {
+    path := self.c.Contexts().CommitFiles.GetSelectedPath()
+    
+    from, to := self.c.Contexts().CommitFiles.GetFromAndToForDiff()
+    from, reverse := self.c.Modes().Diffing.GetFromAndReverseArgsForDiff(from)
+    
+    // 左侧：完整 commit diff（plain=true，无颜色）
+    diff, err := self.c.Git().WorkingTree.ShowFileDiff(from, to, reverse, path, true)
+    
+    // 右侧：已选中的自定义 patch（渲染时自带颜色）
+    secondaryDiff := self.c.Git().Patch.PatchBuilder.RenderPatchForFile(patch.RenderPatchForFileOpts{
+        Filename:                               path,
+        Plain:                                  false,
+        Reverse:                                false,
+        TurnAddedFilesIntoDiffAgainstEmptyFile: true,
+    })
+    
+    context := self.c.Contexts().CustomPatchBuilder
+    state := patch_exploring.NewState(diff, selectedLineIdx, context.GetView(), oldState, ...)
+    context.SetState(state)
+    
+    // 左侧：完整 diff（带光标选中高亮）
+    mainContent := context.GetContentToRender()
+    
+    self.c.RenderToMainViews(types.RefreshMainOpts{
+        Pair: self.c.MainViewPairs().PatchBuilding,
+        Main: &types.ViewUpdateOpts{
+            Task:  types.NewRenderStringWithoutScrollTask(mainContent),
+            Title: self.c.Tr.Patch,
+        },
+        Secondary: &types.ViewUpdateOpts{
+            Task:  types.NewRenderStringWithoutScrollTask(secondaryDiff),
+            Title: self.c.Tr.CustomPatch,
+        },
+    })
+}
+```
+
+### 4.2 Git 命令详解
+
+Patch Building 使用 `ShowFileDiff(from, to, reverse, fileName, plain=true)`：
+
+**核心命令**（[working_tree.go:439-469](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/working_tree.go#L439-L469)）：
+
+```go
+func (self *WorkingTreeCommands) ShowFileDiffCmdObj(from string, to string, reverse bool, fileNames []string, plain bool) *oscommands.CmdObj {
+    colorArg := "never"  // plain=true → 不输出 ANSI 颜色
+    
+    cmdArgs := NewGitCmd("diff").
+        Config("diff.noprefix=false").
+        Arg("--submodule").
+        Arg(fmt.Sprintf("--unified=%d", contextSize)).
+        Arg("--no-renames").
+        Arg("--color=never").  // 纯文本
+        Arg(from).             // 起始引用（如 commit^）
+        Arg(to).               // 结束引用（如 commit）
+        ArgIf(reverse, "-R").  // 是否反向
+        Arg("--").
+        Arg(fileNames...).
+        // ...
+}
+```
+
+**典型命令**：`git diff --no-renames --color=never abc123^ abc123 -- path/to/file.go`
+
+### 4.3 PatchBuilder 状态管理
+
+PatchBuilder 维护每个文件的选中状态（[patch_builder.go:24-51](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch_builder.go#L24-L51)）：
+
+```go
+type fileInfo struct {
+    mode                PatchStatus   // UNSELECTED / WHOLE / PART
+    includedLineIndices []int         // 选中的 patch 行索引
+    diff                string        // 该文件的完整 diff（缓存）
+}
+
+type PatchBuilder struct {
+    To         string
+    From       string
+    reverse    bool
+    CanRebase  bool
+    fileInfoMap map[string]*fileInfo   // 文件名 → 文件信息
+    loadFileDiff loadFileDiffFunc      // 加载 diff 的回调
+}
+```
+
+**首次访问文件时懒加载 diff**（[patch_builder.go:127-145](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch_builder.go#L127-L145)）：
+
+```go
+func (p *PatchBuilder) getFileInfo(filename string) (*fileInfo, error) {
+    info, ok := p.fileInfoMap[filename]
+    if ok {
+        return info, nil  // 已有缓存
     }
     
-    // 渲染每个 hunk
-    for _, hunk := range self.patch.hunks {
-        // 渲染 hunk 头（青色）
-        appendLine(
-            self.formatLineAux(hunk.formatHeaderStart(), style.FgCyan, false) +
-            self.formatLineAux(hunk.headerContext, theme.DefaultTextColor, false),
-        )
-        
-        // 渲染 hunk 内容行
-        for _, line := range hunk.bodyLines {
-            style := self.patchLineStyle(line)
-            if line.IsChange() {
-                appendLine(self.formatLine(line.Content, style, lineIdx))
-            } else {
-                appendLine(self.formatLineAux(line.Content, style, false))
+    // 首次访问：调用 git diff 获取该文件完整 diff
+    diff, err := p.loadFileDiff(p.From, p.To, p.reverse, filename, true)
+    info = &fileInfo{
+        mode: UNSELECTED,
+        diff: diff,
+    }
+    p.fileInfoMap[filename] = info
+    return info, nil
+}
+```
+
+### 4.4 行级标记（Patch 解析）
+
+Patch Building 同样使用 `patch.Parse()` 进行结构化解析。
+
+**解析流程**（[parse.go:12-42](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go#L12-L42)）：
+
+```go
+func Parse(patchStr string) *Patch {
+    lines := strings.Split(strings.TrimSuffix(patchStr, "\n"), "\n")
+    
+    hunks := []*Hunk{}
+    patchHeader := []string{}
+    
+    var currentHunk *Hunk
+    for _, line := range lines {
+        if strings.HasPrefix(line, "@@") {
+            // 正则提取 hunk 头信息：@@ -oldStart,oldCount +newStart,newCount @@ context
+            oldStart, newStart, headerContext := headerInfo(line)
+            currentHunk = &Hunk{
+                oldStart:      oldStart,
+                newStart:      newStart,
+                headerContext: headerContext,
+                bodyLines:     []*PatchLine{},
             }
+            hunks = append(hunks, currentHunk)
+        } else if currentHunk != nil {
+            // 按首字符标记行类型
+            currentHunk.bodyLines = append(currentHunk.bodyLines, newHunkLine(line))
+        } else {
+            patchHeader = append(patchHeader, line)
         }
     }
     
-    return stringBuilder.String()
-}
-```
-
-**行样式映射**（[format.go:111-120](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go#L111-L120)）：
-
-```go
-func (self *patchPresenter) patchLineStyle(patchLine *PatchLine) style.TextStyle {
-    switch patchLine.Kind {
-    case ADDITION:
-        return style.FgGreen   // 新增行：绿色
-    case DELETION:
-        return style.FgRed     // 删除行：红色
-    default:
-        return theme.DefaultTextColor  // 上下文：默认色
+    return &Patch{
+        hunks:  hunks,
+        header: patchHeader,
     }
 }
 ```
 
-**行级高亮实现**（[format.go:122-146](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go#L122-L146)）：
+**行类型判别**（[parse.go:72-85](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go#L72-L85)）：
 
 ```go
-func (self *patchPresenter) formatLine(str string, textStyle style.TextStyle, index int) string {
-    included := self.incLineIndices.Includes(index)
-    return self.formatLineAux(str, textStyle, included)
+func parseFirstChar(firstChar string) PatchLineKind {
+    switch firstChar {
+    case " ":
+        return CONTEXT          // 空格开头 → 上下文行
+    case "+":
+        return ADDITION         // + 开头 → 新增行
+    case "-":
+        return DELETION         // - 开头 → 删除行
+    case "\\":
+        return NEWLINE_MESSAGE  // \ 开头 → 换行消息（如 "\ No newline at end of file"）
+    }
+    return CONTEXT
 }
+```
 
-func (self *patchPresenter) formatLineAux(str string, textStyle style.TextStyle, included bool) string {
-    if self.plain {
-        return str
+**数据结构**：
+
+```go
+type PatchLineKind int
+const (
+    PATCH_HEADER PatchLineKind = iota  // 0: diff --git ... 等头部
+    HUNK_HEADER                        // 1: @@ -x,y +a,b @@ ...
+    ADDITION                           // 2: + 新增行
+    DELETION                           // 3: - 删除行
+    CONTEXT                            // 4: 空格 上下文
+    NEWLINE_MESSAGE                    // 5: \ No newline...
+)
+```
+
+### 4.5 Patch Building 的上下文初始化
+
+Patch Building 视图也使用 `PatchExplorerContext`，但 `getIncludedLineIndices` 不为空（[setup.go:58-73](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/setup.go#L58-L73)）：
+
+```go
+CustomPatchBuilder: NewPatchExplorerContext(
+    c.Views().PatchBuilding,
+    "main",
+    PATCH_BUILDING_MAIN_CONTEXT_KEY,
+    func() []int {
+        // 从 PatchBuilder 获取当前文件已选中的行索引
+        filename := commitFilesContext.GetSelectedPath()
+        includedLineIndices, err := c.Git().Patch.PatchBuilder.GetFileIncLineIndices(filename)
+        if err != nil {
+            c.Log.Error(err)
+            return nil
+        }
+        return includedLineIndices
+    },
+    c,
+),
+```
+
+### 4.6 行选择交互
+
+用户按 `Space` 切换选中状态（[patch_building_controller.go:137-179](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/patch_building_controller.go#L137-L179)）：
+
+```go
+func (self *PatchBuildingController) toggleSelection() error {
+    filename := self.c.Contexts().CommitFiles.GetSelectedPath()
+    state := self.context().GetState()
+    
+    // 获取选中范围内的新增/删除行（排除上下文行）
+    lineIndicesToToggle := state.LineIndicesOfAddedOrDeletedLinesInSelectedPatchRange()
+    
+    // 查询当前文件已包含的行
+    includedLineIndices, err := self.c.Git().Patch.PatchBuilder.GetFileIncLineIndices(filename)
+    
+    // 判断是添加还是移除：根据第一条选中行是否已包含
+    firstSelectedChangeLineIsStaged := lo.Contains(includedLineIndices, lineIndicesToToggle[0])
+    
+    toggleFunc := self.c.Git().Patch.PatchBuilder.AddFileLineRange
+    if firstSelectedChangeLineIsStaged {
+        toggleFunc = self.c.Git().Patch.PatchBuilder.RemoveFileLineRange
     }
     
+    toggleFunc(filename, lineIndicesToToggle)
+    
+    // 跳到下一个同状态的可选择行
+    state.SelectNextStageableLineOfSameIncludedState(
+        self.context().GetIncludedLineIndices(), 
+        firstSelectedChangeLineIsStaged,
+    )
+    return nil
+}
+```
+
+**PatchBuilder 的行索引管理**（[patch_builder.go:147-170](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch_builder.go#L147-L170)）：
+
+```go
+func (p *PatchBuilder) AddFileLineRange(filename string, lineIndices []int) error {
+    info, err := p.getFileInfo(filename)
+    info.mode = PART
+    info.includedLineIndices = lo.Union(info.includedLineIndices, lineIndices)  // 并集
+    return nil
+}
+
+func (p *PatchBuilder) RemoveFileLineRange(filename string, lineIndices []int) error {
+    info, err := p.getFileInfo(filename)
+    info.mode = PART
+    info.includedLineIndices, _ = lo.Difference(info.includedLineIndices, lineIndices)  // 差集
+    if len(info.includedLineIndices) == 0 {
+        p.removeFile(info)
+    }
+    return nil
+}
+```
+
+### 4.7 Patch Building 的三层高亮
+
+Patch Building 有**三层高亮叠加**：
+
+**第一层：内容颜色（format.go）**
+
+- 新增行：`style.FgGreen` 绿色前景
+- 删除行：`style.FgRed` 红色前景
+- Hunk 头：`style.FgCyan` 青色前景
+- Patch 头：粗体默认色
+
+**第二层：已包含行标记（format.go → 首字符绿底）**
+
+由 `incLineIndices` 控制，已包含的变更行首字符叠加绿色背景：
+
+```go
+func (self *patchPresenter) formatLineAux(str string, textStyle style.TextStyle, included bool) string {
     firstCharStyle := textStyle
     if included {
-        // 选中行首字符添加绿色背景
+        // MergeStyle 合并前景色（如绿色）与背景色（BgGreen）
         firstCharStyle = firstCharStyle.MergeStyle(style.BgGreen)
     }
     
@@ -436,163 +659,181 @@ func (self *patchPresenter) formatLineAux(str string, textStyle style.TextStyle,
         return firstCharStyle.Sprint(str)
     }
     
-    // 首字符特殊样式，其余字符普通样式
+    // 首字符：前景色 + 可选绿底
+    // 其余字符：仅前景色
     return firstCharStyle.Sprint(str[:1]) + textStyle.Sprint(str[1:])
 }
 ```
 
-**高亮效果**：
-- 未选中的新增行：`+` 号和内容均为绿色
-- 选中的新增行：`+` 号为绿底，内容为绿色
-- 未选中的删除行：`-` 号和内容均为红色
-- 选中的删除行：`-` 号为绿底，内容为红色
+**效果**：
+- 已选中的新增行：`+` 号显示绿底绿字，其余绿色
+- 已选中的删除行：`-` 号显示绿底红字，其余红色
+- 未选中的新增行：全绿色
+- 未选中的删除行：全红色
 
-#### 3.4 视图内容渲染
+**第三层：光标/范围选中高亮（gocui View 层）**
 
-在 [patch_explorer_context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/patch_explorer_context.go) 中获取渲染内容：
+与 Staging 相同，通过 `SetRangeSelectStart()` 和 `SetCursorY()` 配置，gocui 在渲染时对范围内字符叠加：
+- 前景色加亮
+- 粗体
+- 选中背景色
+
+**三层叠加示意**：
+
+```
+未选中的 +新增行     → 仅第一层：绿色前景
+已选中的 +新增行     → 第一层(绿前景) + 第二层(首字符绿底)
+光标所在的 +新增行   → 第一层(绿前景) + 第二层(首字符绿底) + 第三层(加亮+粗体+选中背景)
+```
+
+### 4.8 右侧自定义 Patch 渲染
+
+右侧副视图通过 `PatchBuilder.RenderPatchForFile()` 渲染：
 
 ```go
-func (self *PatchExplorerContext) GetContentToRender() string {
-    if self.GetState() == nil {
+func (p *PatchBuilder) RenderPatchForFile(opts RenderPatchForFileOpts) string {
+    info, err := p.getFileInfo(opts.Filename)
+    if info.mode == UNSELECTED {
         return ""
     }
     
-    return self.GetState().RenderForLineIndices(self.GetIncludedLineIndices())
-}
-```
-
-**State 渲染方法**（[state.go:398-403](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go#L398-L403)）：
-
-```go
-func (s *State) RenderForLineIndices(includedLineIndices []int) string {
-    includedLineIndicesSet := set.NewFromSlice(includedLineIndices)
-    return s.patch.FormatView(patch.FormatViewOpts{
-        IncLineIndices: includedLineIndicesSet,
-    })
-}
-```
-
-#### 3.5 主视图刷新流程
-
-完整的刷新流程在 [main_panels.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/main_panels.go) 中：
-
-```go
-func (gui *Gui) refreshMainViews(opts types.RefreshMainOpts) {
-    // 重置其他视图滚动位置
-    for _, pair := range gui.allMainContextPairs() {
-        // ...
-    }
+    // 解析 → Transform（仅保留 IncludedLineIndices 的行）→ 格式化
+    patch := Parse(info.diff).
+        Transform(TransformOpts{
+            Reverse:                                opts.Reverse,
+            TurnAddedFilesIntoDiffAgainstEmptyFile: opts.TurnAddedFilesIntoDiffAgainstEmptyFile,
+            IncludedLineIndices:                    info.includedLineIndices,
+        })
     
-    // 刷新主视图
-    if opts.Main != nil {
-        gui.RefreshMainView(opts.Main, opts.Pair.Main)
+    if opts.Plain {
+        return patch.FormatPlain()
     }
-    
-    // 刷新副视图
-    if opts.Secondary != nil {
-        gui.RefreshMainView(opts.Secondary, opts.Pair.Secondary)
-    }
-    
-    // 移动到顶层、分割面板
-    gui.moveMainContextPairToTop(opts.Pair)
-    gui.splitMainPanel(opts.Secondary != nil)
+    return patch.FormatView(FormatViewOpts{})  // 右侧不区分 included，只显示颜色
 }
 ```
 
 ---
 
-## 四、完整流程图
+## 五、三种渲染路径对比表
+
+| 维度 | 路径 A：普通查看 | 路径 B：Staging | 路径 C：Patch Building |
+|------|----------------|----------------|----------------------|
+| **使用场景** | 浏览 diff、文件预览 | 暂存/取消暂存行 | 从 commit 提取行构建 patch |
+| **入口函数** | `RenderDiff()` / `WorktreeFileDiffCmdObj(plain=false)` | `RefreshStagingPanel()` → `WorktreeFileDiff(plain=true)` | `RefreshPatchBuildingPanel()` → `ShowFileDiff(plain=true)` |
+| **Git 命令颜色** | `--color=always`（git 自带颜色） | `--color=never`（lazygit 重新染色） | `--color=never`（lazygit 重新染色） |
+| **渲染方式** | PTY 流式输出 | `RenderStringWithoutScrollTask` | `RenderStringWithoutScrollTask` |
+| **Patch 解析** | 不解析 | `patch.Parse()` 结构化 | `patch.Parse()` 结构化 |
+| **行类型标记** | 不做（git 已输出颜色） | 首字符判别 `+/-/空格` | 首字符判别 `+/-/空格` |
+| **内容颜色层** | git ANSI 输出 | `formatView()` 生成 | `formatView()` 生成 |
+| **已包含行标记** | 无 | 无（返回 nil） | 有（`PatchBuilder.GetFileIncLineIndices`）→ 首字符绿底 |
+| **光标选中高亮** | gocui View 层（加亮+粗体+背景） | gocui View 层（加亮+粗体+背景） | gocui View 层（加亮+粗体+背景） |
+| **高亮层数** | 2 层（git 颜色 + 选中） | 2 层（内容颜色 + 选中） | 3 层（内容颜色 + 已包含标记 + 选中） |
+| **行选择模式** | 无 | LINE / RANGE / HUNK | LINE / RANGE / HUNK |
+| **选中范围持久化** | 无 | 不持久化（每次 Space 即应用） | `PatchBuilder.fileInfoMap` 持久化到内存 |
+
+---
+
+## 六、完整流程图
 
 ```
-用户操作触发 Diff 渲染
-        │
-        ▼
-┌─────────────────────────┐
-│  DiffArgs() 构建参数    │  [diff_helper.go]
-│  - Ref、文件名、过滤路径 │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ DiffCmdObj() 构建命令   │  [diff.go]
-│  - --color=always       │
-│  - --unified=N          │
-│  - 支持外部 diff 工具   │
-└───────────┬─────────────┘
-            │
-     ┌──────┴──────┐
-     │             │
-     ▼             ▼
-┌─────────┐   ┌──────────────────┐
-│ PTY 路径│   │ Patch 格式化路径 │
-└────┬────┘   └─────────┬────────┘
-     │                  │
-     │ git 自带颜色     │ patch.Parse() 解析
-     │                  │  - 按行分割
-     │                  │  - 正则匹配 hunk 头
-     │                  │  - 首字符判断行类型
-     │                  ▼
-     │              ┌──────────────────┐
-     │              │ State 初始化     │  [state.go]
-     │              │  - 选中行管理    │
-     │              │  - 选择模式      │
-     │              │  - 行索引映射    │
-     │              └─────────┬────────┘
-     │                        │
-     │                        ▼
-     │              ┌──────────────────┐
-     │              │ FormatView()     │  [format.go]
-     │              │  - 行颜色映射    │
-     │              │  - 选中高亮      │
-     │              │  - ANSI 代码生成 │
-     │              └─────────┬────────┘
-     │                        │
-     └──────────┬─────────────┘
-                │
-                ▼
-        ┌───────────────┐
-        │ gocui View    │  [view.go]
-        │  - 解析 ANSI  │
-        │  - 显示颜色   │
-        │  - 范围选择   │
-        └───────────────┘
+用户操作
+    │
+    ├───────────── 浏览 Diff ─────────────┐
+    │                                      │
+    │  ┌────────────────────────────┐      │  ┌────────────────────────────┐
+    │  │ 路径 A: PTY 直接渲染       │      │  │ 路径 B/C: Patch 格式化渲染 │
+    │  └─────────────┬──────────────┘      │  └──────────────┬─────────────┘
+    │                │                     │                 │
+    │                ▼                     │                 ▼
+    │  DiffCmdObj/DiffFileCmdObj           │  WorktreeFileDiff(plain=true)
+    │  (--color=always)                    │  ShowFileDiff(plain=true)
+    │                │                     │  (--color=never)
+    │                ▼                     │                 │
+    │         RunPtyTask 执行              │                 ▼
+    │  git 输出带 ANSI 颜色的文本          │        patch.Parse() 解析
+    │                │                     │    ┌────────────────────────────┐
+    │                ▼                     │    │ 首字符判别行类型            │
+    │     gocui View 解析 ANSI             │    │ +→ADDITION, -→DELETION     │
+    │                │                     │    │ 空格→CONTEXT               │
+    │                ▼                     │    └──────────────┬─────────────┘
+    │    颜色层：git 自带颜色               │                 │
+    │    选中层：gocui 加亮+粗体+背景       │                 ▼
+    │                                      │    patch_exploring.NewState()
+    │                                      │  ┌─────────────────────────────┐
+    │                                      │  │ State: 选中行索引、选择模式 │
+    │                                      │  │  LINE / RANGE / HUNK        │
+    │                                      │  │ viewLine/patchLine 双映射   │
+    │                                      │  └──────────────┬──────────────┘
+    │                                      │                 │
+    │                                      │                 ▼
+    │                                      │    Patch.FormatView() 渲染
+    │                                      │  ┌─────────────────────────────┐
+    │                                      │  │ 内容颜色层：                 │
+    │                                      │  │   ADDITION→FgGreen          │
+    │                                      │  │   DELETION→FgRed            │
+    │                                      │  │   HUNK_HEADER→FgCyan        │
+    │                                      │  │                             │
+    │                                      │  │ 已包含标记层（仅 Path C）：  │
+    │                                      │  │   incLineIndices 行         │
+    │                                      │  │   首字符 BgGreen            │
+    │                                      │  └──────────────┬──────────────┘
+    │                                      │                 │
+    │                                      │                 ▼
+    │                                      │    FocusSelection() 配置选中
+    │                                      │    SetRangeSelectStart(start)
+    │                                      │    SetCursorY(end)
+    │                                      │                 │
+    │                                      │                 ▼
+    │                                      │    选中层：gocui 加亮+粗体+背景
+    │                                      │
+    └──────────────────────────────────────┴─────────────────────────────────┘
+                                      ▼
+                            gocui 绘制到终端
 ```
 
 ---
 
-## 五、关键技术点总结
+## 七、关键技术点总结
 
-### 5.1 两种渲染路径对比
+### 7.1 Diff 文本获取的三条路径
 
-| 特性 | PTY 直接渲染 | Patch 格式化渲染 |
-|------|-------------|-----------------|
-| 使用场景 | 普通 diff 查看 | Staging、Patch Building |
-| 颜色来源 | git 命令输出 | lazygit 自定义 |
-| 行选择 | 不支持 | 支持（单行、范围、hunk） |
-| 性能 | 较好（流式输出） | 需完整解析 |
-| 代码位置 | [diff_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go) | [format.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go) |
+1. **普通查看**：`git diff --color=always`，直接通过 PTY 流式输出，git 负责颜色
+2. **Staging**：`git diff [--cached|--no-index] --color=never`，获取纯文本后 lazygit 自行解析染色
+3. **Patch Building**：`git diff from to --no-renames --color=never`，同样获取纯文本，且在 PatchBuilder 中按文件缓存 diff
 
-### 5.2 行级标记核心
+### 7.2 行级标记核心实现
 
-1. **首字符判别法**：通过 `+/-/空格` 快速判断行类型
-2. **Hunk 为单位**：每个 hunk 独立维护行号映射
-3. **双索引映射**：`viewLineIndices` 和 `patchLineIndices` 处理换行
+1. **首字符判别法**：`+` → ADDITION，`-` → DELETION，`空格` → CONTEXT，`\` → NEWLINE_MESSAGE
+2. **Hunk 头正则**：`^@@ -(\d+)[^\+]+\+(\d+)[^@]+@@(.*)$` 提取旧/新起始行号和上下文
+3. **双索引映射**：`viewLineIndices`（patch 行→视图行）和 `patchLineIndices`（视图行→patch 行）处理自动换行
 
-### 5.3 高亮实现技巧
+### 7.3 交互式高亮的三层机制
 
-1. **首字符特殊处理**：选中行仅首字符背景高亮，不影响整行
-2. **样式合并**：`MergeStyle()` 支持前景色与背景色叠加
-3. **ANSI 转义**：利用 `gookit/color` 库生成标准终端颜色代码
+| 层级 | 实现位置 | 作用 | 适用路径 |
+|------|---------|------|---------|
+| 内容颜色层 | `format.go:patchLineStyle()` | 区分新增/删除/hunk头 | B、C |
+| 已包含标记层 | `format.go:formatLineAux()` | 首字符绿底标记已选中行 | 仅 C |
+| 光标选中层 | `view.go:567-588` | 加亮+粗体+选中背景色 | A、B、C |
 
-### 5.4 关键文件索引
+### 7.4 范围选择的两种粒度控制
+
+- **State 层**：`SelectedViewRange()` 返回 LINE/RANGE/HUNK 三种模式的视图行范围
+- **gocui View 层**：`rangeSelectStartY` 和 `cy` 决定最终渲染时的高亮范围
+
+### 7.5 关键文件索引
 
 | 文件 | 作用 |
 |------|------|
-| [diff_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go) | Diff 渲染入口、参数构建 |
-| [diff.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/diff.go) | Git diff 命令构建 |
-| [parse.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go) | Diff 文本解析 |
-| [format.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go) | Patch 格式化与高亮 |
-| [state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go) | Patch 浏览状态管理 |
-| [patch_explorer_context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/patch_explorer_context.go) | 视图上下文 |
-| [text_style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/style/text_style.go) | 样式系统 |
-| [view.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gocui/view.go) | 终端视图渲染 |
+| [diff_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/diff_helper.go) | 路径 A：Diff 模式渲染入口 |
+| [staging_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/staging_helper.go) | 路径 B：Staging 面板刷新 |
+| [patch_building_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/controllers/helpers/patch_building_helper.go) | 路径 C：Patch Building 面板刷新 |
+| [working_tree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/working_tree.go) | `WorktreeFileDiff` / `ShowFileDiff` 命令构建 |
+| [diff.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/git_commands/diff.go) | 路径 A：Diff 模式命令构建 |
+| [parse.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/parse.go) | Diff 文本解析与行类型标记 |
+| [format.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/format.go) | Patch 格式化渲染与颜色层/已包含标记层 |
+| [patch_builder.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/commands/patch/patch_builder.go) | 路径 C：PatchBuilder 状态与行索引管理 |
+| [state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/patch_exploring/state.go) | Patch 浏览状态（选中行、选择模式、双索引映射） |
+| [patch_explorer_context.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/patch_explorer_context.go) | PatchExplorer 视图上下文与 FocusSelection |
+| [setup.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/context/setup.go) | 上下文注册（含 getIncludedLineIndices 回调） |
+| [text_style.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gui/style/text_style.go) | 样式系统（颜色、粗体、MergeStyle） |
+| [view.go](file:///d:/fz/0601-2/solo-dogfeeding/code/31-lazygit/pkg/gocui/view.go) | gocui 终端视图渲染与光标选中高亮 |
