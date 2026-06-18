@@ -188,6 +188,140 @@ const (
 )
 ```
 
+### 2.7 配置目录与配置文件的关系详解
+
+> ⚠️ **关键发现：配置目录查找与配置文件加载是两条相对独立的链路**
+>
+> 即使设置了 `LG_CONFIG_FILE`（跳过默认配置文件加载），**配置目录仍然会被查找和创建**。
+
+#### 2.7.1 NewAppConfig 执行顺序
+
+[app_config.go#L80-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L80-L126)
+
+```go
+func NewAppConfig(...) (*AppConfig, error) {
+    // ═══════════════════════════════════════
+    // 第1步：查找并创建配置目录（总是执行）
+    // ═══════════════════════════════════════
+    configDir, err := findOrCreateConfigDir()
+    // 调用链：findOrCreateConfigDir → ConfigDir → findConfigFile
+    // 无论 LG_CONFIG_FILE 是否设置，这一步都会执行
+
+    // ═══════════════════════════════════════
+    // 第2步：二选一选择配置文件（分支执行）
+    // ═══════════════════════════════════════
+    var configFiles []*ConfigFile
+    customConfigFiles := os.Getenv("LG_CONFIG_FILE")
+    if customConfigFiles != "" {
+        // 分支A：使用 LG_CONFIG_FILE 指定的文件
+        // 不使用 configDir 下的 config.yml
+    } else {
+        // 分支B：使用 configDir + "config.yml"
+    }
+
+    // ═══════════════════════════════════════
+    // 第3步：加载应用状态（独立查找，总是执行）
+    // ═══════════════════════════════════════
+    appState, err := loadAppState()
+    // 调用链：loadAppState → stateFilePath → findConfigFile → xdg.StateFile
+    // 与 LG_CONFIG_FILE 无关，独立查找
+
+    // ═══════════════════════════════════════
+    // 第4步：保存 configDir 到 AppConfig
+    // ═══════════════════════════════════════
+    appConfig := &AppConfig{
+        userConfigDir: configDir,  // 总是保存配置目录路径
+        // ...
+    }
+}
+```
+
+**执行顺序图：**
+
+```
+NewAppConfig()
+    │
+    ├─ 第1步：findOrCreateConfigDir() ← 总是执行
+    │       （与 LG_CONFIG_FILE 无关）
+    │
+    ├─ 第2步：if LG_CONFIG_FILE? ← 二选一
+    │       ├─ 是 → 用户指定文件
+    │       └─ 否 → configDir/config.yml
+    │
+    ├─ 第3步：loadAppState() ← 总是执行
+    │       （独立调用 findConfigFile）
+    │
+    └─ 第4步：保存 userConfigDir ← 总是保存
+```
+
+#### 2.7.2 配置目录的独立用途
+
+配置目录（`userConfigDir`）不仅仅是存放 `config.yml` 的地方，它还有多个独立用途：
+
+| 用途 | 文件 | 查找方式 | 受 LG_CONFIG_FILE 影响？ | 代码位置 |
+|------|------|---------|------------------------|----------|
+| 用户配置 | `config.yml` | `if-else` 二选一 | ✅ 是（设置了就跳过默认） | [app_config.go#L87-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L87-L98) |
+| 应用状态 | `state.yml` | `stateFilePath` 独立查找 | ❌ 否 | [app_config.go#L612-L622](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L612-L622) |
+| 日志文件 | `development.log` | `stateFilePath` 独立查找 | ❌ 否 | [app_config.go#L732-L738](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L732-L738) |
+| 软件更新下载目录 | - | `GetUserConfigDir()` | ❌ 否 | [updates.go#L249](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/updates/updates.go#L249) |
+| 路径信息暴露 | - | `GetUserConfigDir()` 对外接口 | ❌ 否 | [app_config.go#L544-L546](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L544-L546) |
+
+#### 2.7.3 stateFilePath 独立查找逻辑
+
+应用状态文件和日志文件通过 `stateFilePath` 查找，有自己独立的查找策略：
+
+[app_config.go#L612-L622](file:///d:/fz/0601-2/solo-dogfeeding/code/39-lazygit/pkg/config/app_config.go#L612-L622)
+
+```go
+func stateFilePath(filename string) (string, error) {
+    // 优先级1：在配置目录中查找（通过 findConfigFile）
+    exists, legacyStateFile := findConfigFile(filename)
+    if exists {
+        return legacyStateFile, nil
+    }
+
+    // 优先级2：XDG_STATE_HOME 状态目录
+    // 搜索 XDG_STATE_HOME/lazygit/ 和 XDG_STATE_DIRS
+    return xdg.StateFile(filepath.Join("lazygit", filename))
+}
+```
+
+**state.yml 查找优先级：**
+1. 配置目录中的 `state.yml`（与 `config.yml` 同目录查找规则）
+2. `XDG_STATE_HOME/lazygit/state.yml`（标准状态目录）
+
+#### 2.7.4 为什么设置了 LG_CONFIG_FILE 还要查找配置目录？
+
+**设计原因分析：**
+
+1. **职责分离**：
+   - `LG_CONFIG_FILE` 只影响**用户配置文件**的加载
+   - 配置目录还承担**状态存储、日志、更新下载**等其他职责
+   - 这些职责与配置文件相互独立
+
+2. **向后兼容**：
+   - 旧版本状态文件可能存放在配置目录中
+   - `stateFilePath` 会先在配置目录查找，找到就用
+
+3. **接口一致性**：
+   - `GetUserConfigDir()` 是对外公开的接口
+   - 即使使用自定义配置文件，也需要返回一个合理的配置目录
+
+4. **目录创建时机**：
+   - `findOrCreateConfigDir` 在函数最开始调用
+   - 保证后续如果需要写入状态文件，目录已存在
+
+#### 2.7.5 设置 LG_CONFIG_FILE 后的行为总结
+
+| 行为 | 是否发生 | 说明 |
+|------|---------|------|
+| 默认 `config.yml` 被加载 | ❌ 否 | 完全跳过，使用 LG_CONFIG_FILE 指定的文件 |
+| `findConfigFile` 被调用 | ✅ 是 | 至少调用 2 次：1次给 configDir，1次给 state.yml |
+| `userConfigDir` 有值 | ✅ 是 | 始终有值，通过 `findConfigFile` 确定 |
+| `state.yml` 正常加载 | ✅ 是 | 独立查找，不受 LG_CONFIG_FILE 影响 |
+| 日志文件正常写入 | ✅ 是 | 通过 `stateFilePath` 独立确定路径 |
+| 更新下载目录正常 | ✅ 是 | 使用 `GetUserConfigDir()` |
+
 ---
 
 ## 三、配置加载与合并（代码级）
@@ -876,3 +1010,22 @@ A: 后加载文件的命令在前，先加载文件的命令在后。例如：�
 
 **Q: omitempty 标签会影响回退判断吗？**
 A: **不影响**。`omitempty` 只影响 YAML **序列化输出**（空值不输出到文件），不影响 **反序列化输入**（读取配置文件时，没定义的字段保持零值）。回退判断是在运行时通过 `== ""` 或 `== nil` 做的，和 omitempty 无关。
+
+**Q: 设置了 LG_CONFIG_FILE 后，配置目录还会被查找吗？**
+A: **会的**。这是一个容易误解的点。`LG_CONFIG_FILE` 只影响**用户配置文件**的加载（跳过默认 config.yml），但配置目录仍然会被查找和创建，因为：
+- `findOrCreateConfigDir()` 在 `if-else` 之前就被调用了
+- 配置目录还用于存放 `state.yml`（应用状态）、日志文件、更新下载等
+- 这些功能与 `LG_CONFIG_FILE` 是相互独立的
+
+**Q: state.yml 的路径和 config.yml 的路径一定相同吗？**
+A: **不一定**。`config.yml` 只有默认路径分支才会从配置目录加载；而 `state.yml` 通过 `stateFilePath` 独立查找，它会先在配置目录找，找不到就用 `XDG_STATE_HOME/lazygit/`。设置了 `LG_CONFIG_FILE` 后，config.yml 用用户指定的路径，但 state.yml 仍然用原来的查找逻辑。
+
+**Q: NewAppConfig 中 findConfigFile 会被调用几次？**
+A: 至少 **2 次**：
+1. `findOrCreateConfigDir()` → `ConfigDir()` → `findConfigFile("config.yml")` — 确定配置目录
+2. `loadAppState()` → `stateFilePath()` → `findConfigFile("state.yml")` — 查找状态文件
+
+另外还有 `LogPath()` 也会调用 `stateFilePath()`，但那是在日志初始化时，不在 `NewAppConfig` 流程内。
+
+**Q: GetUserConfigDir() 返回的路径和 LG_CONFIG_FILE 有关系吗？**
+A: **没有关系**。`GetUserConfigDir()` 返回的是通过 `findConfigFile` 查找到的配置目录，与 `LG_CONFIG_FILE` 指定的文件路径完全无关。即使你设置了 `LG_CONFIG_FILE`，`GetUserConfigDir()` 仍然返回默认的配置目录路径。
