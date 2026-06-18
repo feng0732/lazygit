@@ -13,7 +13,14 @@ NewApp()
   ├─ validateGitVersion()  ── Git 版本校验
   ├─ GetRepoPaths()        ── 获取仓库路径（可能失败）
   ├─ setupRepo()           ── 仓库设置（非仓库/裸仓库/最近仓库）
-  └─ gui.NewGui()          ── 创建 GUI 实例
+  │    │
+  │    ├─ 分支 A: 当前目录是正常仓库 ────────────────────────── showRecentRepos=false
+  │    ├─ 分支 B: 当前目录非仓库 + 创建了新仓库 ──────────────── showRecentRepos=false
+  │    ├─ 分支 C: 当前目录非仓库 + 打开了最近仓库 ────────────── showRecentRepos=true  (需弹出最近仓库菜单)
+  │    ├─ 分支 D: 裸仓库 + 打开了最近仓库 ───────────────────── showRecentRepos=true  (需弹出最近仓库菜单)
+  │    └─ 分支 E: GIT_DIR 环境变量已设置 ───────────────────── showRecentRepos=false
+  │
+  └─ gui.NewGui(showRecentRepos)  ── 创建 GUI 实例，保存标志
   ↓
 app.Run(startArgs)
   ↓
@@ -24,25 +31,36 @@ gui.Run()
   ├─ createAllViews()      ── 创建所有视图
   ├─ onNewRepo()           ── 新仓库初始化（状态、控制器、快捷键）
   └─ MainLoop()            ── 进入事件主循环
+       │
+       └─ 首次 layout() 调用
+            ├─ !ViewsSetup → onInitialViewsCreation()
+            │    ├─ [可选] 启动弹窗（新手引导/更新说明）
+            │    ├─ [条件] showRecentRepos==true → CreateRecentReposMenu() 弹出菜单
+            │    └─ 标记 waitForIntro.Done()
+            └─ !State.ViewsSetup → onInitialViewsCreationForRepo()
+                 ├─ 视图层级排序
+                 ├─ 隐藏弹窗
+                 ├─ 激活初始上下文
+                 └─ loadNewRepo() → 更新最近仓库列表 + 刷新数据
 ```
 
 ---
 
 ## 1. 程序入口：main.go
 
-入口文件为 [main.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/main.go)，非常简洁：
+入口文件为 [main.go](main.go)，非常简洁：
 
 - 接收构建时注入的 `commit`、`date`、`version`、`buildSource` 变量（通过 LDFLAGS）
 - 构造 `BuildInfo` 结构体
 - 调用 `app.Start(ldFlagsBuildInfo, nil)` 启动应用
 
-关键代码位于 [main.go#L15-L23](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/main.go#L15-L23)。
+关键代码位于 [main.go#L15-L23](main.go#L15-L23)。
 
 ---
 
 ## 2. 启动阶段：app.Start()
 
-位于 [entry_point.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/entry_point.go) 的 `Start` 函数是启动的核心入口。
+位于 [pkg/app/entry_point.go](pkg/app/entry_point.go) 的 `Start` 函数是启动的核心入口。
 
 ### 2.1 CLI 参数解析
 
@@ -88,7 +106,7 @@ if cliArgs.RepoPath != "" {
 }
 ```
 
-见 [entry_point.go#L57-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/entry_point.go#L57-L76)。
+见 [pkg/app/entry_point.go#L57-L76](pkg/app/entry_point.go#L57-L76)。
 
 **错误分支**：
 - 如果 `--path` 与 `--work-tree` / `--git-dir` 同时使用 → `log.Fatal`
@@ -149,11 +167,11 @@ appConfig, err := config.NewAppConfig(...)
 
 ## 3. 应用初始化：app.Run() 与 NewApp()
 
-位于 [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go)。
+位于 [pkg/app/app.go](pkg/app/app.go)。
 
 ### 3.1 NewApp() 流程
 
-`NewApp()` 是应用实例的构造函数，执行以下步骤：
+`NewApp()` 是应用实例的构造函数，执行以下步骤（见 [pkg/app/app.go#L96-L142](pkg/app/app.go#L96-L142)）：
 
 #### 步骤 1：创建 OSCommand
 
@@ -189,31 +207,47 @@ repoPaths, err := git_commands.GetRepoPaths(app.OSCommand.Cmd, gitVersion)
 
 详见 [3.3 仓库路径检测](#33-仓库路径检测)。
 
-**注意**：这里即使获取失败也不会立即终止，只是记录日志，后续会在 `setupRepo()` 中处理。
+**注意**：这里即使获取失败也不会立即终止，只是记录日志（见 [pkg/app/app.go#L122-L125](pkg/app/app.go#L122-L125)），后续会在 `setupRepo()` 中处理。
 
-#### 步骤 6：设置仓库 setupRepo()
+#### 步骤 6：设置仓库 setupRepo() —— 关键分支点
 
 ```go
 showRecentRepos, err := app.setupRepo(repoPaths)
 ```
 
-详见 [3.4 仓库设置 setupRepo()](#34-仓库设置-setuprepo)。
+**`showRecentRepos` 返回值的含义**：
+- `true`：用户是从"最近仓库列表"打开的仓库，GUI 需要在首次布局时自动弹出"最近仓库"菜单
+- `false`：正常进入当前目录的仓库（或新建仓库、或 GIT_DIR 已指定），无需额外弹窗
 
-#### 步骤 7：创建 GUI 实例
+详见 [3.4 仓库设置 setupRepo() 全分支分析](#34-仓库设置-setuprepo-全分支分析)。
+
+#### 步骤 7：可选覆盖 —— 测试环境变量
+
+```go
+if os.Getenv("SHOW_RECENT_REPOS") == "true" {
+    showRecentRepos = true
+}
+```
+
+集成测试可通过此环境变量强制显示最近仓库菜单。
+
+#### 步骤 8：将 showRecentRepos 传入 GUI
 
 ```go
 app.Gui, err = gui.NewGui(common, config, gitVersion, updater, showRecentRepos, dirName, test)
 ```
 
+`showRecentRepos` 被保存到 `Gui.showRecentRepos` 字段（见 [pkg/gui/gui.go#L93](pkg/gui/gui.go#L93) 和 [pkg/gui/gui.go#L738](pkg/gui/gui.go#L738)），等待首次布局时使用。
+
 ### 3.2 Git 版本验证
 
-`validateGitVersion()` 位于 [app.go#L150-L164](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go#L150-L164)。
+`validateGitVersion()` 位于 [pkg/app/app.go#L150-L164](pkg/app/app.go#L150-L164)。
 
 最低要求版本：**2.32.0**（`minGitVersionStr` 常量）。
 
 流程：
 1. 调用 `git --version` 获取版本字符串
-2. 用正则表达式解析出版本号（Major.Minor.Patch）
+2. 用正则表达式解析出版本号（Major.Minor.Patch），见 [pkg/commands/git_commands/version.go#L31-L61](pkg/commands/git_commands/version.go#L31-L61)
 3. 比较版本，低于最低版本则返回错误
 
 **错误分支**：
@@ -223,9 +257,9 @@ app.Gui, err = gui.NewGui(common, config, gitVersion, updater, showRecentRepos, 
 
 ### 3.3 仓库路径检测
 
-`GetRepoPaths()` 位于 [repo_paths.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/commands/git_commands/repo_paths.go)。
+`GetRepoPaths()` 位于 [pkg/commands/git_commands/repo_paths.go](pkg/commands/git_commands/repo_paths.go)。
 
-核心实现是调用 `git rev-parse` 命令获取多个路径信息：
+核心实现是调用 `git rev-parse` 命令获取多个路径信息（见 [pkg/commands/git_commands/repo_paths.go#L87-L90](pkg/commands/git_commands/repo_paths.go#L87-L90)）：
 
 ```bash
 git rev-parse --path-format=absolute \
@@ -246,91 +280,110 @@ git rev-parse --path-format=absolute \
 
 **错误分支**：如果当前目录不在 Git 仓库中，`git rev-parse` 会失败，返回 `nil, err`。
 
-### 3.4 仓库设置 setupRepo()
+### 3.4 仓库设置 setupRepo() 全分支分析
 
-`setupRepo()` 位于 [app.go#L194-L282](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go#L194-L282)，是仓库检测的核心逻辑。
+`setupRepo()` 位于 [pkg/app/app.go#L194-L282](pkg/app/app.go#L194-L282)，是仓库检测的核心逻辑。返回值 `(showRecentRepos bool, err error)` 决定了后续 GUI 是否显示最近仓库菜单。
 
-#### 前置判断：GIT_DIR 环境变量
-
-如果已设置 `GIT_DIR` 环境变量，直接跳过所有 setup，返回 `(false, nil)`。
-
-#### 场景 1：不在 Git 仓库中（repoPaths == nil）
+#### 前置分支：GIT_DIR 环境变量已设置
 
 ```go
-if repoPaths == nil {
-    // 1. 获取当前工作目录
-    // 2. 再次确认不是 Git 仓库（isDirectoryAGitRepository 检查 .git 目录）
-    // 3. 根据 NotARepository 配置处理
+if env.GetGitDirEnv() != "" {
+    // 已通过环境变量直接指定 git 目录，跳过所有 setup
+    return false, nil   // 分支 E: 不显示最近仓库菜单
 }
 ```
 
-根据 `userConfig.NotARepository` 配置有不同行为：
+#### 主分支 A：不是 Git 仓库（repoPaths == nil）
 
-| 配置值 | 行为 |
-|--------|------|
-| `"prompt"` | 提示用户是否初始化新仓库（y/n），可选设置初始分支名 |
-| `"create"` | 直接创建 Git 仓库 |
-| `"skip"` | 不创建，尝试打开最近仓库 |
-| `"quit"` | 打印错误后 `os.Exit(1)` |
-| 其他 | 打印配置错误后 `os.Exit(1)` |
+```go
+if repoPaths == nil {
+    // 1. 获取当前工作目录 cwd
+    // 2. 再次确认 .git 目录不存在（双重保险）
+    // 3. 根据 NotARepository 配置分岔
+}
+```
 
-如果用户选择创建仓库（`shouldInitRepo = true`）：
+根据 `userConfig.NotARepository` 配置值：
+
+| 配置值 | 行为 | showRecentRepos 结果 |
+|--------|------|---------------------|
+| `"prompt"` | 提示用户是否 git init（y/n），还可输入初始分支名 | 取决于用户选择 |
+| `"create"` | 直接执行 `git init` 创建新仓库 | `false`（分支 A1） |
+| `"skip"` | 不创建，直接尝试打开最近仓库 | 取决于最近仓库 |
+| `"quit"` | 打印错误后 `os.Exit(1)` | 程序终止 |
+| 其他 | 打印配置错误后 `os.Exit(1)` | 程序终止 |
+
+**分支 A1：用户选择创建新仓库（shouldInitRepo = true）**
+
 ```go
 args := []string{"git", "init"}
 // 可选添加 --initial-branch=...
 app.OSCommand.Cmd.New(args).Run()
+return false, nil  // 新建的仓库，不显示最近仓库菜单
 ```
 
-**如果不创建仓库**，则调用 `openRecentRepo(app)` 尝试打开最近使用的仓库。
+**分支 A2：用户不创建仓库 → 尝试打开最近仓库**
 
-#### openRecentRepo() 逻辑
+调用 `openRecentRepo(app)`（见 [pkg/app/app.go#L171-L192](pkg/app/app.go#L171-L192)）：
 
-`openRecentRepo()` 位于 [app.go#L171-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go#L171-L192)：
-
-1. 遍历 `app.Config.GetAppState().RecentRepos` 列表（最近使用的仓库）
-2. 检查每个目录是否为有效 Git 仓库（`.git` 目录存在）
+1. 遍历 `app.Config.GetAppState().RecentRepos` 列表
+2. 检查每个目录是否含 `.git` 目录
 3. 尝试 `os.Chdir()` 切换到该目录
-4. 加载 direnv（如果有）
-5. 返回 `true` 表示成功打开
+4. 加载 direnv 环境
+5. 成功则返回 `true`，否则继续下一个
 
-如果所有最近仓库都无法打开，打印 "No recent repositories" 并 `os.Exit(1)`。
+结果：
+- **分支 A2a：成功打开最近仓库** → 返回 `(true, nil)`，`showRecentRepos=true`
+- **分支 A2b：所有最近仓库都无法打开** → 打印 "No recent repositories" 后 `os.Exit(1)`
 
-**返回值**：`(showRecentRepos bool, err error)`
-- 当成功从最近仓库列表打开时，`showRecentRepos = true`（后续 GUI 会显示最近仓库菜单）
-- 正常进入当前目录仓库时，`showRecentRepos = false`
-
-#### 场景 2：是裸仓库（repoPaths.IsBareRepo()）
+#### 主分支 B：是裸仓库（repoPaths.IsBareRepo() == true）
 
 ```go
 if repoPaths.IsBareRepo() {
-    // 提示用户是否要打开最近仓库
-    fmt.Print(app.Tr.BareRepo)
+    fmt.Print(app.Tr.BareRepo)  // 提示用户: 裸仓库，是否打开最近仓库？
     response, _ := bufio.NewReader(os.Stdin).ReadString('\n')
     
     if shouldOpenRecent := strings.Trim(response, " \r\n") == "y"; !shouldOpenRecent {
-        os.Exit(0)  // 用户选 n，直接退出
+        os.Exit(0)  // 分支 B1: 用户选 n，直接退出
     }
     
-    // 尝试打开最近仓库
+    // 分支 B2: 用户选 y，尝试打开最近仓库
     if openRecentRepo(app) {
-        return true, nil
+        return true, nil   // 分支 B2a: 成功 → showRecentRepos=true
     }
     
-    // 没有可用的最近仓库
+    // 分支 B2b: 无可用最近仓库
     fmt.Println(app.Tr.NoRecentRepositories)
     os.Exit(1)
 }
 ```
 
-**错误分支**：
-- 用户输入非 "y" → `os.Exit(0)`
-- 没有可用的最近仓库 → 打印消息后 `os.Exit(1)`
+#### 主分支 C：是正常的非裸仓库
+
+直接 fall-through 到函数末尾：
+
+```go
+return false, nil  // 分支 C: 正常仓库，不显示最近仓库菜单
+```
+
+#### setupRepo() 全部分支汇总
+
+| 分支 | 场景 | showRecentRepos | 后续行为 |
+|------|------|-----------------|----------|
+| A1 | 非仓库 → 创建了新仓库 | `false` | 正常进入 GUI |
+| A2a | 非仓库 → 成功打开最近仓库 | `true` | GUI 启动后自动弹出最近仓库菜单 |
+| A2b | 非仓库 → 无可用最近仓库 | - | `os.Exit(1)` |
+| B1 | 裸仓库 → 用户选 n | - | `os.Exit(0)` |
+| B2a | 裸仓库 → 成功打开最近仓库 | `true` | GUI 启动后自动弹出最近仓库菜单 |
+| B2b | 裸仓库 → 无可用最近仓库 | - | `os.Exit(1)` |
+| C | 正常非裸仓库 | `false` | 正常进入 GUI |
+| E | GIT_DIR 已指定 | `false` | 正常进入 GUI |
 
 ---
 
 ## 4. 错误处理：knownError 机制
 
-`Run()` 函数中的错误处理位于 [app.go#L48-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go#L48-L62)：
+`Run()` 函数中的错误处理位于 [pkg/app/app.go#L48-L62](pkg/app/app.go#L48-L62)：
 
 ```go
 if err != nil {
@@ -347,7 +400,7 @@ if err != nil {
 
 ### 已知错误映射
 
-`knownError()` 位于 [errors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/errors.go)，识别以下已知错误：
+`knownError()` 位于 [pkg/app/errors.go](pkg/app/errors.go)，识别以下已知错误：
 
 | 原始错误包含 | 友好提示 |
 |-------------|----------|
@@ -359,11 +412,243 @@ if err != nil {
 
 ---
 
-## 5. GUI 启动流程
+## 5. 从 setupRepo 到界面进入的衔接流程
 
-### 5.1 NewGui() 构造
+### 5.1 衔接总览
 
-`gui.NewGui()` 位于 [gui.go#L721-L797](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/gui.go#L721-L797)，主要做以下初始化：
+```
+setupRepo() 返回 (showRecentRepos, err)
+    │
+    ▼
+NewApp() 中 gui.NewGui(..., showRecentRepos, ...)
+    │  Gui 结构体保存 showRecentRepos 字段
+    ▼
+app.Run(startArgs)
+    │
+    ▼
+gui.RunAndHandleError()
+    │
+    ▼
+gui.Run()
+    ├─ initGocui()           → 初始化终端 UI
+    ├─ createAllViews()      → 创建所有视图（但还没布局）
+    ├─ onNewRepo()           → 创建 GitCommand、加载配置、初始化状态/控制器/快捷键、推入初始上下文、首次 render
+    ├─ startBackgroundRoutines()
+    └─ MainLoop()
+         │
+         ▼
+    首次 layout() 调用（由 MainLoop 的第一次事件循环触发）
+         │
+         ├─ [Gate 1] !gui.ViewsSetup → onInitialViewsCreation()
+         │    ├─ 启动弹窗（首次用户引导 / 版本更新说明）
+         │    ├─ 保存当前版本号到 AppState
+         │    ├─ ★ 关键检查: showRecentRepos==true → CreateRecentReposMenu()
+         │    ├─ 后台检查更新
+         │    ├─ waitForIntro.Done()
+         │    └─ gui.ViewsSetup = true  (Gate 1 关闭)
+         │
+         └─ [Gate 2] !gui.State.ViewsSetup → onInitialViewsCreationForRepo()
+              ├─ onRepoViewReset() → 视图层级排序
+              ├─ 隐藏所有弹窗视图
+              ├─ 激活初始上下文
+              ├─ loadNewRepo() → updateRecentRepoList() + Refresh + 更新窗口标题
+              └─ gui.State.ViewsSetup = true  (Gate 2 关闭)
+```
+
+### 5.2 NewGui()：showRecentRepos 标志的保存
+
+`gui.NewGui()` 位于 [pkg/gui/gui.go#L721-L797](pkg/gui/gui.go#L721-L797)，接收的 `showRecentRepos` 参数被直接保存到 `Gui` 结构体：
+
+```go
+type Gui struct {
+    // ...
+    showRecentRepos bool  // [pkg/gui/gui.go#L93]
+    // ...
+}
+
+func NewGui(..., showRecentRepos bool, ...) (*Gui, error) {
+    gui := &Gui{
+        // ...
+        showRecentRepos:      showRecentRepos,  // [pkg/gui/gui.go#L738]
+        // ...
+    }
+    // ...
+}
+```
+
+此时标志只是被保存，**尚未被使用**。
+
+### 5.3 gui.Run()：GUI 运行启动
+
+`gui.Run()` 位于 [pkg/gui/gui.go#L882-L952](pkg/gui/gui.go#L882-L952)：
+
+1. **initGocui()**：初始化底层终端 UI 库（tcell/gocui），支持 headless 测试模式
+2. **设置错误处理器**：`g.ErrorHandler = gui.PopupHandler.ErrorHandler`
+3. **设置布局管理器**：`gui.g.SetManager(gocui.ManagerFunc(gui.layout))` —— 每次重绘都会调用 `layout()`
+4. **createAllViews()**：创建所有视图（files、branches、commits 等），但尚未布局
+5. **onNewRepo()**：仓库级别的初始化，见 [5.4](#54-onnewrepo-仓库初始化)
+6. **startBackgroundRoutines()**：启动后台自动刷新、自动 fetch 等
+7. **MainLoop()**：进入事件主循环，首次循环会触发 `layout()`
+
+### 5.4 onNewRepo()：仓库初始化
+
+`onNewRepo()` 位于 [pkg/gui/gui.go#L320-L434](pkg/gui/gui.go#L320-L434)，每次切换到新仓库（包括首次启动）时调用：
+
+1. **创建 GitCommand**：`commands.NewGitCommand()` —— 这一步会再次执行 `git rev-parse` 获取仓库路径
+2. **重新加载仓库配置**：从仓库的 Git 目录和父目录加载 `.lazygit.yml`
+3. **用户配置加载后处理**：`onUserConfigLoaded()` —— 语言、主题、图标、快捷键等
+4. **resetState()**：初始化或复用仓库状态
+   - 初始化 `Model`（提交、文件、分支等数据模型，初始为空切片）
+   - 初始化 `Modes`（过滤、樱桃拣选、diff 等）
+   - 设置 `StartupStage = INITIAL`（两阶段启动的初始阶段）
+   - 创建上下文树（Files、Branches、Commits、Stash 等）
+   - 设置初始屏幕模式
+5. **重置控制器和快捷键**
+6. **设置焦点/超链接/搜索处理器**
+7. **推入初始上下文**：根据 `--filter`、`git-arg` 决定聚焦哪个面板（默认 Files）
+8. **首次 render()**：触发第一次界面绘制
+
+此时状态已经准备好，但 **`showRecentRepos` 标志仍未被使用**。
+
+### 5.5 首次 layout()：Gate 机制与 showRecentRepos 消费
+
+`layout()` 函数位于 [pkg/gui/layout.go#L13-L207](pkg/gui/layout.go#L13-L207)，由 gocui 的主循环在每次重绘时调用。
+
+使用了两个 Gate 标志来确保初始化逻辑只执行一次：
+
+#### Gate 1：`gui.ViewsSetup`（全局视图级初始化）
+
+```go
+if !gui.ViewsSetup {  // [pkg/gui/layout.go#L155]
+    if err := gui.onInitialViewsCreation(); err != nil {
+        return err
+    }
+    gui.handleTestMode()
+    gui.ViewsSetup = true  // Gate 1 关闭，后续不再执行
+}
+```
+
+`onInitialViewsCreation()` 位于 [pkg/gui/layout.go#L255-L280](pkg/gui/layout.go#L255-L280)，是 `showRecentRepos` 标志真正被消费的地方：
+
+```go
+func (gui *Gui) onInitialViewsCreation() error {
+    // 1. 启动弹窗（首次使用介绍 / 破坏性变更说明）
+    if !gui.c.UserConfig().DisableStartupPopups {
+        storedPopupVersion := gui.c.GetAppState().StartupPopupVersion
+        if storedPopupVersion < StartupPopupVersion {
+            gui.showIntroPopupMessage()   // 新手引导
+        } else {
+            gui.showBreakingChangesMessage()  // 版本更新说明
+        }
+    }
+    
+    // 2. 保存当前版本号
+    gui.c.GetAppState().LastVersion = gui.Config.GetVersion()
+    gui.c.SaveAppStateAndLogError()
+    
+    // ★★★ showRecentRepos 标志的唯一消费点 ★★★
+    if gui.showRecentRepos {  // [pkg/gui/layout.go#L268]
+        if err := gui.helpers.Repos.CreateRecentReposMenu(); err != nil {
+            return err
+        }
+        gui.showRecentRepos = false  // [pkg/gui/layout.go#L272] 消费后复位
+    }
+    
+    // 4. 后台检查更新
+    gui.helpers.Update.CheckForUpdateInBackground()
+    
+    // 5. 标记 intro 等待完成
+    gui.waitForIntro.Done()
+    return nil
+}
+```
+
+**衔接意义**：从 `setupRepo()` 返回的 `showRecentRepos=true` 标志，经过 `NewGui()` 保存、`gui.Run()` 透传，最终在首次布局时触发 `CreateRecentReposMenu()`，向用户弹出最近仓库的选择菜单。
+
+#### Gate 2：`gui.State.ViewsSetup`（仓库级视图初始化）
+
+```go
+if !gui.State.ViewsSetup {  // [pkg/gui/layout.go#L165]
+    if err := gui.onInitialViewsCreationForRepo(); err != nil {
+        return err
+    }
+    gui.State.ViewsSetup = true  // Gate 2 关闭
+}
+```
+
+`onInitialViewsCreationForRepo()` 位于 [pkg/gui/layout.go#L215-L232](pkg/gui/layout.go#L215-L232)：
+
+```go
+func (gui *Gui) onInitialViewsCreationForRepo() error {
+    if err := gui.onRepoViewReset(); err != nil {  // 视图层级排序（z-order）
+        return err
+    }
+    
+    // 隐藏所有弹窗视图（切换仓库场景需要）
+    for _, viewName := range gui.popupViewNames() {
+        view, _ := gui.g.View(viewName)
+        if view != nil {
+            view.Visible = false
+        }
+    }
+    
+    initialContext := gui.c.Context().Current()
+    gui.c.Context().Activate(initialContext, types.OnFocusOpts{})
+    
+    return gui.loadNewRepo()  // ★ 数据加载入口
+}
+```
+
+`loadNewRepo()` 位于 [pkg/gui/gui.go#L1064-L1076](pkg/gui/gui.go#L1064-L1076)：
+
+```go
+func (gui *Gui) loadNewRepo() error {
+    if err := gui.updateRecentRepoList(); err != nil {  // 将当前仓库加入最近仓库列表（首位）
+        return err
+    }
+    
+    gui.c.Refresh(types.RefreshOptions{Mode: types.ASYNC})  // 异步刷新所有数据
+    
+    if err := gui.os.UpdateWindowTitle(); err != nil {
+        return err
+    }
+    return nil
+}
+```
+
+### 5.6 CreateRecentReposMenu()：最近仓库菜单
+
+当 `showRecentRepos=true` 时调用，位于 [pkg/gui/controllers/helpers/repos_helper.go#L98-L142](pkg/gui/controllers/helpers/repos_helper.go#L98-L142)：
+
+1. 从 `AppState.RecentRepos[1:]` 获取除当前仓库外的最近仓库（当前仓库是列表首位）
+2. 并发获取每个仓库的当前分支名
+3. 构建菜单项（仓库名、分支、路径三列）
+4. 调用 `self.c.Menu(...)` 显示菜单
+
+用户选择某个仓库时，触发 `OnPress` → `DispatchSwitchToRepo(path, context.NO_CONTEXT)`：
+
+```go
+func (self *ReposHelper) DispatchSwitchToRepo(path string, contextKey types.ContextKey) error {
+    return self.c.WithWaitingStatus(self.c.Tr.Switching, func(gocui.Task) error {
+        env.UnsetGitLocationEnvVars()   // 清除 GIT_DIR/GIT_WORK_TREE 等
+        os.Chdir(path)                   // 切换目录
+        commands.VerifyInGitRepo(...)    // 验证目标确实是仓库
+        direnv.Load(...)                 // 加载 direnv
+        self.onNewRepo(appTypes.StartArgs{}, contextKey)  // ★ 重新初始化仓库状态
+        return nil
+    })
+}
+```
+
+切换仓库时会再次调用 `onNewRepo()` → 重置 `State.ViewsSetup = false` → 下次 layout 时触发 Gate 2，完成新仓库的视图初始化和数据加载。
+
+---
+
+## 6. GUI 启动流程细节
+
+### 6.1 NewGui() 构造
+
+`gui.NewGui()` 位于 [pkg/gui/gui.go#L721-L797](pkg/gui/gui.go#L721-L797)，主要做以下初始化：
 
 - 设置 `showRecentRepos` 标志（来自 setupRepo）
 - 初始化 `RepoStateMap`（仓库状态映射，支持多仓库/工作树切换）
@@ -372,73 +657,9 @@ if err != nil {
 - 创建 `BackgroundRoutineMgr`（后台例程管理器）
 - 创建 `PagerConfig`
 
-### 5.2 Run() 执行
+### 6.2 初始上下文选择
 
-`gui.Run()` 位于 [gui.go#L882-L952](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/gui.go#L882-L952)：
-
-```go
-func (gui *Gui) Run(startArgs appTypes.StartArgs) error {
-    // 1. 初始化 gocui
-    g, err := gui.initGocui(Headless(), startArgs.IntegrationTest)
-    
-    // 2. 设置错误处理器
-    g.ErrorHandler = gui.PopupHandler.ErrorHandler
-    
-    // 3. 设置布局管理器
-    gui.g.SetManager(gocui.ManagerFunc(gui.layout))
-    
-    // 4. 创建所有视图
-    if err := gui.createAllViews(); err != nil {
-        return err
-    }
-    
-    // 5. 新仓库初始化（必须在 SetManager 之后，因为 SetManager 会删除快捷键）
-    if err := gui.onNewRepo(startArgs, context.NO_CONTEXT); err != nil {
-        return err
-    }
-    
-    // 6. 启动后台例程
-    gui.BackgroundRoutineMgr.startBackgroundRoutines()
-    
-    // 7. 安装恢复信号处理器
-    gui.Helpers().SuspendResume.InstallResumeSignalHandler()
-    
-    // 8. 进入主事件循环
-    err = gui.g.MainLoop()
-}
-```
-
-### 5.3 onNewRepo() - 新仓库初始化
-
-`onNewRepo()` 位于 [gui.go#L320-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/gui.go#L320-L434)，每次切换到新仓库时调用：
-
-1. **创建 GitCommand**：`commands.NewGitCommand()`
-2. **重新加载仓库配置**：`Config.ReloadUserConfigForRepo()`
-3. **用户配置加载后处理**：`onUserConfigLoaded()`
-   - 加载翻译（语言设置）
-   - 设置颜色主题
-   - 配置视图属性
-   - 设置搜索快捷键
-   - 设置编辑快捷键
-   - 配置图标（Nerd Fonts）
-   - 配置分支颜色
-4. **重置状态**：`resetState(startArgs)`
-   - 从 `RepoStateMap` 复用已有状态，或创建新状态
-   - 初始化 `Model`（提交、文件、分支等数据模型）
-   - 初始化 `Modes`（过滤、樱桃拣选、diff 等模式）
-   - 设置初始屏幕模式
-   - 创建上下文树和上下文管理器
-   - 设置初始上下文（根据 git-arg 参数决定聚焦哪个面板）
-5. **重置控制器和快捷键**
-6. **设置焦点处理器**：窗口获得焦点时刷新配置和数据
-7. **设置超链接处理器**：支持 `lazygit-edit://` 协议
-8. **设置搜索结果处理器**
-9. **推入初始上下文**：`gui.c.Context().Push(contextToPush, ...)`
-10. **首次渲染**：`gui.render()`
-
-### 5.4 初始上下文选择
-
-`initialContext()` 位于 [gui.go#L692-L713](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/gui.go#L692-L713)：
+`initialContext()` 位于 [pkg/gui/gui.go#L692-L713](pkg/gui/gui.go#L692-L713)：
 
 - 默认聚焦 `Files` 上下文
 - 如果有 `--filter` 参数，聚焦 `LocalCommits`
@@ -450,53 +671,9 @@ func (gui *Gui) Run(startArgs appTypes.StartArgs) error {
 
 ---
 
-## 6. 首次布局与界面进入
+## 7. 启动阶段：StartupStage 两阶段策略
 
-### 6.1 布局函数 layout()
-
-首次布局时会触发 `onInitialViewsCreation()` 回调，位于 [layout.go#L255-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/layout.go#L255-L280)：
-
-```go
-func (gui *Gui) onInitialViewsCreation() error {
-    // 1. 启动弹窗（首次使用介绍 / 破坏性变更说明）
-    if !gui.c.UserConfig().DisableStartupPopups {
-        storedPopupVersion := gui.c.GetAppState().StartupPopupVersion
-        if storedPopupVersion < StartupPopupVersion {
-            gui.showIntroPopupMessage()  // 新手引导
-        } else {
-            gui.showBreakingChangesMessage()  // 版本更新说明
-        }
-    }
-    
-    // 2. 保存当前版本号
-    gui.c.GetAppState().LastVersion = gui.Config.GetVersion()
-    gui.c.SaveAppStateAndLogError()
-    
-    // 3. 显示最近仓库菜单（如果是从最近仓库打开的）
-    if gui.showRecentRepos {
-        gui.helpers.Repos.CreateRecentReposMenu()
-        gui.showRecentRepos = false
-    }
-    
-    // 4. 后台检查更新
-    gui.helpers.Update.CheckForUpdateInBackground()
-    
-    // 5. 标记 intro 等待完成
-    gui.waitForIntro.Done()
-}
-```
-
-### 6.2 最近仓库菜单
-
-当 `showRecentRepos = true` 时（即从最近仓库列表打开时），会显示最近仓库菜单，让用户可以快速切换到其他最近使用的仓库。
-
-菜单创建由 `gui.helpers.Repos.CreateRecentReposMenu()` 完成。
-
----
-
-## 7. 启动阶段：StartupStage
-
-为了优化启动速度，Lazygit 采用两阶段启动策略，定义在 [common.go#L402-L408](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/types/common.go#L402-L408)：
+为了优化启动速度，Lazygit 采用两阶段启动策略，定义在 [pkg/gui/types/common.go#L402-L408](pkg/gui/types/common.go#L402-L408)：
 
 ```go
 type StartupStage int
@@ -509,7 +686,7 @@ const (
 
 ### 7.1 两阶段刷新策略
 
-`refreshReflogCommitsConsideringStartup()` 位于 [refresh_helper.go#L283-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L283-L296)：
+`refreshReflogCommitsConsideringStartup()` 位于 [pkg/gui/controllers/helpers/refresh_helper.go#L283-L296](pkg/gui/controllers/helpers/refresh_helper.go#L283-L296)：
 
 **INITIAL 阶段**：
 - 同步加载核心数据（文件、分支、提交等）
@@ -523,6 +700,8 @@ const (
 
 这样设计的目的是：reflog 数据是启动时的性能瓶颈（用于分支按最近使用排序），但不是首屏必须的，所以延后加载。
 
+该阶段值保存在 `GuiRepoState.StartupStage`（见 [pkg/gui/gui.go#L238](pkg/gui/gui.go#L238)），在 `resetState()` 创建新仓库状态时默认为 `INITIAL`。
+
 ---
 
 ## 8. 错误分支总结
@@ -533,20 +712,23 @@ const (
 
 | 错误场景 | 来源 |
 |---------|------|
-| --path 与 --work-tree/--git-dir 互斥 | entry_point.go |
-| 指定路径不是有效 Git 仓库 | entry_point.go |
-| 切换目录失败 | entry_point.go |
-| 无效 git-arg 参数 | entry_point.go |
-| 临时目录创建失败（权限等） | entry_point.go |
-| 配置初始化失败 | entry_point.go |
+| --path 与 --work-tree/--git-dir 互斥 | [pkg/app/entry_point.go#L58-L60](pkg/app/entry_point.go#L58-L60) |
+| 指定路径不是有效 Git 仓库 | [pkg/app/entry_point.go#L67-L69](pkg/app/entry_point.go#L67-L69) |
+| 切换目录失败 | [pkg/app/entry_point.go#L72-L75](pkg/app/entry_point.go#L72-L75) |
+| 无效 git-arg 参数 | [pkg/app/entry_point.go#L265-L268](pkg/app/entry_point.go#L265-L268) |
+| 临时目录创建失败（权限等） | [pkg/app/entry_point.go#L129-L136](pkg/app/entry_point.go#L129-L136) |
+| 配置初始化失败 | [pkg/app/entry_point.go#L139-L142](pkg/app/entry_point.go#L139-L142) |
 
-### 8.2 Git 相关错误
+### 8.2 Git 与仓库相关错误
 
 | 错误场景 | 处理方式 |
 |---------|----------|
 | Git 版本过低（< 2.32.0） | 已知错误，友好提示后退出 |
-| 不是 Git 仓库 | 进入 setupRepo 逻辑（提示创建/打开最近仓库/退出） |
-| 裸仓库 | 提示是否打开最近仓库，或退出 |
+| 不是 Git 仓库 + 无最近仓库 | 打印 "No recent repositories" 后 `os.Exit(1)` |
+| 裸仓库 + 用户选 n | `os.Exit(0)` |
+| 裸仓库 + 无最近仓库 | 打印 "No recent repositories" 后 `os.Exit(1)` |
+| NotARepository 配置为 quit | 打印错误后 `os.Exit(1)` |
+| NotARepository 配置非法 | 打印错误后 `os.Exit(1)` |
 | 工作目录不存在 | 已知错误，友好提示后退出 |
 
 ### 8.3 GUI 启动错误
@@ -563,9 +745,9 @@ const (
 ```
 发生错误
   ↓
-gui.RunAndHandleError()
+gui.RunAndHandleError() [pkg/gui/gui.go#L954-L983]
   ↓
-app.Run() 中的错误处理
+app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
   ├─ knownError? ──是──→ log.Fatal(友好消息)
   └─ 否 ──→ 记录堆栈 + log.Fatal(错误详情 + issue 链接)
 ```
@@ -579,23 +761,32 @@ app.Run() 中的错误处理
 3. **仓库路径预处理** → --path / --work-tree / --git-dir
 4. **配置初始化** → AppConfig、临时目录
 5. **App 实例化** → `NewApp()`
-   - Git 版本验证
+   - Git 版本验证（最低 2.32.0）
    - 仓库路径检测（git rev-parse）
-   - 仓库设置（非仓库/裸仓库/最近仓库）
-   - GUI 实例创建
+   - **setupRepo() 分支决策**：
+     - 正常仓库 → showRecentRepos=false
+     - 新建仓库 → showRecentRepos=false
+     - 从最近仓库打开 → showRecentRepos=true
+     - 裸仓库打开最近仓库 → showRecentRepos=true
+     - 无可用最近仓库/用户退出 → os.Exit
+   - GUI 实例创建（保存 showRecentRepos 标志）
 6. **GUI 运行** → `gui.Run()`
    - gocui 初始化
    - 视图创建
-   - 新仓库初始化（状态、控制器、快捷键）
-   - 首次上下文推入
-   - 首次渲染
-7. **首次布局** → `onInitialViewsCreation()`
-   - 启动弹窗（新手引导/更新说明）
-   - 最近仓库菜单（如果适用）
-   - 后台更新检查
-8. **主事件循环** → `MainLoop()`
+   - onNewRepo()：GitCommand、配置、状态、控制器、快捷键、推入初始上下文、首次 render
+   - 后台例程启动
+7. **首次布局（MainLoop 第一次循环）** → `layout()`
+   - Gate 1 `!ViewsSetup` → `onInitialViewsCreation()`
+     - 启动弹窗（新手引导/更新说明）
+     - **showRecentRepos==true → CreateRecentReposMenu() 弹出最近仓库菜单**
+     - 后台更新检查
+   - Gate 2 `!State.ViewsSetup` → `onInitialViewsCreationForRepo()`
+     - 视图排序
+     - 激活上下文
+     - **loadNewRepo()**：更新最近仓库列表 + Refresh 数据 + 更新窗口标题
+8. **主事件循环持续运行** → `MainLoop()`
    - 接收用户输入
-   - 数据刷新（两阶段启动）
+   - 数据刷新（INITIAL → COMPLETE 两阶段完成）
    - 界面渲染
 
 ---
@@ -604,14 +795,15 @@ app.Run() 中的错误处理
 
 | 文件 | 作用 |
 |------|------|
-| [main.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/main.go) | 程序入口 |
-| [pkg/app/entry_point.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/entry_point.go) | 启动入口、CLI 解析 |
-| [pkg/app/app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/app.go) | App 构造、仓库设置、版本验证 |
-| [pkg/app/errors.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/app/errors.go) | 已知错误映射 |
-| [pkg/commands/git_commands/repo_paths.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/commands/git_commands/repo_paths.go) | 仓库路径检测 |
-| [pkg/commands/git_commands/version.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/commands/git_commands/version.go) | Git 版本解析 |
-| [pkg/gui/gui.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/gui.go) | GUI 构造与运行 |
-| [pkg/gui/layout.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/layout.go) | 布局与首次视图创建 |
-| [pkg/gui/recent_repos_panel.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/recent_repos_panel.go) | 最近仓库管理 |
-| [pkg/gui/types/common.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/types/common.go) | 启动阶段定义 |
-| [pkg/gui/controllers/helpers/refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/40-lazygit/pkg/gui/controllers/helpers/refresh_helper.go) | 刷新与两阶段启动 |
+| [main.go](main.go) | 程序入口 |
+| [pkg/app/entry_point.go](pkg/app/entry_point.go) | 启动入口、CLI 解析 |
+| [pkg/app/app.go](pkg/app/app.go) | App 构造、setupRepo 仓库设置分支、Git 版本验证 |
+| [pkg/app/errors.go](pkg/app/errors.go) | 已知错误映射 |
+| [pkg/commands/git_commands/repo_paths.go](pkg/commands/git_commands/repo_paths.go) | 仓库路径检测（git rev-parse） |
+| [pkg/commands/git_commands/version.go](pkg/commands/git_commands/version.go) | Git 版本解析 |
+| [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState、两阶段启动 |
+| [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、onInitialViewsCreation（showRecentRepos 消费点）、onInitialViewsCreationForRepo |
+| [pkg/gui/recent_repos_panel.go](pkg/gui/recent_repos_panel.go) | 最近仓库列表管理 |
+| [pkg/gui/controllers/helpers/repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | CreateRecentReposMenu、DispatchSwitchToRepo（切换仓库） |
+| [pkg/gui/types/common.go](pkg/gui/types/common.go) | StartupStage 定义、IRepoStateAccessor |
+| [pkg/gui/controllers/helpers/refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go) | 刷新与两阶段启动逻辑 |
