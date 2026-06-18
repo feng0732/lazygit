@@ -39,9 +39,9 @@
 
 ### 2.1 入口 A：本地分支面板 (Local Branches)
 
-- **文件**: [branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/branches_controller.go#L134-L139)
+- **文件**: [pkg/gui/controllers/branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/branches_controller.go#L134-L139)
 - **快捷键**: `Config.Branches.MergeIntoCurrentBranch`
-- **处理函数**: [BranchesController.merge](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/branches_controller.go#L682-L685)
+- **处理函数**: [pkg/gui/controllers/branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/branches_controller.go#L682-L685)
 
 ```go
 func (self *BranchesController) merge() error {
@@ -53,9 +53,9 @@ func (self *BranchesController) merge() error {
 
 ### 2.2 入口 B：远端分支面板 (Remote Branches)
 
-- **文件**: [remote_branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/remote_branches_controller.go#L52-L58)
+- **文件**: [pkg/gui/controllers/remote_branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/remote_branches_controller.go#L52-L58)
 - **快捷键**: 同样是 `Config.Branches.MergeIntoCurrentBranch`
-- **处理函数**: [RemoteBranchesController.merge](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/remote_branches_controller.go#L139-L141)
+- **处理函数**: [pkg/gui/controllers/remote_branches_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/remote_branches_controller.go#L139-L141)
 
 ```go
 func (self *RemoteBranchesController) merge(selectedBranch *models.RemoteBranch) error {
@@ -68,7 +68,7 @@ func (self *RemoteBranchesController) merge(selectedBranch *models.RemoteBranch)
 
 ### 2.3 合并策略菜单（共享）
 
-两个入口都调用 [MergeAndRebaseHelper.MergeRefIntoCheckedOutBranch](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L375-L489)，弹出 4 种合并方式：
+两个入口都调用 [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L375-L489)，弹出 4 种合并方式：
 
 | 菜单项 | 快捷键 | Git 参数 |
 |--------|--------|----------|
@@ -83,7 +83,7 @@ func (self *RemoteBranchesController) merge(selectedBranch *models.RemoteBranch)
 
 最终调用 Git 命令层：
 
-- **文件**: [branch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/branch.go#L262-L286)
+- **文件**: [pkg/commands/git_commands/branch.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/branch.go#L262-L286)
 - **函数**: `BranchCommands.Merge(branchName string, variant MergeVariant)`
 
 ```bash
@@ -94,14 +94,14 @@ git merge --no-edit ${用户配置 Merging.Args} ${策略参数} ${分支ref}
 
 ### 2.5 命令执行后的结果检查
 
-Merge 返回后走 [CheckMergeOrRebase](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L168-L170)：
+Merge 返回后走 [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L168-L170)：
 
 1. 先 `Refresh()` 刷新文件视图
 2. 错误分类处理：
    - `"No changes - did you forget to use"` → 自动 `--skip`
    - `"The previous cherry-pick is now empty"` → 自动 `--skip`
    - `"No rebase in progress?"` → 静默忽略
-   - 命中 [isMergeConflictErr](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L142-L150) 的 7 种关键字之一 → 进入 `PromptForConflictHandling()`
+   - 命中 [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L142-L150) 的 7 种关键字之一 → 进入 `PromptForConflictHandling()`
 
 ---
 
@@ -111,7 +111,7 @@ Merge 返回后走 [CheckMergeOrRebase](file:///d:/fz/0601-2/solo-dogfeeding/cod
 
 ### 3.1 第一层：仓库级别 WorkingTreeState
 
-定义在 [working_tree_state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L9-L14)：
+定义在 [pkg/commands/models/working_tree_state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L9-L14)：
 
 ```go
 type WorkingTreeState struct {
@@ -126,37 +126,63 @@ type WorkingTreeState struct {
 
 通过检查 `.git` 目录下的锁文件判断（任何 UI 刷新都会调用）：
 
-- **文件**: [status.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L23-L83)
+- **文件**: [pkg/commands/git_commands/status.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L23-L83)
 - **函数**: `StatusCommands.WorkingTreeState()`
 
 | 状态 | 检测方式 |
 |------|----------|
 | `Rebasing` | `.git/rebase-merge/` 或 `.git/rebase-apply/` 目录存在 |
 | `Merging` | `.git/MERGE_HEAD` 文件存在 |
-| `CherryPicking` | `.git/CHERRY_PICK_HEAD` 文件存在且值不匹配 `rebase-merge/stopped-sha` 前缀 |
+| `CherryPicking` | `.git/CHERRY_PICK_HEAD` 文件存在，且不满足 "前缀匹配 rebase-merge/stopped-sha" 或 "stopped-sha 不存在" |
 | `Reverting` | `.git/REVERT_HEAD` 文件存在 |
 
-**CherryPick 的特殊排除逻辑（重点注意前缀方向）**：
-Git 历史上 rebase 用 cherry-pick 实现，rebase 中断时 `CHERRY_PICK_HEAD` 可能残留。代码在 [status.go:L71-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L71-L77) 中做如下处理：
+**CherryPick 的特殊排除逻辑（完整判定流程）**：
+Git 历史上 rebase 用 cherry-pick 实现，rebase 中断时 `CHERRY_PICK_HEAD` 可能残留。代码在 [pkg/commands/git_commands/status.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L49-L79) 中的完整判定流程：
 
-```go
-cherryPickHeadStr := strings.TrimSpace(string(cherryPickHead))  // 完整 SHA1（40 字符）
-stoppedShaStr := strings.TrimSpace(string(stoppedSha))          // 缩写 SHA1（通常 7-12 字符）
+```
+Step 1: 检查 CHERRY_PICK_HEAD 文件是否存在
+        ↓ 不存在 → return (false, nil)  [不是 cherry-pick]
+        ↓ 存在 → 继续
 
-// 检查 完整SHA1 是否以 缩写SHA1 为前缀
-if strings.HasPrefix(cherryPickHeadStr, stoppedShaStr) {
-    return false, nil  // 前缀匹配 → 是 rebase 残余，不是真正的 cherry-pick
-}
-return true, nil       // 前缀不匹配 → 是真正的 cherry-pick 冲突
+Step 2: 读取 CHERRY_PICK_HEAD 内容（完整 SHA1，40 字符）
+        ↓ 读取报错 → return (false, err)  [IO 错误]
+        ↓ 成功 → 继续
+
+Step 3: 读取 rebase-merge/stopped-sha（缩写 SHA1，7-12 字符）
+        ↓ 读取报错 → ⚠️ return (true, nil)  [默认是真正的 cherry-pick！]
+        ↓ 成功 → 继续
+
+Step 4: 前缀比较
+        if strings.HasPrefix(完整SHA, 缩写SHA) {
+            return (false, nil)   // 前缀匹配 → 是 rebase 残余
+        }
+        return (true, nil)        // 前缀不匹配 → 是真正的 cherry-pick
 ```
 
-**前缀比较方向**：`cherryPickHeadStr`（长的完整 SHA）作为被检查字符串，`stoppedShaStr`（短的缩写 SHA）作为前缀。方向不能反——因为缩写 SHA 永远不可能以 40 位完整 SHA 为前缀。
+**关键细节 #1 —— stopped-sha 读取失败的默认行为**：
+Step 3 读取 `rebase-merge/stopped-sha` 失败时（例如文件不存在、权限不足、磁盘 IO 错误），代码直接 `return true, nil`，**保守地判定为真正的 cherry-pick**。代码注释写着：
+> *"If we get an error we assume the file doesn't exist"*
 
-**其他三个状态无同类歧义**：`IsInRebase()`、`IsInMergeState()`、`IsInRevert()` 都是简单的文件/目录存在性检查，没有字符串前缀比较逻辑。只有 CherryPick 因为 Git 历史原因需要做这个特殊排除。
+这意味着：
+- 如果只是在一个普通的 cherry-pick 冲突（没有任何 rebase 目录），读取 stopped-sha 必然失败 → 正确判定为 cherry-pick ✅
+- 如果处于 rebase 状态但 stopped-sha 文件损坏/丢失 → 会误判为 cherry-pick（但这种边缘情况极罕见）
+
+**关键细节 #2 —— 只检查 rebase-merge，不检查 rebase-apply**：
+代码只尝试读取 `.git/rebase-merge/stopped-sha`，而不检查 `.git/rebase-apply/stopped-sha`。这是因为：
+- `rebase-merge` 目录对应交互式 rebase / merge-based rebase（现代默认方式）
+- `rebase-apply` 目录对应老式 patch-based rebase（`git rebase --apply`），通常不会产生 `CHERRY_PICK_HEAD` 残留
+
+**关键细节 #3 —— 前缀比较方向**：
+```go
+if strings.HasPrefix(cherryPickHeadStr, stoppedShaStr) {
+```
+`cherryPickHeadStr`（完整 40 位 SHA）作为被检查字符串，`stoppedShaStr`（缩写 7-12 位 SHA）作为前缀。方向不能反——因为缩写 SHA 永远不可能以 40 位完整 SHA 为前缀，反了会永远返回 false，把 rebase 残余全部误判为真正的 cherry-pick。
+
+**其他三个状态无同类歧义**：`IsInRebase()`、`IsInMergeState()`、`IsInRevert()` 都是简单的文件/目录存在性检查，没有字符串前缀比较逻辑和分支默认行为。只有 CherryPick 因为 Git 历史原因需要做这个特殊排除。
 
 #### 3.1.2 Effective State 优先级
 
-多状态并存（如 rebase 中途 cherry-pick 冲突）时，[Effective()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L45-L59) 决定当前 UI 展示哪个状态：
+多状态并存（如 rebase 中途 cherry-pick 冲突）时，[pkg/commands/models/working_tree_state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L45-L59) 决定当前 UI 展示哪个状态：
 
 **优先级**: `Reverting` > `CherryPicking` > `Merging` > `Rebasing`
 
@@ -166,12 +192,35 @@ return true, nil       // 前缀不匹配 → 是真正的 cherry-pick 冲突
 
 `git status --porcelain` 输出的双字符状态被解析为两个布尔字段。
 
-**两个字符的约定（避免歧义）**：
-- 第 1 位 = **X** = staged 侧（index / ours / HEAD 分支）
-- 第 2 位 = **Y** = unstaged 侧（working tree / theirs / MERGE_HEAD 分支）
-- `U` = unmerged（冲突）、`A` = added、`D` = deleted、`M` = modified
+#### 3.2.0 字符语义精确定义（对照 git status 官方文档）
 
-- **文件**: [file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L146-L163)
+**两个字符的位置约定（XY）**：
+- 第 1 位 **X** = staged 侧 = ours = HEAD 分支（当前所在分支）
+- 第 2 位 **Y** = unstaged 侧 = theirs = MERGE_HEAD / REBASE_HEAD 分支（被合并的分支）
+
+**unmerged 状态下的字符精确含义（来自 git status 官方文档）**：
+
+| 字符 | 在 unmerged 状态中的语义 |
+|------|------------------------|
+| `U` | **unmerged**（冲突，未合并）——不是 "updated" 也不是 "modified" |
+| `A` | added（新增/添加） |
+| `D` | deleted（删除） |
+
+**Git 官方 7 种 unmerged 状态的完整对照**：
+
+| shortStatus | Git 官方描述 | 精确含义 |
+|-------------|-------------|----------|
+| `DD` | unmerged, both deleted | 双方都删除了 |
+| `AU` | unmerged, added by us | **我们新增**，冲突（theirs 侧状态为 unmerged） |
+| `UD` | unmerged, deleted by them | **他们删除**，冲突（ours 侧状态为 unmerged） |
+| `UA` | unmerged, added by them | **他们新增**，冲突（ours 侧状态为 unmerged） |
+| `DU` | unmerged, deleted by us | **我们删除**，冲突（theirs 侧状态为 unmerged） |
+| `AA` | unmerged, both added | 双方都新增了 |
+| `UU` | unmerged, both modified | 双方都修改了 |
+
+> **U 的语义修正（重要！）**：我之前把 AU 写成 "我们新增、他们删除"，UA 写成 "我们删除、他们新增"——这是**不精确的**。U 在 unmerged 状态里的标准语义是 **"conflict / unmerged"**，不是 "deleted"。AU 中 Y 位的 U 只表示 theirs 侧处于未合并冲突状态，具体是删除/新增/修改要看另一位的 A/D 以及实际场景。
+
+- **文件**: [pkg/commands/models/file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L146-L163)
 - **函数**: `deriveStatusFields(shortStatus string)`
 
 ```go
@@ -179,36 +228,42 @@ hasInlineMergeConflicts := lo.Contains([]string{"UU", "AA"}, shortStatus)
 hasMergeConflicts := hasInlineMergeConflicts || lo.Contains([]string{"DD", "AU", "UA", "UD", "DU"}, shortStatus)
 ```
 
-| shortStatus | 含义（XY） | 字段标记 | 常见场景 |
-|-------------|-----------|----------|----------|
-| `UU` | 双方都修改（U=our, U=their） | `HasInlineMergeConflicts=true` | 同一行都改了，文件内有 `<<<<<<<` 标记 |
-| `AA` | 双方都新增（A=our, A=their） | `HasInlineMergeConflicts=true` | 两个分支都新增了同名不同内容的文件 |
-| `DD` | 双方都删除（D=our, D=their） | `HasMergeConflicts=true` | rename/rename 冲突的源文件 |
-| `AU` | **我们新增、他们删除**（A=our, U=their） | `HasMergeConflicts=true` | rename/rename 冲突的 ours 目标位置 |
-| `UA` | **我们删除、他们新增**（U=our, A=their） | `HasMergeConflicts=true` | rename/rename 冲突的 theirs 目标位置 |
-| `UD` | **我们修改、他们删除**（U=our, D=their） | `HasMergeConflicts=true` | 我们改了某文件，但 theirs 删了它 |
-| `DU` | **我们删除、他们修改**（D=our, U=their） | `HasMergeConflicts=true` | 我们删了某文件，但 theirs 改了它 |
-
-> **注意 AU/UA 方向**：我之前写的"AU=我们删他们加"是**反的**！正确的方向是 A 在第一位（ours 侧），U 在第二位（theirs 侧），所以 AU = ours added + theirs deleted/unmerged。
+| shortStatus | Git 官方含义（XY） | 字段标记 | 常见真实场景 |
+|-------------|-------------------|----------|-------------|
+| `UU` | unmerged, both modified | `HasInlineMergeConflicts=true` | 同一行都改了，文件内有 `<<<<<<<` 标记 |
+| `AA` | unmerged, both added | `HasInlineMergeConflicts=true` | 两个分支都新增了同名不同内容的文件，文件内有标记 |
+| `DD` | unmerged, both deleted | `HasMergeConflicts=true` | rename/rename 冲突的**源文件** |
+| `AU` | unmerged, added by us | `HasMergeConflicts=true` | rename/rename 冲突的**ours 目标位置**（我们把源文件重命名到了这里） |
+| `UA` | unmerged, added by them | `HasMergeConflicts=true` | rename/rename 冲突的**theirs 目标位置**（他们把源文件重命名到了这里） |
+| `UD` | unmerged, deleted by them | `HasMergeConflicts=true` | 我们修改了某文件，他们删除了它 |
+| `DU` | unmerged, deleted by us | `HasMergeConflicts=true` | 我们删除了某文件，他们修改了它 |
 
 #### 3.2.1 同类歧义：rename/rename 冲突的三文件组合
 
 `AU`/`UA`/`DD` 这三个状态通常**结伴出现**，是 rename/rename 冲突的完整信号（两个分支都把同一个源文件重命名到不同位置）：
 
-| 状态 | 角色 | 翻译描述 [english.go:L1194-L1198](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/i18n/english.go#L1194-L1198) |
+```
+源文件 old.go (DD, 双方都标记为删除)
+├─ ours 分支: old.go → ours_new.go  →  AU (added by us, conflict)
+└─ theirs 分支: old.go → theirs_new.go → UA (added by them, conflict)
+```
+
+| 状态 | 角色 | lazygit 翻译描述 [pkg/i18n/english.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/i18n/english.go#L1194-L1198) |
 |------|------|---------------------------------------------------------------------|
 | `DD` | 源文件 | "this file was moved or renamed both in current and incoming" |
 | `AU` | ours 的目标 | "destination of a move or rename in the current changes" |
 | `UA` | theirs 的目标 | "destination of a move or rename in the incoming changes" |
 
-在 [handleNonInlineConflict](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L730-L744) 中，代码根据不同状态给用户推荐不同的操作顺序：
-- `DD` → 只有删除选项（双方都删了，只能删）
+在 [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L730-L744) 中，代码根据不同状态给用户推荐不同的操作顺序：
+- `DD` → 只有删除选项（双方都删了源文件，只能删）
 - `DU`/`UD` → 删除在前、保留在后（删除是更常见的选择）
 - `AU`/`UA` → 保留在前、删除在后（保留更安全，概率 50/50）
 
+**注意 AU/UA 不是 rename 冲突的专属状态**：你也可能在非 rename 场景看到单独的 AU 或 UA（例如我们新增了一个新文件，但 theirs 里恰好有一个同名旧文件处于冲突状态）。只有当 `AU` + `UA` + `DD` 三个同时出现时，才是典型的 rename/rename 冲突。
+
 #### 3.2.2 同类歧义：Deleted 字段与冲突状态的重叠
 
-`Deleted` 字段在 [deriveStatusFields:L158](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L158) 中定义为：
+`Deleted` 字段在 [pkg/commands/models/file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L158) 中定义为：
 ```go
 Deleted := unstagedChange == "D" || stagedChange == "D"
 ```
@@ -223,7 +278,7 @@ Deleted := unstagedChange == "D" || stagedChange == "D"
 
 #### 3.3.1 扫描函数实现
 
-- **文件**: [find_conflicts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/find_conflicts.go#L88-L117)
+- **文件**: [pkg/gui/mergeconflicts/find_conflicts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/find_conflicts.go#L88-L117)
 - **函数**: `FileHasConflictMarkers(path string)`
 
 高效扫描（只查 `<<<<<<< ` 和 `>>>>>>> ` 前缀，不解析完整结构）：
@@ -234,7 +289,7 @@ if bytes.HasPrefix(line, CONFLICT_END_BYTES)   { return true, nil }
 
 #### 3.3.2 扫描触发点 #1：Stage/Unstage 保护性检查
 
-- **文件**: [file_node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/filetree/file_node.go#L49-L57)
+- **文件**: [pkg/gui/filetree/file_node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/filetree/file_node.go#L49-L57)
 - **函数**: `FileNode.GetHasInlineMergeConflicts()`
 - **触发时机**: 用户对包含冲突文件的目录执行 stage/unstage 时
 
@@ -250,7 +305,7 @@ func (self *FileNode) GetHasInlineMergeConflicts() bool {
 }
 ```
 
-在 [files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L467-L472) 中，如果此函数返回 true，会直接报错拦截：
+在 [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L467-L472) 中，如果此函数返回 true，会直接报错拦截：
 ```go
 if node.GetHasInlineMergeConflicts() {
     return errors.New(self.c.Tr.ErrStageDirWithInlineMergeConflicts)
@@ -260,7 +315,7 @@ if node.GetHasInlineMergeConflicts() {
 
 #### 3.3.3 扫描触发点 #2：自动 stage 已解决文件
 
-- **文件**: [refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L570-L603)
+- **文件**: [pkg/gui/controllers/helpers/refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L570-L603)
 - **函数**: `RefreshHelper.refreshStateFiles()`
 - **触发时机**: 每次 FILES 范围刷新（冲突 pick 后、焦点回到窗口、定时刷新等）
 - **前置开关**: 用户配置 `Git.AutoStageResolvedConflicts` 必须为 true
@@ -292,7 +347,7 @@ if self.c.UserConfig().Git.AutoStageResolvedConflicts {
 
 严格来说这不是 `FileHasConflictMarkers`，但同样会扫描文件内容，且触发更频繁：
 
-- **文件**: [files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L273-L282)
+- **文件**: [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L273-L282)
 - **函数**: `FilesController.GetOnRenderToMain()`
 - **触发时机**: 用户在 Files 面板上下移动光标选中带 `HasInlineMergeConflicts` 标记的文件时
 
@@ -315,7 +370,7 @@ if node.File != nil && node.File.HasInlineMergeConflicts {
 
 ### 4.1 冲突出现后的初始菜单
 
-刚执行 merge/rebase 检测到冲突时，调用 [PromptForConflictHandling()](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L184-L206)：
+刚执行 merge/rebase 检测到冲突时，调用 [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L184-L206)：
 
 ```
 ┌─ Found Conflicts ─────────────────────┐
@@ -326,7 +381,7 @@ if node.File != nil && node.File.HasInlineMergeConflicts {
 
 ### 4.2 Files 面板按 Enter：分歧点
 
-在 Files 面板选中冲突文件按 Enter，[EnterFile](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L674-L704) 分三条路径：
+在 Files 面板选中冲突文件按 Enter，[pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L674-L704) 分三条路径：
 
 ```go
 if file.HasInlineMergeConflicts {
@@ -340,16 +395,16 @@ if file.HasMergeConflicts {
 
 #### 4.2.1 路径 A：内联冲突编辑器 switchToMerge
 
-- **文件**: [files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L1098-L1105)
+- **文件**: [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L1098-L1105)
 
-调用 [MergeConflictsHelper.SwitchToMerge](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_conflicts_helper.go#L85-L98)：
+调用 [pkg/gui/controllers/helpers/merge_conflicts_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_conflicts_helper.go#L85-L98)：
 1. 读取文件内容 → `findConflicts()` 完整解析所有冲突块
 2. 若解析出冲突 → 将 `MergeConflictsContext` 压入上下文栈
 3. 渲染彩色冲突视图
 
 #### 4.2.2 路径 B：非内联冲突 handleNonInlineConflict
 
-- **文件**: [files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L706-L751)
+- **文件**: [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L706-L751)
 
 针对没有 `<<<<<<<` 标记的文件级冲突（DD/AU/UA/UD/DU），根据 shortStatus 动态生成菜单项：
 
@@ -366,7 +421,7 @@ if file.HasMergeConflicts {
 - **Keep File** → `git add <file>`（stage 当前工作树版本）
 - **Delete File** → `git rm <file>`（从工作树和 index 移除）
 
-主视图也会给这些状态渲染提示信息：`DU` 和 `UD` 还会附带 `git diff --base` 的输出，在 [files_controller.go:L299-L305](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L299-L305) 中：
+主视图也会给这些状态渲染提示信息：`DU` 和 `UD` 还会附带 `git diff --base` 的输出，在 [pkg/gui/controllers/files_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/files_controller.go#L299-L305) 中：
 - `DU`（我们删、他们改）→ 显示 "Incoming changes:"（因为 theirs 修改了，需要看改了什么再决定是否应用到别处）
 - `UD`（我们改、他们删）→ 显示 "Current changes:"（因为 ours 修改了，需要看改了什么再决定是否应用到别处）
 
@@ -374,7 +429,7 @@ if file.HasMergeConflicts {
 
 ### 4.3 MergeConflicts 控制器：核心逐行解决
 
-- **文件**: [merge_conflicts_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/merge_conflicts_controller.go#L28-L114)
+- **文件**: [pkg/gui/controllers/merge_conflicts_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/merge_conflicts_controller.go#L28-L114)
 
 #### 4.3.1 键绑定一览
 
@@ -393,8 +448,8 @@ if file.HasMergeConflicts {
 
 #### 4.3.2 冲突块解析与 Selection 模型
 
-- **文件**: [find_conflicts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/find_conflicts.go#L25-L58)
-- **文件**: [merge_conflict.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/merge_conflict.go)
+- **文件**: [pkg/gui/mergeconflicts/find_conflicts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/find_conflicts.go#L25-L58)
+- **文件**: [pkg/gui/mergeconflicts/merge_conflict.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/merge_conflict.go)
 
 每个 `mergeConflict` 记录 4 个行号：`start`（<<<<<<<）、`ancestor`（\|\|\|\|\|\|\|）、`target`（=======）、`end`（>>>>>>>）。
 
@@ -410,7 +465,7 @@ if file.HasMergeConflicts {
 
 #### 4.3.3 Undo 内容栈
 
-- **文件**: [state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/state.go#L15-L17)
+- **文件**: [pkg/gui/mergeconflicts/state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/mergeconflicts/state.go#L15-L17)
 
 `State.contents` 是字符串切片作为栈：
 ```
@@ -422,7 +477,7 @@ if file.HasMergeConflicts {
 
 ### 4.4 批量策略菜单（非逐行解决）
 
-- **文件**: [working_tree_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/working_tree_helper.go#L355-L417)
+- **文件**: [pkg/gui/controllers/helpers/working_tree_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/working_tree_helper.go#L355-L417)
 - **入口**: Files 面板按 `o`，或 MergeConflicts 视图按 `o`
 
 | 菜单项 | 快捷键 | 等价命令 |
@@ -442,7 +497,7 @@ if file.HasMergeConflicts {
 
 ### 5.1 起点：最后一个冲突在 MergeConflicts 视图内被解决
 
-- **文件**: [merge_conflicts_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/merge_conflicts_controller.go#L254-L266)
+- **文件**: [pkg/gui/controllers/merge_conflicts_controller.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/merge_conflicts_controller.go#L254-L266)
 
 ```go
 func (self *MergeConflictsController) pickSelection(selection mergeconflicts.Selection) error {
@@ -462,7 +517,7 @@ func (self *MergeConflictsController) onLastConflictResolved() {
 
 ### 5.2 关键枢纽：refreshStateFiles 中的 Continue 触发逻辑
 
-FILES 刷新最终走到 [RefreshHelper.refreshStateFiles](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L570-L619)。这个函数做了 3 件事：
+FILES 刷新最终走到 [pkg/gui/controllers/helpers/refresh_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/refresh_helper.go#L570-L619)。这个函数做了 3 件事：
 
 **步骤 1**（如果开了 AutoStageResolvedConflicts）：扫描所有 `HasInlineMergeConflicts` 的文件，用 `FileHasConflictMarkers()` 二次确认，无标记的自动 stage。**同时统计 `prevConflictFileCount`**（刷新 Model 之前存在多少冲突文件）。
 
@@ -486,7 +541,7 @@ if self.c.Git().Status.WorkingTreeState().Any()   // 仍处于 merge/rebase/... 
 
 ### 5.3 PromptToContinueRebase 确认框
 
-- **文件**: [merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L223-L263)
+- **文件**: [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L223-L263)
 
 ```
 ┌─ Continue ─────────────────────────────────────┐
@@ -502,7 +557,7 @@ if self.c.Git().Status.WorkingTreeState().Any()   // 仍处于 merge/rebase/... 
 
 ### 5.4 genericMergeCommand：统一的 continue/abort/skip 执行器
 
-- **文件**: [merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L74-L118)
+- **文件**: [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L74-L118)
 
 ```go
 func (self *MergeAndRebaseHelper) genericMergeCommand(command string) error {
@@ -529,7 +584,7 @@ func (self *MergeAndRebaseHelper) genericMergeCommand(command string) error {
 | rebase continue + 有 exec todo | 是 | exec 可能是耗时编译，用户想看终端输出 |
 | 其他所有情况（abort/skip 等） | 否 | 内嵌执行，用 GIT_EDITOR=lazygit 跳过编辑器 |
 
-实际 Git 命令执行在 [RebaseCommands.GenericMergeOrRebaseAction](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/rebase.go#L482-L503)：
+实际 Git 命令执行在 [pkg/commands/git_commands/rebase.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/rebase.go#L482-L503)：
 ```go
 func (self *RebaseCommands) GenericMergeOrRebaseAction(commandType string, command string) error {
     // 构造: git <commandType> --<command>
@@ -542,7 +597,7 @@ func (self *RebaseCommands) GenericMergeOrRebaseAction(commandType string, comma
 
 除了自动弹出的 Continue 提示，用户随时可通过菜单手动操作：
 
-- **文件**: [merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L39-L68)
+- **文件**: [pkg/gui/controllers/helpers/merge_and_rebase_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/gui/controllers/helpers/merge_and_rebase_helper.go#L39-L68)
 - **函数**: `CreateRebaseOptionsMenu()`
 
 菜单按当前 Effective State 动态生成：
@@ -683,41 +738,44 @@ RefreshHelper.refreshStateFiles()  ← 异步执行
 
 这是本次深度分析发现的所有容易理解错的地方，按"陷阱等级"排序：
 
-### 8.1 🟥 高危陷阱：CherryPick 前缀比较方向
+### 8.1 🟥 高危陷阱：CherryPick stopped-sha 读取失败的默认分支
 
-**代码位置**: [status.go:L71-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L71-L77)
+**代码位置**: [pkg/commands/git_commands/status.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/git_commands/status.go#L49-L79)
 
 ```go
-cherryPickHeadStr := strings.TrimSpace(string(cherryPickHead))  // 完整 SHA1 (40 chars)
-stoppedShaStr := strings.TrimSpace(string(stoppedSha))          // 缩写 SHA1 (7-12 chars)
-
-if strings.HasPrefix(cherryPickHeadStr, stoppedShaStr) {  // ✅ 正确方向
-    return false, nil  // 是 rebase 残余，不是真正的 cherry-pick
+stoppedSha, err := os.ReadFile(filepath.Join(self.repoPaths.WorktreeGitDirPath(), "rebase-merge", "stopped-sha"))
+if err != nil {
+    // If we get an error we assume the file doesn't exist
+    return true, nil   // ⚠️ 读取失败 → 默认判定为真正的 cherry-pick
 }
 ```
 
-**易错点**: 很容易写成 `strings.HasPrefix(stoppedShaStr, cherryPickHeadStr)`（前缀方向反了）。但因为完整 SHA 比缩写长，反了永远返回 false，会把 rebase 残余误判为真正的 cherry-pick，导致 UI 显示错误。
+**易错点 #1**：只检查 `rebase-merge/stopped-sha`，不检查 `rebase-apply/stopped-sha`。即只考虑现代 merge-based rebase，不考虑老式 patch-based rebase（`git rebase --apply`）。
 
-**为什么只有 CherryPick 需要？**：Git 历史上 rebase 用 cherry-pick 实现，rebase 中断时 `CHERRY_PICK_HEAD` 可能残留。其他三个状态（Rebasing/Merging/Reverting）都是简单的文件存在性检查，没有同类歧义。
+**易错点 #2**：读取失败（文件不存在、权限不足、磁盘错误）时直接 `return true`，即**宁杀错不放过**——把所有无法确认的情况都视为真正的 cherry-pick。只有在成功读取且前缀匹配时才判定为 rebase 残余。
+
+**还有**：前缀比较方向不能反（详见上文 3.1.1 节）。
 
 ---
 
-### 8.2 🟧 中危陷阱：shortStatus 的 XY 约定
+### 8.2 🟧 中危陷阱：U 在 unmerged 状态下的语义是 "conflict" 不是 "deleted"
 
-**代码位置**: [file.go:L146-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L146-L163)
+**代码位置**: [pkg/commands/models/file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L146-L163)
 
-**硬约定**:
-- 第 1 位 **X** = staged 侧 = ours = HEAD 分支
-- 第 2 位 **Y** = unstaged 侧 = theirs = MERGE_HEAD 分支
+**Git 官方 unmerged 语义对照**：
 
-**已修正的错误**（原文档写反了）：
+| shortStatus | Git 官方描述 | 精确语义 |
+|-------------|-------------|----------|
+| `AU` | unmerged, added by us | 我们新增了，冲突（U≠deleted） |
+| `UA` | unmerged, added by them | 他们新增了，冲突（U≠deleted） |
+| `UD` | unmerged, deleted by them | 他们删除了，冲突 |
+| `DU` | unmerged, deleted by us | 我们删除了，冲突 |
 
-| shortStatus | 原错误理解 | ✅ 正确理解 |
-|-------------|-----------|-----------|
-| `AU` | 我们删、他们加 | **我们加**（A=our）、**他们删**（U=their） |
-| `UA` | 他们删、我们加 | **我们删**（U=our）、**他们加**（A=their） |
+**已修正的错误**：之前把 AU 写成"我们新增、他们删除"，UA 写成"我们删除、他们新增"。
 
-**记忆法**: A/U/D 永远修饰它**所在位**代表的那一方。A 在第一位就是 ours added，A 在第二位就是 theirs added。
+> **U 的精确含义**：在 unmerged 状态下，U = **conflict / unmerged**，不是 deleted。AU 中 Y 位的 U 只表示 theirs 侧处于冲突未合并状态，具体做了什么要看另一位的 A/D 以及实际上下文。真正表示"删除"的是字符 D。
+
+**记忆法**: 字符只修饰它**所在位**代表的那一方。A 在第一位 = ours added；A 在第二位 = theirs added；D 在第一位 = ours deleted；D 在第二位 = theirs deleted。
 
 ---
 
@@ -737,7 +795,7 @@ if strings.HasPrefix(cherryPickHeadStr, stoppedShaStr) {  // ✅ 正确方向
 
 ### 8.4 🟨 低危陷阱：Deleted 字段与冲突状态可重叠
 
-**代码位置**: [file.go:L158](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L158)
+**代码位置**: [pkg/commands/models/file.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/file.go#L158)
 
 ```go
 Deleted := unstagedChange == "D" || stagedChange == "D"
@@ -757,7 +815,7 @@ Deleted := unstagedChange == "D" || stagedChange == "D"
 
 ### 8.5 🟨 低危陷阱：WorkingTreeState 多状态并存的优先级
 
-**代码位置**: [working_tree_state.go:L45-L59](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L45-L59)
+**代码位置**: [pkg/commands/models/working_tree_state.go](file:///d:/fz/0601-2/solo-dogfeeding/code/37-lazygit/pkg/commands/models/working_tree_state.go#L45-L59)
 
 `Effective()` 方法的优先级是硬编码的 if 顺序：
 
@@ -791,11 +849,14 @@ if self.Rebasing        { return REBASING }        // 最低
 
 | 模块 | 检查项 | 有无歧义 | 是否已修正 |
 |------|--------|----------|------------|
-| WorkingTreeState | IsInCherryPick 前缀比较 | ✅ 有（方向易错） | ✅ 已详细说明 |
-| WorkingTreeState | IsInRebase/Merge/Revert | ❌ 无 | — |
+| WorkingTreeState | IsInCherryPick stopped-sha 读取失败默认分支 | ✅ 有（默认 true，宁杀错不放过） | ✅ 已详细说明 |
+| WorkingTreeState | IsInCherryPick 只检查 rebase-merge 不检查 rebase-apply | ✅ 有（遗漏老式 apply rebase） | ✅ 已说明 |
+| WorkingTreeState | IsInCherryPick 前缀比较方向 | ✅ 有（方向易错） | ✅ 已详细说明 |
+| WorkingTreeState | IsInRebase/Merge/Revert | ❌ 无（纯文件存在性检查） | — |
 | WorkingTreeState | Effective() 优先级 | ✅ 有（if 顺序隐含优先级） | ✅ 已说明 |
-| File 状态 | shortStatus XY 约定 | ✅ 有（AU/UA 易写反） | ✅ 已修正并说明 |
-| File 状态 | Deleted 字段含义 | ✅ 有（可与冲突重叠） | ✅ 已说明 |
+| File 状态 | unmerged 状态下 U 的语义 | ✅ 有（易误读为 deleted，实际是 conflict） | ✅ 已对照 git 官方文档修正 |
+| File 状态 | shortStatus XY 位置约定 | ✅ 有（AU/UA 易写反） | ✅ 已修正并说明 |
+| File 状态 | Deleted 字段含义 | ✅ 有（可与冲突状态重叠） | ✅ 已说明 |
 | File 状态 | AU/UA/DD 组合语义 | ✅ 有（rename 冲突三胞胎） | ✅ 已说明 |
 | File 状态 | HasInlineMergeConflicts | ✅ 有（git status 可能滞后） | ✅ 已说明 |
 | mergeconflicts 包 | findConflicts 解析 | ❌ 无 | — |
