@@ -464,8 +464,10 @@ gui.Run()
          │
          └─ ② [Gate 2] !gui.State.ViewsSetup → onInitialViewsCreationForRepo()   后执行!
               ├─ onRepoViewReset() → 视图层级排序
-              ├─ 隐藏所有弹窗视图
-              ├─ 激活初始上下文
+              ├─ 遍历 popupViewNames() → 所有 popup 设为 Visible=false（含菜单!）
+              ├─ initialContext = Current() = 菜单  (场景 1：首次启动 A2a/B2a)
+              ├─ Activate(菜单) → 再次设 Visible=true  (场景 1)
+              │                         切换仓库时 Current()=主面板，菜单保持隐藏
               └─ loadNewRepo()
                    ├─ ★ updateRecentRepoList()  才把当前仓库移到 RecentRepos[0]
                    ├─ Refresh(ASYNC)             刷新所有数据
@@ -527,18 +529,37 @@ func NewGui(..., showRecentRepos bool, ...) (*Gui, error) {
 1. **创建 GitCommand**：`commands.NewGitCommand()` —— 这一步会再次执行 `git rev-parse` 获取仓库路径
 2. **重新加载仓库配置**：从仓库的 Git 目录和父目录加载 `.lazygit.yml`
 3. **用户配置加载后处理**：`onUserConfigLoaded()` —— 语言、主题、图标、快捷键等
-4. **resetState()**：初始化或复用仓库状态
-   - 初始化 `Model`（提交、文件、分支等数据模型，初始为空切片）
-   - 初始化 `Modes`（过滤、樱桃拣选、diff 等）
-   - 设置 `StartupStage = INITIAL`（两阶段启动的初始阶段）
-   - 创建上下文树（Files、Branches、Commits、Stash 等）
-   - 设置初始屏幕模式
+4. **resetState()**：初始化或复用仓库状态（见下）
 5. **重置控制器和快捷键**
 6. **设置焦点/超链接/搜索处理器**
 7. **推入初始上下文**：根据 `--filter`、`git-arg` 决定聚焦哪个面板（默认 Files）
 8. **首次 render()**：触发第一次界面绘制
 
 此时状态已经准备好，但 **`showRecentRepos` 标志仍未被使用**。
+
+#### resetState() 两条路径：新建状态 vs 复用已打开仓库
+
+`resetState()` 位于 [pkg/gui/gui.go#L568-L632](pkg/gui/gui.go#L568-L632)，根据 `RepoStateMap` 缓存决定是复用还是新建：
+
+| 维度 | 路径 A：复用已打开仓库 | 路径 B：新建状态 |
+|------|---------------------|-----------------|
+| 触发条件 | `RepoStateMap[Repo(worktreePath)] != nil` | 仓库未被缓存 |
+| State | 复用旧 `GuiRepoState` 指针 | 创建全新 `GuiRepoState` |
+| ViewsSetup | 强制重置为 `false`（Gate 2 重新触发） | 初始化即为 `false` |
+| Model/Modes | 保留上次切换前的数据（提交/文件等） | 全新空模型 |
+| ContextMgr | 复用旧 `ContextMgr`（保留上下文栈） | 创建全新 `ContextMgr`（空栈） |
+| Contexts | 复用旧上下文树 | 从 `gui.contextTree()` 创建全新树 |
+| CurrentPopupOpts | 设为 `nil`（防止残留 popup 卡住） | 默认为 `nil` |
+| WindowViewNameMap | 重新初始化（重置窗口布局） | 初始化 |
+| 返回的 contextToPush | `gui.c.Context().Current()`（旧栈顶！可能是任意上下文） | `initialContext()`（Files/Branches 等主面板） |
+| 缓存 | 已在 RepoStateMap 中 | 存入 `RepoStateMap[Repo(worktreePath)]` |
+
+**关键差异**：
+- **路径 A（复用）**：如果用户之前在该仓库打开了菜单、弹窗等再切换出去，`Current()` 返回的可能是菜单或其他弹窗上下文。但 `CurrentPopupOpts = nil` 确保弹窗不会自动重新弹出。
+- **路径 B（新建）**：`initialContext()` 只返回 Files、Branches、Commits、Stash 四个主面板之一（见 [pkg/gui/gui.go#L692-L713](pkg/gui/gui.go#L692-L713)），栈初始为空后推入主面板。
+
+**⚠️ 上下文管理器与 State 的绑定**：
+`gui.c.Context()` 返回的是 `gui.State.ContextMgr`（[pkg/gui/gui_common.go#L53-L55](pkg/gui/gui_common.go#L53-L55)）。这意味着切换仓库时，`gui.State` 被替换，上下文栈也随之切换。每个仓库拥有独立的上下文栈。
 
 ### 5.5 首次 layout()：Gate 执行顺序与 showRecentRepos 消费
 
@@ -645,19 +666,70 @@ func (gui *Gui) onInitialViewsCreationForRepo() error {
 }
 ```
 
-##### ⚠️ 菜单可见性完整链路（有代码依据）
+##### ⚠️ Gate 2 菜单可见性链路：区分两种场景
 
-当 `showRecentRepos=true` 时，菜单可见性经过以下精确步骤：
+Gate 2 中的"隐藏所有 popup + 激活当前上下文"组合，在不同场景下对菜单可见性的影响完全不同。代码注释也注明了这段隐藏逻辑"仅适用于切换仓库场景"（[pkg/gui/layout.go#L220](pkg/gui/layout.go#L220)）。
+
+---
+
+###### 场景 1：首次启动进入分支 A2a/B2a（showRecentRepos=true）
+
+此时 Gate 1 在同一次 layout() 调用中刚刚推入了菜单，栈顶 = 菜单。
 
 | 步骤 | 代码位置 | 操作 | 菜单可见性 |
 |------|---------|------|-----------|
-| 1 | [pkg/gui/menu_panel.go#L92](pkg/gui/menu_panel.go#L92) | `Context().Push(Menu)` → 调用 `Activate(Menu)` | - |
+| 1 | [pkg/gui/menu_panel.go#L92](pkg/gui/menu_panel.go#L92) | Gate 1: `Context().Push(Menu)` → 调用 `Activate(Menu)` | - |
 | 2 | [pkg/gui/context.go#L197](pkg/gui/context.go#L197) | `Activate()` 中 `v.Visible = true` | ✅ `true` |
-| 3 | [pkg/gui/layout.go#L221-L225](pkg/gui/layout.go#L221-L225) | Gate 2 遍历 `popupViewNames()`（菜单在其中，因为 Kind=`TEMPORARY_POPUP`），设 `view.Visible = false` | ❌ `false` |
-| 4 | [pkg/gui/layout.go#L228](pkg/gui/layout.go#L228) | `initialContext = Current()` → 返回栈顶 = 菜单 | - |
+| 3 | [pkg/gui/layout.go#L653-L658](pkg/gui/layout.go#L653-L658) | Gate 2: 遍历 `popupViewNames()`（菜单 Kind=`TEMPORARY_POPUP` 在列表中），设 `view.Visible = false` | ❌ `false` |
+| 4 | [pkg/gui/layout.go#L660](pkg/gui/layout.go#L660) | `initialContext = Current()` → 返回栈顶 = **菜单** | - |
 | 5 | [pkg/gui/context.go#L197](pkg/gui/context.go#L197) | `Activate(Menu)` 中再次 `v.Visible = true` | ✅ `true` |
 
-**结论**：菜单会被 Gate 2 的隐藏逻辑临时设为不可见，但随后的 `Activate(Menu)` 会立即将其重新设为可见。代码注释也注明了这段隐藏逻辑"仅适用于切换仓库场景"（[pkg/gui/layout.go#L220](pkg/gui/layout.go#L220)），切换仓库时上下文栈会被重置，`Current()` 不是菜单。
+**场景 1 结论**：菜单被 Gate 2 临时隐藏，但 `Current()` 是菜单，`Activate(Menu)` 立即恢复。菜单最终可见 ✅。
+
+---
+
+###### 场景 2：用户从菜单中选择其他仓库 → 切换仓库
+
+流程：`DispatchSwitchToRepo(path)` → `os.Chdir(path)` → `onNewRepo(StartArgs{}, NO_CONTEXT)`。
+
+`onNewRepo()` 中 `resetState()` 的执行：
+- **路径 A（复用目标仓库）**：`gui.State = 旧 State`，旧 `ContextMgr`，旧上下文栈；但 `CurrentPopupOpts = nil`；返回 `Current()`（旧栈顶，可能是之前离开时的上下文）
+- **路径 B（目标仓库新建）**：全新 `State`、全新 `ContextMgr`（空栈）；返回 `initialContext()`（Files/Branches 等主面板）
+
+随后 `onNewRepo()` 末尾执行（[pkg/gui/gui.go#L419-L429](pkg/gui/gui.go#L419-L429)）：
+```go
+if contextKey != context.NO_CONTEXT {
+    contextToPush = gui.c.ContextForKey(contextKey)  // 菜单选择时传 NO_CONTEXT，走 else
+}
+gui.c.Context().Push(contextToPush, types.OnFocusOpts{})  // 推入 Files 等主面板
+```
+
+推入主面板后，`Current() = 主面板上下文（Kind != POPUP）`。然后触发 Gate 2：
+
+| 步骤 | 代码位置 | 操作 | 原仓库的菜单 | 目标仓库的主面板 |
+|------|---------|------|-------------|-----------------|
+| 1 | [pkg/gui/repos_helper.go#L183](pkg/gui/repos_helper.go#L183) | `onNewRepo()` → `resetState()` → State 和 ContextMgr 切换为目标仓库 | State 已切换，菜单属于**原仓库的旧 ContextMgr**，不再被当前 State 引用 | 新栈已建立 |
+| 2 | [pkg/gui/gui.go#L429](pkg/gui/gui.go#L429) | `Push(Files/主面板)` 推入目标仓库的主面板 | - | 栈顶 = 主面板 |
+| 3 | [pkg/gui/layout.go#L653-L658](pkg/gui/layout.go#L653-L658) | Gate 2: 遍历 `popupViewNames()`（包括菜单视图名），设 `view.Visible = false` | 菜单视图对象仍在 gocui 中，但属于旧 State，被设为 `false` | 主面板不受影响 |
+| 4 | [pkg/gui/layout.go#L660](pkg/gui/layout.go#L660) | `initialContext = Current()` → 返回**目标仓库的主面板** | - | - |
+| 5 | [pkg/gui/context.go#L197](pkg/gui/context.go#L197) | `Activate(主面板)` → 设主面板视图 `Visible = true` | 菜单未被激活，保持 `false` | ✅ 主面板可见 |
+
+**场景 2 结论**：
+- 菜单所属的 ContextMgr 已被切换为目标仓库的 ContextMgr，菜单不再是当前上下文栈的一部分
+- Gate 2 的 `popupViewNames()` 遍历仍然会把菜单视图对象设为 `Visible=false`
+- `Current()` 返回的是目标仓库的主面板，`Activate(主面板)` 不会激活菜单
+- 菜单最终不可见 ✅（用户已切换到新仓库，菜单确实应该消失）
+- 代码注释"This only applies when we've just switched repos"的真实含义就是**场景 2**
+
+---
+
+**两个场景的根本差异**：
+| 差异点 | 场景 1（首次启动 A2a/B2a） | 场景 2（从菜单切换仓库） |
+|--------|--------------------------|------------------------|
+| State/ContextMgr | 同一个，未切换 | 从原仓库切换到目标仓库，完全不同的栈 |
+| `Current()` | 菜单（栈顶） | 目标仓库的主面板（Files 等） |
+| Gate 2 的 `Activate` 目标 | 菜单 → 恢复菜单可见 | 主面板 → 主面板可见，菜单不可见 |
+| 菜单最终状态 | ✅ 可见 | ❌ 不可见（符合预期） |
 
 `loadNewRepo()` 位于 [pkg/gui/gui.go#L1064-L1076](pkg/gui/gui.go#L1064-L1076)：
 
@@ -940,13 +1012,26 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
    - **Gate 2 `!State.ViewsSetup` → `onInitialViewsCreationForRepo()`（后执行）**
      - 视图排序（onRepoViewReset）
      - 遍历 `popupViewNames()`（含菜单）→ 设所有 popup `Visible=false`（菜单被临时隐藏）
-     - `initialContext = Current()` → 返回栈顶 = 菜单
+     - `initialContext = Current()` → 返回栈顶 = **菜单**（场景 1）
      - `Activate(Menu)` → 再次设 `v.Visible=true`，菜单恢复显示
      - **loadNewRepo()**：
        - `updateRecentRepoList()`：**才把当前仓库移到 RecentRepos[0]，去重并重排**
        - `Refresh(ASYNC)`：刷新数据
        - `UpdateWindowTitle()`：更新窗口标题
-8. **主事件循环持续运行** → `MainLoop()`
+8. **用户从菜单选择其他仓库 → DispatchSwitchToRepo()**（场景 2）
+   - `os.Chdir(path)` → 切换到目标目录
+   - `commands.VerifyInGitRepo()` → 验证目标确实是仓库
+   - **onNewRepo(StartArgs{}, NO_CONTEXT)**：
+     - `resetState()`：根据 RepoStateMap 缓存分支
+       - **路径 A（复用目标仓库）**：复用旧 State/ContextMgr，但 `ViewsSetup=false`，`CurrentPopupOpts=nil`，返回 `Current()`（旧栈顶）
+       - **路径 B（目标仓库新建）**：全新 State/ContextMgr（空栈），返回 `initialContext()`（Files 等主面板）
+     - `Push(contextToPush)` → 推入目标仓库的主面板上下文；`Current() = 主面板`
+   - **下次 layout() 触发 Gate 2（仅 `State.ViewsSetup=false`，Gate 1 已永久关闭）**
+     - 遍历 `popupViewNames()` → 含菜单视图名 → 设菜单 `Visible=false`（菜单属于旧仓库 State，已不在当前栈中）
+     - `initialContext = Current()` → **目标仓库的主面板**
+     - `Activate(主面板)` → 主面板可见，菜单不被激活保持隐藏
+     - `loadNewRepo()` → 把新切换的仓库移到 `RecentRepos[0]`
+9. **主事件循环持续运行** → `MainLoop()`
    - 接收用户输入
    - 数据刷新（INITIAL → COMPLETE 两阶段完成）
    - 界面渲染
@@ -963,7 +1048,8 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
 | [pkg/app/errors.go](pkg/app/errors.go) | 已知错误映射 |
 | [pkg/commands/git_commands/repo_paths.go](pkg/commands/git_commands/repo_paths.go) | 仓库路径检测（git rev-parse） |
 | [pkg/commands/git_commands/version.go](pkg/commands/git_commands/version.go) | Git 版本解析 |
-| [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState、两阶段启动、loadNewRepo |
+| [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState（新建/复用分支）、两阶段启动、loadNewRepo |
+| [pkg/gui/gui_common.go](pkg/gui/gui_common.go) | guiCommon.Context() → 返回 gui.State.ContextMgr（State 与上下文栈绑定） |
 | [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、Gate 执行顺序、onInitialViewsCreation、onInitialViewsCreationForRepo、popupViewNames |
 | [pkg/gui/menu_panel.go](pkg/gui/menu_panel.go) | createMenu（菜单创建与推入上下文栈） |
 | [pkg/gui/recent_repos_panel.go](pkg/gui/recent_repos_panel.go) | updateRecentRepoList（列表刷新逻辑）、newRecentReposList |
