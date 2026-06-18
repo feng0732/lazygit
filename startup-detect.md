@@ -43,8 +43,9 @@ gui.Run()
             │
             └─ [Gate 2] !State.ViewsSetup → onInitialViewsCreationForRepo()  [后执行!]
                  ├─ 视图层级排序
-                 ├─ 隐藏弹窗
-                 ├─ 激活初始上下文
+                 ├─ 遍历 popupViewNames() → 所有 popup 设为 Visible=false（含菜单!）
+                 ├─ initialContext = Current() = 菜单
+                 ├─ Activate(菜单) → 再次设 Visible=true
                  └─ loadNewRepo()
                       ├─ updateRecentRepoList()  ★ 才把当前仓库移到 RecentRepos[0]
                       ├─ Refresh(ASYNC)         ★ 刷新数据
@@ -629,10 +630,10 @@ func (gui *Gui) onInitialViewsCreationForRepo() error {
         return err
     }
     
-    // 隐藏所有弹窗视图（切换仓库场景需要）
+    // hide any popup views. This only applies when we've just switched repos
     for _, viewName := range gui.popupViewNames() {
-        view, _ := gui.g.View(viewName)
-        if view != nil {
+        view, err := gui.g.View(viewName)
+        if err == nil {
             view.Visible = false
         }
     }
@@ -644,7 +645,19 @@ func (gui *Gui) onInitialViewsCreationForRepo() error {
 }
 ```
 
-⚠️ **Gate 2 隐藏弹窗的影响**：`onInitialViewsCreationForRepo()` 会遍历 `popupViewNames()` 并将所有弹窗设为不可见。这意味着 Gate 1 中弹出的最近仓库菜单，如果是弹窗类型，**理论上可能被 Gate 2 立即隐藏**。但在实际中，`CreateRecentReposMenu()` 使用的是 `self.c.Menu(...)` 创建的菜单上下文，会推入上下文栈并重新渲染，不受此处隐藏逻辑影响。
+##### ⚠️ 菜单可见性完整链路（有代码依据）
+
+当 `showRecentRepos=true` 时，菜单可见性经过以下精确步骤：
+
+| 步骤 | 代码位置 | 操作 | 菜单可见性 |
+|------|---------|------|-----------|
+| 1 | [pkg/gui/menu_panel.go#L92](pkg/gui/menu_panel.go#L92) | `Context().Push(Menu)` → 调用 `Activate(Menu)` | - |
+| 2 | [pkg/gui/context.go#L197](pkg/gui/context.go#L197) | `Activate()` 中 `v.Visible = true` | ✅ `true` |
+| 3 | [pkg/gui/layout.go#L221-L225](pkg/gui/layout.go#L221-L225) | Gate 2 遍历 `popupViewNames()`（菜单在其中，因为 Kind=`TEMPORARY_POPUP`），设 `view.Visible = false` | ❌ `false` |
+| 4 | [pkg/gui/layout.go#L228](pkg/gui/layout.go#L228) | `initialContext = Current()` → 返回栈顶 = 菜单 | - |
+| 5 | [pkg/gui/context.go#L197](pkg/gui/context.go#L197) | `Activate(Menu)` 中再次 `v.Visible = true` | ✅ `true` |
+
+**结论**：菜单会被 Gate 2 的隐藏逻辑临时设为不可见，但随后的 `Activate(Menu)` 会立即将其重新设为可见。代码注释也注明了这段隐藏逻辑"仅适用于切换仓库场景"（[pkg/gui/layout.go#L220](pkg/gui/layout.go#L220)），切换仓库时上下文栈会被重置，`Current()` 不是菜单。
 
 `loadNewRepo()` 位于 [pkg/gui/gui.go#L1064-L1076](pkg/gui/gui.go#L1064-L1076)：
 
@@ -689,12 +702,39 @@ func (self *ReposHelper) CreateRecentReposMenu() error {
 - 当前被打开的仓库在上一次会话中的位置不确定，可能是 `[0]`，也可能是 `[1]`、`[2]` ...
 - 因此 `RecentRepos[1:]` 跳过的可能不是当前仓库，而是另一个仓库；同时当前仓库可能出现在菜单中
 
-#### 菜单构建流程
+#### 菜单上下文类型
 
-1. **读取列表**：`AppState.RecentRepos[1:]`（上一次会话的旧顺序，跳过第 0 位）
-2. **获取分支**：并发调用 `getCurrentBranch(path)` 获取每个仓库的当前分支名
-3. **构建菜单项**：三列展示（仓库名、分支名、完整路径）
-4. **显示菜单**：调用 `self.c.Menu(...)` 创建菜单上下文并推入栈
+菜单通过 `self.c.Menu(...)` 创建，底层调用 `gui.createMenu()`（[pkg/gui/menu_panel.go#L14](pkg/gui/menu_panel.go#L14)），最终推入 `MenuContext`。
+
+`MenuContext` 的 Kind 是 `TEMPORARY_POPUP`（[pkg/gui/context/menu_context.go#L38](pkg/gui/context/menu_context.go#L38)）：
+
+```go
+return &MenuContext{
+    // ...
+    ListContextTrait: &ListContextTrait{
+        Context: NewSimpleContext(NewBaseContext(NewBaseContextOpts{
+            // ...
+            Kind: types.TEMPORARY_POPUP,  // ← 菜单是 TEMPORARY_POPUP 类型
+            // ...
+        })),
+        // ...
+    },
+}
+```
+
+#### 菜单构建与推入流程
+
+`createMenu()` 的完整流程（[pkg/gui/menu_panel.go#L14-L94](pkg/gui/menu_panel.go#L14-L94)）：
+
+1. **追加 Cancel 菜单项**（除非 `HideCancel=true`）
+2. **处理菜单项键位冲突**：过滤掉与导航键（确认/返回/上下）冲突的快捷键
+3. **设置菜单数据**：`SetMenuItems()`、`SetPrompt()`、`SetSelection(0)`
+4. **设置菜单视图属性**：标题、颜色、Tooltip 可见
+5. **重置快捷键**：`resetKeybindings()` 注册菜单专属快捷键
+6. **更新菜单视图内容**：`PostRefreshUpdate(Menu)`
+7. **推入上下文栈**：`gui.c.Context().Push(gui.State.Contexts.Menu, types.OnFocusOpts{})`
+   - 这会调用 `Activate(Menu)`（[pkg/gui/context.go#L70](pkg/gui/context.go#L70)）
+   - `Activate()` 设置 `v.Visible = true`（[pkg/gui/context.go#L197](pkg/gui/context.go#L197)），菜单显示
 
 #### updateRecentRepoList() 的刷新逻辑
 
@@ -892,12 +932,16 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
 7. **首次布局（MainLoop 第一次循环）** → `layout()` 同一调用中 Gate 1 → Gate 2 顺序执行
    - **Gate 1 `!ViewsSetup` → `onInitialViewsCreation()`（先执行）**
      - 启动弹窗（新手引导/更新说明）
-     - **showRecentRepos==true → CreateRecentReposMenu()**：读取 `RecentRepos[1:]`
-       - ⚠️ 此时 RecentRepos 仍是旧列表顺序，当前仓库不一定在 [0] 位
-       - ⚠️ 菜单可能包含当前仓库自身，或误跳过另一个仓库
+     - **showRecentRepos==true → CreateRecentReposMenu()**：
+       - 创建菜单上下文（Kind=`TEMPORARY_POPUP`）
+       - `Context().Push(Menu)` → `Activate(Menu)` → 设 `v.Visible=true`，菜单显示
+       - 读取 `RecentRepos[1:]`（此时仍是旧列表顺序，当前仓库不一定在 [0] 位）
      - 后台更新检查
    - **Gate 2 `!State.ViewsSetup` → `onInitialViewsCreationForRepo()`（后执行）**
-     - 视图排序、隐藏弹窗视图、激活上下文
+     - 视图排序（onRepoViewReset）
+     - 遍历 `popupViewNames()`（含菜单）→ 设所有 popup `Visible=false`（菜单被临时隐藏）
+     - `initialContext = Current()` → 返回栈顶 = 菜单
+     - `Activate(Menu)` → 再次设 `v.Visible=true`，菜单恢复显示
      - **loadNewRepo()**：
        - `updateRecentRepoList()`：**才把当前仓库移到 RecentRepos[0]，去重并重排**
        - `Refresh(ASYNC)`：刷新数据
@@ -920,9 +964,12 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
 | [pkg/commands/git_commands/repo_paths.go](pkg/commands/git_commands/repo_paths.go) | 仓库路径检测（git rev-parse） |
 | [pkg/commands/git_commands/version.go](pkg/commands/git_commands/version.go) | Git 版本解析 |
 | [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState、两阶段启动、loadNewRepo |
-| [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、Gate 执行顺序、onInitialViewsCreation（showRecentRepos 消费点）、onInitialViewsCreationForRepo |
+| [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、Gate 执行顺序、onInitialViewsCreation、onInitialViewsCreationForRepo、popupViewNames |
+| [pkg/gui/menu_panel.go](pkg/gui/menu_panel.go) | createMenu（菜单创建与推入上下文栈） |
 | [pkg/gui/recent_repos_panel.go](pkg/gui/recent_repos_panel.go) | updateRecentRepoList（列表刷新逻辑）、newRecentReposList |
-| [pkg/gui/controllers/helpers/repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | CreateRecentReposMenu（菜单构建）、DispatchSwitchToRepo（切换仓库） |
+| [pkg/gui/context.go](pkg/gui/context.go) | ContextMgr、Push/Pop/Activate 上下文管理、视图可见性控制 |
+| [pkg/gui/context/menu_context.go](pkg/gui/context/menu_context.go) | MenuContext 定义（Kind=TEMPORARY_POPUP） |
+| [pkg/gui/controllers/helpers/repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | CreateRecentReposMenu、DispatchSwitchToRepo |
 | [pkg/gui/types/common.go](pkg/gui/types/common.go) | StartupStage 定义、IRepoStateAccessor |
 | [pkg/gui/controllers/helpers/refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go) | 刷新与两阶段启动逻辑 |
 | [pkg/config/app_config.go](pkg/config/app_config.go) | AppState 定义（RecentRepos 字段） |
