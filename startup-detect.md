@@ -14,10 +14,10 @@ NewApp()
   ├─ GetRepoPaths()        ── 获取仓库路径（可能失败）
   ├─ setupRepo()           ── 仓库设置（非仓库/裸仓库/最近仓库）
   │    │
-  │    ├─ 分支 A: 当前目录是正常仓库 ────────────────────────── showRecentRepos=false
-  │    ├─ 分支 B: 当前目录非仓库 + 创建了新仓库 ──────────────── showRecentRepos=false
-  │    ├─ 分支 C: 当前目录非仓库 + 打开了最近仓库 ────────────── showRecentRepos=true  (需弹出最近仓库菜单)
-  │    ├─ 分支 D: 裸仓库 + 打开了最近仓库 ───────────────────── showRecentRepos=true  (需弹出最近仓库菜单)
+  │    ├─ 分支 A1: 当前目录非仓库 + 创建了新仓库 ─────────────── showRecentRepos=false
+  │    ├─ 分支 A2a: 当前目录非仓库 + os.Chdir 到最近仓库 ───── showRecentRepos=true  (RecentRepos 列表顺序未变!)
+  │    ├─ 分支 B2a: 裸仓库 + os.Chdir 到最近仓库 ───────────── showRecentRepos=true  (RecentRepos 列表顺序未变!)
+  │    ├─ 分支 C: 当前目录是正常仓库 ───────────────────────── showRecentRepos=false
   │    └─ 分支 E: GIT_DIR 环境变量已设置 ───────────────────── showRecentRepos=false
   │
   └─ gui.NewGui(showRecentRepos)  ── 创建 GUI 实例，保存标志
@@ -32,16 +32,23 @@ gui.Run()
   ├─ onNewRepo()           ── 新仓库初始化（状态、控制器、快捷键）
   └─ MainLoop()            ── 进入事件主循环
        │
-       └─ 首次 layout() 调用
-            ├─ !ViewsSetup → onInitialViewsCreation()
+       └─ 首次 layout() 调用 [pkg/gui/layout.go#L155-L171]
+            │
+            ├─ [Gate 1] !ViewsSetup → onInitialViewsCreation()  [先执行!]
             │    ├─ [可选] 启动弹窗（新手引导/更新说明）
-            │    ├─ [条件] showRecentRepos==true → CreateRecentReposMenu() 弹出菜单
-            │    └─ 标记 waitForIntro.Done()
-            └─ !State.ViewsSetup → onInitialViewsCreationForRepo()
+            │    ├─ [条件] showRecentRepos==true → CreateRecentReposMenu()
+            │    │     └─ 读取 AppState.RecentRepos[1:]  ★ 此时列表尚未刷新!
+            │    │        当前仓库可能不在 [0] 位，菜单可能包含当前仓库或遗漏
+            │    └─ 标记 waitForIntro.Done() + ViewsSetup=true
+            │
+            └─ [Gate 2] !State.ViewsSetup → onInitialViewsCreationForRepo()  [后执行!]
                  ├─ 视图层级排序
                  ├─ 隐藏弹窗
                  ├─ 激活初始上下文
-                 └─ loadNewRepo() → 更新最近仓库列表 + 刷新数据
+                 └─ loadNewRepo()
+                      ├─ updateRecentRepoList()  ★ 才把当前仓库移到 RecentRepos[0]
+                      ├─ Refresh(ASYNC)         ★ 刷新数据
+                      └─ UpdateWindowTitle()
 ```
 
 ---
@@ -326,14 +333,16 @@ return false, nil  // 新建的仓库，不显示最近仓库菜单
 
 调用 `openRecentRepo(app)`（见 [pkg/app/app.go#L171-L192](pkg/app/app.go#L171-L192)）：
 
-1. 遍历 `app.Config.GetAppState().RecentRepos` 列表
+1. 遍历 `app.Config.GetAppState().RecentRepos` 列表（上一次会话保存的顺序）
 2. 检查每个目录是否含 `.git` 目录
-3. 尝试 `os.Chdir()` 切换到该目录
+3. 尝试 `os.Chdir()` 切换到该目录（仅切换工作目录）
 4. 加载 direnv 环境
 5. 成功则返回 `true`，否则继续下一个
 
+⚠️ **关键点**：`openRecentRepo()` 只执行 `os.Chdir()`，**不会修改 `RecentRepos` 列表的顺序或内容**。当前被选中的仓库在列表中的位置保持不变（不一定在第 0 位）。`RecentRepos` 列表的刷新和重排要等到 GUI 启动后 `updateRecentRepoList()` 才会发生。
+
 结果：
-- **分支 A2a：成功打开最近仓库** → 返回 `(true, nil)`，`showRecentRepos=true`
+- **分支 A2a：成功打开最近仓库** → 返回 `(true, nil)`，`showRecentRepos=true`，RecentRepos 列表原样保留
 - **分支 A2b：所有最近仓库都无法打开** → 打印 "No recent repositories" 后 `os.Exit(1)`
 
 #### 主分支 B：是裸仓库（repoPaths.IsBareRepo() == true）
@@ -349,7 +358,7 @@ if repoPaths.IsBareRepo() {
     
     // 分支 B2: 用户选 y，尝试打开最近仓库
     if openRecentRepo(app) {
-        return true, nil   // 分支 B2a: 成功 → showRecentRepos=true
+        return true, nil   // 分支 B2a: 成功 → showRecentRepos=true, RecentRepos 列表原样保留
     }
     
     // 分支 B2b: 无可用最近仓库
@@ -368,16 +377,16 @@ return false, nil  // 分支 C: 正常仓库，不显示最近仓库菜单
 
 #### setupRepo() 全部分支汇总
 
-| 分支 | 场景 | showRecentRepos | 后续行为 |
-|------|------|-----------------|----------|
-| A1 | 非仓库 → 创建了新仓库 | `false` | 正常进入 GUI |
-| A2a | 非仓库 → 成功打开最近仓库 | `true` | GUI 启动后自动弹出最近仓库菜单 |
-| A2b | 非仓库 → 无可用最近仓库 | - | `os.Exit(1)` |
-| B1 | 裸仓库 → 用户选 n | - | `os.Exit(0)` |
-| B2a | 裸仓库 → 成功打开最近仓库 | `true` | GUI 启动后自动弹出最近仓库菜单 |
-| B2b | 裸仓库 → 无可用最近仓库 | - | `os.Exit(1)` |
-| C | 正常非裸仓库 | `false` | 正常进入 GUI |
-| E | GIT_DIR 已指定 | `false` | 正常进入 GUI |
+| 分支 | 场景 | showRecentRepos | RecentRepos 列表状态 | 后续行为 |
+|------|------|-----------------|---------------------|----------|
+| A1 | 非仓库 → 创建了新仓库 | `false` | 上一次会话的旧列表（当前仓库未被加入） | 正常进入 GUI，Gate 2 中 updateRecentRepoList() 会追加当前仓库到首位 |
+| A2a | 非仓库 → os.Chdir 到最近仓库 | `true` | 上一次会话的旧列表（当前仓库位置不变，不一定在 [0] 位） | Gate 1 弹出菜单（读取旧列表 [1:]）；Gate 2 中 updateRecentRepoList() 把当前仓库移到首位 |
+| A2b | 非仓库 → 无可用最近仓库 | - | - | `os.Exit(1)` |
+| B1 | 裸仓库 → 用户选 n | - | - | `os.Exit(0)` |
+| B2a | 裸仓库 → os.Chdir 到最近仓库 | `true` | 上一次会话的旧列表（当前仓库位置不变，不一定在 [0] 位） | Gate 1 弹出菜单（读取旧列表 [1:]）；Gate 2 中 updateRecentRepoList() 把当前仓库移到首位 |
+| B2b | 裸仓库 → 无可用最近仓库 | - | - | `os.Exit(1)` |
+| C | 正常非裸仓库 | `false` | 上一次会话的旧列表（当前仓库可能已在 [0] 位或其他位置） | 正常进入 GUI，Gate 2 中 updateRecentRepoList() 确保当前仓库在首位 |
+| E | GIT_DIR 已指定 | `false` | 上一次会话的旧列表 | 正常进入 GUI |
 
 ---
 
@@ -418,7 +427,7 @@ if err != nil {
 
 ```
 setupRepo() 返回 (showRecentRepos, err)
-    │
+    │  [RecentRepos 列表 = 上一次会话保存的原样，当前仓库不一定在 [0] 位]
     ▼
 NewApp() 中 gui.NewGui(..., showRecentRepos, ...)
     │  Gui 结构体保存 showRecentRepos 字段
@@ -438,22 +447,42 @@ gui.Run()
          │
          ▼
     首次 layout() 调用（由 MainLoop 的第一次事件循环触发）
+         │  [pkg/gui/layout.go#L155-L171]
+         │  ★ Gate 1 和 Gate 2 在同一个 layout() 调用中顺序执行
          │
-         ├─ [Gate 1] !gui.ViewsSetup → onInitialViewsCreation()
+         ├─ ① [Gate 1] !gui.ViewsSetup → onInitialViewsCreation()   先执行!
          │    ├─ 启动弹窗（首次用户引导 / 版本更新说明）
          │    ├─ 保存当前版本号到 AppState
-         │    ├─ ★ 关键检查: showRecentRepos==true → CreateRecentReposMenu()
+         │    ├─ ★ showRecentRepos==true → CreateRecentReposMenu()
+         │    │     └─ 读取 AppState.RecentRepos[1:]
+         │    │        ★★★ 此时列表尚未刷新! 当前仓库可能不在 [0] 位 ★★★
+         │    │        可能出现：当前仓库出现在菜单中，或应显示的仓库被误跳过
          │    ├─ 后台检查更新
          │    ├─ waitForIntro.Done()
          │    └─ gui.ViewsSetup = true  (Gate 1 关闭)
          │
-         └─ [Gate 2] !gui.State.ViewsSetup → onInitialViewsCreationForRepo()
+         └─ ② [Gate 2] !gui.State.ViewsSetup → onInitialViewsCreationForRepo()   后执行!
               ├─ onRepoViewReset() → 视图层级排序
               ├─ 隐藏所有弹窗视图
               ├─ 激活初始上下文
-              ├─ loadNewRepo() → updateRecentRepoList() + Refresh + 更新窗口标题
+              └─ loadNewRepo()
+                   ├─ ★ updateRecentRepoList()  才把当前仓库移到 RecentRepos[0]
+                   ├─ Refresh(ASYNC)             刷新所有数据
+                   └─ UpdateWindowTitle()
               └─ gui.State.ViewsSetup = true  (Gate 2 关闭)
 ```
+
+#### 时序问题总结
+
+**问题场景**（分支 A2a / B2a）：
+1. `openRecentRepo()` 只是 `os.Chdir()` 切换到最近仓库，`RecentRepos` 列表保持旧顺序
+2. Gate 1 先执行：`CreateRecentReposMenu()` 读取 `RecentRepos[1:]`（旧顺序，假设跳过"旧的第 0 位"仓库）
+3. Gate 2 后执行：`updateRecentRepoList()` 才把当前仓库移到 `RecentRepos[0]`
+
+**可能的影响**：
+- 如果当前仓库在上一次会话中不在 `[0]` 位，Gate 1 弹出的菜单可能包含当前仓库自身（因为被当作 [1:] 中的一员）
+- 如果上一次会话中 `[0]` 位是另一个仓库，那个仓库会被错误地从菜单中隐藏（被 `[1:]` 跳过）
+- 但菜单一旦弹出后不会随 `updateRecentRepoList()` 自动更新，用户看到的就是旧数据
 
 ### 5.2 NewGui()：showRecentRepos 标志的保存
 
@@ -510,11 +539,27 @@ func NewGui(..., showRecentRepos bool, ...) (*Gui, error) {
 
 此时状态已经准备好，但 **`showRecentRepos` 标志仍未被使用**。
 
-### 5.5 首次 layout()：Gate 机制与 showRecentRepos 消费
+### 5.5 首次 layout()：Gate 执行顺序与 showRecentRepos 消费
 
 `layout()` 函数位于 [pkg/gui/layout.go#L13-L207](pkg/gui/layout.go#L13-L207)，由 gocui 的主循环在每次重绘时调用。
 
-使用了两个 Gate 标志来确保初始化逻辑只执行一次：
+两个 Gate 在**同一个 `layout()` 调用中顺序执行**，Gate 1 先、Gate 2 后（见 [pkg/gui/layout.go#L155-L171](pkg/gui/layout.go#L155-L171)）：
+
+```
+layout()
+  │
+  ├─ if !gui.ViewsSetup {            // Gate 1：总是先判断
+  │     onInitialViewsCreation()     //   → CreateRecentReposMenu() 读取旧列表
+  │     gui.ViewsSetup = true
+  │  }
+  │
+  └─ if !gui.State.ViewsSetup {      // Gate 2：总是后判断
+        onInitialViewsCreationForRepo()
+          → loadNewRepo()
+            → updateRecentRepoList() //   → 才刷新列表顺序
+        gui.State.ViewsSetup = true
+    }
+```
 
 #### Gate 1：`gui.ViewsSetup`（全局视图级初始化）
 
@@ -563,7 +608,7 @@ func (gui *Gui) onInitialViewsCreation() error {
 }
 ```
 
-**衔接意义**：从 `setupRepo()` 返回的 `showRecentRepos=true` 标志，经过 `NewGui()` 保存、`gui.Run()` 透传，最终在首次布局时触发 `CreateRecentReposMenu()`，向用户弹出最近仓库的选择菜单。
+⚠️ **时序关键点**：`onInitialViewsCreation()` 执行时，`RecentRepos` 列表尚未被刷新（刷新发生在随后的 Gate 2 中）。此时 `CreateRecentReposMenu()` 读取到的是**上一次会话保存的原始顺序**。
 
 #### Gate 2：`gui.State.ViewsSetup`（仓库级视图初始化）
 
@@ -595,15 +640,17 @@ func (gui *Gui) onInitialViewsCreationForRepo() error {
     initialContext := gui.c.Context().Current()
     gui.c.Context().Activate(initialContext, types.OnFocusOpts{})
     
-    return gui.loadNewRepo()  // ★ 数据加载入口
+    return gui.loadNewRepo()  // ★ 数据加载入口，包含 updateRecentRepoList()
 }
 ```
+
+⚠️ **Gate 2 隐藏弹窗的影响**：`onInitialViewsCreationForRepo()` 会遍历 `popupViewNames()` 并将所有弹窗设为不可见。这意味着 Gate 1 中弹出的最近仓库菜单，如果是弹窗类型，**理论上可能被 Gate 2 立即隐藏**。但在实际中，`CreateRecentReposMenu()` 使用的是 `self.c.Menu(...)` 创建的菜单上下文，会推入上下文栈并重新渲染，不受此处隐藏逻辑影响。
 
 `loadNewRepo()` 位于 [pkg/gui/gui.go#L1064-L1076](pkg/gui/gui.go#L1064-L1076)：
 
 ```go
 func (gui *Gui) loadNewRepo() error {
-    if err := gui.updateRecentRepoList(); err != nil {  // 将当前仓库加入最近仓库列表（首位）
+    if err := gui.updateRecentRepoList(); err != nil {  // ★ 将当前仓库加入最近仓库列表首位
         return err
     }
     
@@ -616,14 +663,73 @@ func (gui *Gui) loadNewRepo() error {
 }
 ```
 
+此时 `updateRecentRepoList()` 才真正把当前仓库移到 `RecentRepos[0]`，但 Gate 1 中弹出的菜单已经使用了旧数据。
+
 ### 5.6 CreateRecentReposMenu()：最近仓库菜单
 
-当 `showRecentRepos=true` 时调用，位于 [pkg/gui/controllers/helpers/repos_helper.go#L98-L142](pkg/gui/controllers/helpers/repos_helper.go#L98-L142)：
+当 `showRecentRepos=true` 时调用，位于 [pkg/gui/controllers/helpers/repos_helper.go#L98-L142](pkg/gui/controllers/helpers/repos_helper.go#L98-L142)。
 
-1. 从 `AppState.RecentRepos[1:]` 获取除当前仓库外的最近仓库（当前仓库是列表首位）
-2. 并发获取每个仓库的当前分支名
-3. 构建菜单项（仓库名、分支、路径三列）
-4. 调用 `self.c.Menu(...)` 显示菜单
+#### 菜单数据来源
+
+```go
+func (self *ReposHelper) CreateRecentReposMenu() error {
+    // we'll show an empty panel if there are no recent repos
+    recentRepoPaths := []string{}
+    if len(self.c.GetAppState().RecentRepos) > 0 {
+        // we skip the first one because we're currently in it
+        recentRepoPaths = self.c.GetAppState().RecentRepos[1:]  // ★ 假设 [0] 是当前仓库
+    }
+    // ...
+}
+```
+
+**⚠️ 关键问题**：代码注释假设 `RecentRepos[0]` 是当前仓库，因此用 `[1:]` 跳过。但实际上：
+
+- 当 `showRecentRepos=true` 时（分支 A2a/B2a），`openRecentRepo()` 仅执行了 `os.Chdir()`，**并未修改 `RecentRepos` 列表顺序**
+- 当前被打开的仓库在上一次会话中的位置不确定，可能是 `[0]`，也可能是 `[1]`、`[2]` ...
+- 因此 `RecentRepos[1:]` 跳过的可能不是当前仓库，而是另一个仓库；同时当前仓库可能出现在菜单中
+
+#### 菜单构建流程
+
+1. **读取列表**：`AppState.RecentRepos[1:]`（上一次会话的旧顺序，跳过第 0 位）
+2. **获取分支**：并发调用 `getCurrentBranch(path)` 获取每个仓库的当前分支名
+3. **构建菜单项**：三列展示（仓库名、分支名、完整路径）
+4. **显示菜单**：调用 `self.c.Menu(...)` 创建菜单上下文并推入栈
+
+#### updateRecentRepoList() 的刷新逻辑
+
+列表刷新发生在 Gate 2，见 [pkg/gui/recent_repos_panel.go#L10-L43](pkg/gui/recent_repos_panel.go#L10-L43)：
+
+```go
+func (gui *Gui) updateRecentRepoList() error {
+    if gui.git.Status.IsBareRepo() {
+        return nil  // 裸仓库不加入最近列表
+    }
+    
+    recentRepos := gui.c.GetAppState().RecentRepos  // 旧列表
+    currentRepo, _ := os.Getwd()
+    recentRepos = newRecentReposList(recentRepos, currentRepo)  // 重排
+    gui.c.GetAppState().RecentRepos = recentRepos
+    return gui.c.SaveAppState()
+}
+
+func newRecentReposList(recentRepos []string, currentRepo string) []string {
+    newRepos := []string{currentRepo}  // 当前仓库强制放到 [0]
+    for _, repo := range recentRepos {
+        if repo != currentRepo {                          // 去重
+            if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+                continue                                   // 过滤已不存在的仓库
+            }
+            newRepos = append(newRepos, repo)              // 保留其余顺序
+        }
+    }
+    return newRepos
+}
+```
+
+刷新后 `RecentRepos[0]` 确实是当前仓库，但刷新发生在菜单弹出之后。
+
+#### 用户选择仓库后的切换流程
 
 用户选择某个仓库时，触发 `OnPress` → `DispatchSwitchToRepo(path, context.NO_CONTEXT)`：
 
@@ -640,7 +746,16 @@ func (self *ReposHelper) DispatchSwitchToRepo(path string, contextKey types.Cont
 }
 ```
 
-切换仓库时会再次调用 `onNewRepo()` → 重置 `State.ViewsSetup = false` → 下次 layout 时触发 Gate 2，完成新仓库的视图初始化和数据加载。
+切换仓库时会再次调用 `onNewRepo()` → 重置 `State.ViewsSetup = false` → 下次 layout 时触发 Gate 2，完成新仓库的视图初始化和数据加载（包括再次调用 `updateRecentRepoList()` 将新切换的仓库移到 `[0]` 位）。
+
+#### 列表来源与刷新时序对比表
+
+| 阶段 | 位置 | RecentRepos 内容 | 当前仓库是否在 [0] |
+|------|------|-----------------|-------------------|
+| setupRepo() 前 | - | 上一次会话保存的列表 | 否（还没选仓库） |
+| openRecentRepo() 后 | [pkg/app/app.go#L171-L192](pkg/app/app.go#L171-L192) | 上一次会话保存的列表（未修改） | 不一定（取决于上一次会话） |
+| Gate 1: CreateRecentReposMenu() | [pkg/gui/controllers/helpers/repos_helper.go#L98-L142](pkg/gui/controllers/helpers/repos_helper.go#L98-L142) | 上一次会话保存的列表（未修改） | 不一定 |
+| Gate 2: updateRecentRepoList() | [pkg/gui/recent_repos_panel.go#L10-L43](pkg/gui/recent_repos_panel.go#L10-L43) | 当前仓库在 [0]，其余去重排序 | ✅ 是 |
 
 ---
 
@@ -764,26 +879,29 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
    - Git 版本验证（最低 2.32.0）
    - 仓库路径检测（git rev-parse）
    - **setupRepo() 分支决策**：
-     - 正常仓库 → showRecentRepos=false
-     - 新建仓库 → showRecentRepos=false
-     - 从最近仓库打开 → showRecentRepos=true
-     - 裸仓库打开最近仓库 → showRecentRepos=true
+     - 正常仓库 → showRecentRepos=false, RecentRepos 保持旧列表
+     - 新建仓库 → showRecentRepos=false, RecentRepos 保持旧列表
+     - 从最近仓库打开（A2a/B2a）→ showRecentRepos=true, **RecentRepos 列表顺序不变（仅 os.Chdir）**
      - 无可用最近仓库/用户退出 → os.Exit
-   - GUI 实例创建（保存 showRecentRepos 标志）
+   - GUI 实例创建（保存 showRecentRepos 标志，RecentRepos 仍为旧列表）
 6. **GUI 运行** → `gui.Run()`
    - gocui 初始化
    - 视图创建
    - onNewRepo()：GitCommand、配置、状态、控制器、快捷键、推入初始上下文、首次 render
    - 后台例程启动
-7. **首次布局（MainLoop 第一次循环）** → `layout()`
-   - Gate 1 `!ViewsSetup` → `onInitialViewsCreation()`
+7. **首次布局（MainLoop 第一次循环）** → `layout()` 同一调用中 Gate 1 → Gate 2 顺序执行
+   - **Gate 1 `!ViewsSetup` → `onInitialViewsCreation()`（先执行）**
      - 启动弹窗（新手引导/更新说明）
-     - **showRecentRepos==true → CreateRecentReposMenu() 弹出最近仓库菜单**
+     - **showRecentRepos==true → CreateRecentReposMenu()**：读取 `RecentRepos[1:]`
+       - ⚠️ 此时 RecentRepos 仍是旧列表顺序，当前仓库不一定在 [0] 位
+       - ⚠️ 菜单可能包含当前仓库自身，或误跳过另一个仓库
      - 后台更新检查
-   - Gate 2 `!State.ViewsSetup` → `onInitialViewsCreationForRepo()`
-     - 视图排序
-     - 激活上下文
-     - **loadNewRepo()**：更新最近仓库列表 + Refresh 数据 + 更新窗口标题
+   - **Gate 2 `!State.ViewsSetup` → `onInitialViewsCreationForRepo()`（后执行）**
+     - 视图排序、隐藏弹窗视图、激活上下文
+     - **loadNewRepo()**：
+       - `updateRecentRepoList()`：**才把当前仓库移到 RecentRepos[0]，去重并重排**
+       - `Refresh(ASYNC)`：刷新数据
+       - `UpdateWindowTitle()`：更新窗口标题
 8. **主事件循环持续运行** → `MainLoop()`
    - 接收用户输入
    - 数据刷新（INITIAL → COMPLETE 两阶段完成）
@@ -797,13 +915,14 @@ app.Run() 中的错误处理 [pkg/app/app.go#L48-L62]
 |------|------|
 | [main.go](main.go) | 程序入口 |
 | [pkg/app/entry_point.go](pkg/app/entry_point.go) | 启动入口、CLI 解析 |
-| [pkg/app/app.go](pkg/app/app.go) | App 构造、setupRepo 仓库设置分支、Git 版本验证 |
+| [pkg/app/app.go](pkg/app/app.go) | App 构造、setupRepo 仓库设置分支、Git 版本验证、openRecentRepo |
 | [pkg/app/errors.go](pkg/app/errors.go) | 已知错误映射 |
 | [pkg/commands/git_commands/repo_paths.go](pkg/commands/git_commands/repo_paths.go) | 仓库路径检测（git rev-parse） |
 | [pkg/commands/git_commands/version.go](pkg/commands/git_commands/version.go) | Git 版本解析 |
-| [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState、两阶段启动 |
-| [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、onInitialViewsCreation（showRecentRepos 消费点）、onInitialViewsCreationForRepo |
-| [pkg/gui/recent_repos_panel.go](pkg/gui/recent_repos_panel.go) | 最近仓库列表管理 |
-| [pkg/gui/controllers/helpers/repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | CreateRecentReposMenu、DispatchSwitchToRepo（切换仓库） |
+| [pkg/gui/gui.go](pkg/gui/gui.go) | GUI 构造、Run、onNewRepo、resetState、两阶段启动、loadNewRepo |
+| [pkg/gui/layout.go](pkg/gui/layout.go) | 布局函数、Gate 执行顺序、onInitialViewsCreation（showRecentRepos 消费点）、onInitialViewsCreationForRepo |
+| [pkg/gui/recent_repos_panel.go](pkg/gui/recent_repos_panel.go) | updateRecentRepoList（列表刷新逻辑）、newRecentReposList |
+| [pkg/gui/controllers/helpers/repos_helper.go](pkg/gui/controllers/helpers/repos_helper.go) | CreateRecentReposMenu（菜单构建）、DispatchSwitchToRepo（切换仓库） |
 | [pkg/gui/types/common.go](pkg/gui/types/common.go) | StartupStage 定义、IRepoStateAccessor |
 | [pkg/gui/controllers/helpers/refresh_helper.go](pkg/gui/controllers/helpers/refresh_helper.go) | 刷新与两阶段启动逻辑 |
+| [pkg/config/app_config.go](pkg/config/app_config.go) | AppState 定义（RecentRepos 字段） |
